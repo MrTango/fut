@@ -70,10 +70,11 @@ pub enum Capability {
     TerminalColors,
     ProjectOpen,
     Attachments,
+    LargeScreens,
 }
 
 impl Capability {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -84,6 +85,7 @@ impl Capability {
         Self::TerminalColors,
         Self::ProjectOpen,
         Self::Attachments,
+        Self::LargeScreens,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -98,6 +100,7 @@ impl Capability {
             Self::TerminalColors => "terminal-colors.v1",
             Self::ProjectOpen => "project-open.v1",
             Self::Attachments => "attachments.v1",
+            Self::LargeScreens => "large-screens.v1",
         }
     }
 }
@@ -118,6 +121,21 @@ impl Capabilities {
             .filter(|cap| self.contains(*cap))
             .map(|cap| cap.name().into())
             .collect()
+    }
+
+    /// Whether screens reference Kitty images delivered in separate
+    /// `kitty_image` frames rather than embedding their pixels.
+    pub fn separate_images(self) -> bool {
+        self.contains(Capability::LargeScreens)
+    }
+
+    /// Largest visible grid this peer may request or receive.
+    pub fn max_visible_cells(self) -> usize {
+        if self.contains(Capability::LargeScreens) {
+            crate::domain::MAX_VISIBLE_CELLS
+        } else {
+            crate::domain::LEGACY_MAX_VISIBLE_CELLS
+        }
     }
 
     fn from_names(names: &[String]) -> Self {
@@ -179,6 +197,7 @@ impl Capabilities {
             }
             LocationOpened { .. } => Capability::ProjectOpen,
             Pong { .. } => Capability::Health,
+            KittyImage { .. } => Capability::LargeScreens,
             ExtensionCatalog { .. } | ExtensionCatalogChanged { .. } => {
                 Capability::ExtensionCatalog
             }
@@ -244,6 +263,7 @@ impl RemoteHello {
         if matches!(mode, ClientMode::Interactive { .. }) {
             optional.push(Capability::TerminalColors.name().into());
             optional.push(Capability::Attachments.name().into());
+            optional.push(Capability::LargeScreens.name().into());
         }
         Self {
             generation: GENERATION,
@@ -294,10 +314,6 @@ impl RemoteHello {
         {
             return Err(EndpointError::InvalidHandshake);
         }
-        if let ClientMode::Interactive { size, .. } = &self.mode {
-            size.validate()
-                .map_err(|_| EndpointError::InvalidHandshake)?;
-        }
         let selected = self
             .required
             .iter()
@@ -305,7 +321,12 @@ impl RemoteHello {
             .filter(|name| supported.contains(name))
             .cloned()
             .collect::<Vec<_>>();
-        Ok(Capabilities::from_names(&selected))
+        let selected = Capabilities::from_names(&selected);
+        if let ClientMode::Interactive { size, .. } = &self.mode {
+            size.validate_within(selected.max_visible_cells())
+                .map_err(|_| EndpointError::InvalidHandshake)?;
+        }
+        Ok(selected)
     }
 
     pub fn accept(&self, welcome: &RemoteWelcome) -> Result<Capabilities, EndpointError> {
@@ -686,6 +707,68 @@ mod tests {
         for message in &messages {
             assert!(!legacy.allows_client(message));
         }
+    }
+
+    #[test]
+    fn large_screens_are_optional_and_older_peers_keep_the_generation_one_bounds() {
+        let interactive = |columns, rows| ClientMode::Interactive {
+            size: crate::domain::TerminalSize { columns, rows },
+            selector: None,
+        };
+        let image = ServerMessage::KittyImage {
+            terminal_id: crate::domain::TerminalId::new(),
+            image: crate::domain::KittyImage {
+                id: 1,
+                generation: 1,
+                png: vec![1].into(),
+            },
+        };
+        assert!(
+            !RemoteHello::new(ClientMode::Control, "0.35.0")
+                .optional
+                .iter()
+                .any(|name| name == "large-screens.v1")
+        );
+
+        // 508x160 is above the generation-1 bound but within the new one.
+        let offer = RemoteHello::new(interactive(508, 160), "0.35.0");
+        assert!(offer.optional.iter().any(|name| name == "large-screens.v1"));
+        let selected = offer.negotiate(Capabilities::ALL).unwrap();
+        assert!(selected.separate_images());
+        assert!(selected.allows_server(&image));
+        assert_eq!(
+            selected.max_visible_cells(),
+            crate::domain::MAX_VISIBLE_CELLS
+        );
+
+        // A daemon that predates the capability ignores the optional offer.
+        let older_daemon = Capabilities::from_names(
+            &Capabilities::ALL
+                .names()
+                .into_iter()
+                .filter(|name| name != "large-screens.v1")
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            offer.negotiate(older_daemon),
+            Err(EndpointError::InvalidHandshake)
+        );
+
+        // An older client never offers it: embedded images, original bound.
+        let mut old = RemoteHello::new(interactive(250, 200), "0.34.0");
+        old.optional.retain(|name| name != "large-screens.v1");
+        let selected = old.negotiate(Capabilities::ALL).unwrap();
+        assert!(!selected.separate_images());
+        assert!(!selected.allows_server(&image));
+        assert_eq!(
+            selected.max_visible_cells(),
+            crate::domain::LEGACY_MAX_VISIBLE_CELLS
+        );
+        old.mode = interactive(508, 160);
+        assert_eq!(
+            old.negotiate(Capabilities::ALL),
+            Err(EndpointError::InvalidHandshake)
+        );
     }
 
     #[test]

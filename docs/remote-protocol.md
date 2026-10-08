@@ -85,6 +85,7 @@ are common to every negotiated connection.
 | `metadata.v1` | `list_resources`, `watch_resources`; resource snapshots/changes and client presence | Required for the navigator and attachment |
 | `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-1 metadata payloads are unchanged |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
+| `large-screens.v1` | Interactive screens up to 150,000 visible cells; Kitty images arrive once per generation in `kitty_image` messages, and screen images carry an empty `d` as a reference to those pixels | Screens embed image pixels and stay within 50,000 visible cells; larger hello or resize sizes are rejected |
 | `terminal-colors.v1` | Interactive `terminal_colors` updates with host foreground, background, and 16 ANSI palette colors | Child applications retain the emulator’s last known colors; host color updates are not sent |
 | `attachments.v1` | Interactive `attachment_begin`, `attachment_chunk`, `attachment_commit`, `attachment_cancel`; upload a PNG and paste its daemon-local path into the original terminal | Clipboard image paste is unavailable |
 | `health.v1` | `ping` / `pong` | Machine verification probes health when available and otherwise uses the successful handshake |
