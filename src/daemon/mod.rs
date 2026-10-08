@@ -7130,10 +7130,13 @@ fn ui_event_error_disposition(
         return UiEventErrorDisposition::Reply;
     }
     match (policy, error) {
-        (UiEventPolicy::Input, CommandError::Stopped)
-        | (UiEventPolicy::Disposable, CommandError::Busy | CommandError::Stopped) => {
-            UiEventErrorDisposition::DropTransient
-        }
+        // Input the program is not reading is lost either way; replying would
+        // end an attached client, which has no request waiting for it.
+        (UiEventPolicy::Input, CommandError::Stopped | CommandError::InputBacklogFull)
+        | (
+            UiEventPolicy::Disposable,
+            CommandError::Busy | CommandError::Stopped | CommandError::InputBacklogFull,
+        ) => UiEventErrorDisposition::DropTransient,
         (UiEventPolicy::Input, CommandError::Busy | CommandError::Emulator(_)) => {
             UiEventErrorDisposition::Reply
         }
@@ -7233,6 +7236,7 @@ async fn send_command_error(
 fn command_error_code(error: &CommandError) -> &'static str {
     match error {
         CommandError::Busy => "busy",
+        CommandError::InputBacklogFull => "input_backlog_full",
         CommandError::Stopped => "terminal_stopped",
         CommandError::CloseTimeout => "close_timeout",
         CommandError::Emulator(_) => "terminal_emulator",
@@ -7699,9 +7703,13 @@ mod tests {
     }
 
     #[test]
-    fn uncorrelated_input_discards_only_stopped() {
+    fn uncorrelated_input_discards_only_stopped_and_unread_input() {
         assert_eq!(
             ui_event_error_disposition(UiEventPolicy::Input, None, &CommandError::Stopped),
+            UiEventErrorDisposition::DropTransient
+        );
+        assert_eq!(
+            ui_event_error_disposition(UiEventPolicy::Input, None, &CommandError::InputBacklogFull),
             UiEventErrorDisposition::DropTransient
         );
         assert_eq!(
@@ -7732,6 +7740,14 @@ mod tests {
             ui_event_error_disposition(
                 UiEventPolicy::Disposable,
                 None,
+                &CommandError::InputBacklogFull
+            ),
+            UiEventErrorDisposition::DropTransient
+        );
+        assert_eq!(
+            ui_event_error_disposition(
+                UiEventPolicy::Disposable,
+                None,
                 &CommandError::Emulator("broken".into()),
             ),
             UiEventErrorDisposition::Diagnose
@@ -7744,6 +7760,7 @@ mod tests {
         for (error, code) in [
             (CommandError::Stopped, "terminal_stopped"),
             (CommandError::Busy, "busy"),
+            (CommandError::InputBacklogFull, "input_backlog_full"),
             (CommandError::Emulator("broken".into()), "terminal_emulator"),
         ] {
             assert_eq!(

@@ -11,6 +11,7 @@
 - Choose the shell new panes launch with `terminal.shell`, instead of always using `$SHELL`.
 - Make agents sidebar rows configurable with an agents `row`, `agent.*` tokens, and the agent's workspace, tab, and pane extension tokens. Rows without one keep their built-in line, and an overflowing agents list now shows the overflow marker like workspaces.
 - Support terminals up to 150,000 cells, enough for 5K displays, and stop resending unchanged inline images with every full screen.
+- Fix panes freezing when a program stops reading its input, such as during fast scrolling.
 
 ## 0.34
 
