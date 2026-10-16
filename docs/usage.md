@@ -113,24 +113,6 @@ filesystem. Remote terminal links are limited to HTTP and HTTPS. Ordinary
 terminal input, navigation, layout actions, copy mode, and pane links continue
 to work.
 
-### Paste a clipboard image
-
-Press `Ctrl-b Ctrl-v`, or search for **Paste clipboard image** in the command
-palette. Fut reads an image from your local clipboard, uploads it to the daemon
-hosting the terminal, and inserts a quoted PNG file path without pressing Enter.
-The target is captured when you invoke the action, so switching panes does not
-redirect the paste. Ordinary text paste is unchanged.
-
-This works locally and with `fut --machine workbox`; the remote daemon must
-support image attachments. Running `ssh workbox` and then starting Fut there
-does not give Fut access to your laptop's clipboard.
-
-macOS uses the system clipboard, including TIFF screenshot conversion. On Linux,
-install `wl-clipboard` for Wayland or `xclip` for X11; the clipboard must offer
-PNG data. Images are limited to 20 MiB. Uploaded files are private and retained
-until the daemon exits, with a 256 MiB shared storage budget. Incomplete uploads
-are discarded on disconnect, and transfers are never replayed after reconnect.
-
 Fut supplies SSH keepalive defaults of `ServerAliveInterval 30` and
 `ServerAliveCountMax 6` through a private temporary config file. Your user and
 system SSH settings take precedence, including an explicit interval of zero.
@@ -306,6 +288,46 @@ Clipboard writes use `pbcopy` on macOS. On Linux, Fut automatically uses
 SSH or headless session without access to a graphical clipboard, Fut reports
 that the clipboard is unavailable. A failed copy keeps the selection active
 for another attempt.
+
+### Paste a clipboard image
+
+Press `Ctrl-b Ctrl-v`, or search for **Paste clipboard image** in the command
+palette. Fut reads an image from your local clipboard, uploads it to the daemon
+hosting the terminal, and inserts a quoted PNG file path without pressing Enter.
+The target is captured when you invoke the action, so switching panes does not
+redirect the paste. Ordinary text paste is unchanged.
+
+This works locally and with `fut --machine workbox`; the remote daemon must
+support image attachments. Running `ssh workbox` and then starting Fut there
+does not give Fut access to your laptop's clipboard.
+
+macOS uses the system clipboard, including TIFF screenshot conversion. On Linux,
+install `wl-clipboard` for Wayland or `xclip` for X11; the clipboard must offer
+PNG data. Images are limited to 20 MiB. Uploaded files are private and retained
+until the daemon exits, with a 256 MiB shared storage budget. Incomplete uploads
+are discarded on disconnect, and transfers are never replayed after reconnect.
+
+### Drop an image into a remote terminal
+
+When your terminal delivers a file drop as a bracketed paste, Fut recognizes a
+single absolute path to a local PNG, uploads the image, and inserts its remote
+path without pressing Enter. Shell-quoted and backslash-escaped paths, including
+filenames with spaces, are supported. Pasting an image path manually behaves the
+same way: terminals do not provide a separate file-drop event to Fut.
+
+This only applies to ordinary terminal input on remote connections that support
+attachments. Local connections, other paste text, missing files, and files that
+are not PNGs retain normal paste behavior. Multiple files, JPEGs, and terminals
+that deliver drops as ordinary keystrokes are not supported yet. The same image
+size and storage limits apply as for clipboard image paste.
+
+To disable automatic image-path uploads, add this to your local configuration
+and reattach:
+
+```toml
+[remote]
+upload_image_paths = false # Default: true.
+```
 
 ## Workspaces, tabs, and panes
 

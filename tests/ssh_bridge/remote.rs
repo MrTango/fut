@@ -102,6 +102,77 @@ async fn assert_ssh_reaped(root: &std::path::Path) {
 }
 
 #[tokio::test]
+async fn remote_dropped_png_uploads_exact_bytes_without_enter_and_can_be_disabled() {
+    let harness = Harness::start("printf 'DROP_READY\\r\\n'; while IFS= read -r line; do printf '%s\\n' \"$line\" >> pasted.txt; printf 'DROP_RECEIVED\\r\\n'; done").await;
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&[255, 0, 0, 255])
+            .unwrap();
+    }
+    let received = harness.root.path().join("cwd/pasted.txt");
+    for enabled in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let bin = fake_ssh(root.path());
+        let image = root.path().join("it's a screenshot.png");
+        fs::write(&image, &png).unwrap();
+        let pasted = format!("'{}'", image.display().to_string().replace('\'', "'\\''"));
+        let mut command = Command::new("/usr/bin/script");
+        remote_env(&mut command, root.path(), &bin, &harness.socket);
+        if !enabled {
+            let config = root.path().join("config");
+            fs::write(&config, "[remote]\nupload_image_paths = false\n").unwrap();
+            command.env("FUT_CONFIG", config);
+        }
+        command.args(script_command_args()).arg(format!(
+            "stty cols 150 rows 40; exec \"$FUT_BIN\" {} --machine clonk --attach-only",
+            if enabled { "--no-config" } else { "" }
+        ));
+        let mut client = PtyChild::spawn(command);
+        client.wait_for("navigator").await;
+        client.send(b"\r");
+        client.wait_for("DROP_READY").await;
+        client.send(format!("\x1b[200~{pasted}\x1b[201~").as_bytes());
+        client
+            .wait_for(if enabled {
+                "fut-attachment-"
+            } else {
+                "screenshot.png"
+            })
+            .await;
+        assert!(!received.exists(), "dropping a file must not submit Enter");
+        client.send(b"\r");
+        client.wait_for("DROP_RECEIVED").await;
+        wait_for(DEADLINE, || {
+            fs::read_to_string(&received).is_ok_and(|text| text.ends_with('\n'))
+        })
+        .await;
+        let text = fs::read_to_string(&received).unwrap();
+        if enabled {
+            let path = text
+                .trim()
+                .strip_prefix('\'')
+                .unwrap()
+                .strip_suffix('\'')
+                .unwrap();
+            assert_ne!(path, image.to_str().unwrap());
+            assert_eq!(fs::read(path).unwrap(), png);
+        } else {
+            assert_eq!(text.trim_end_matches('\n'), pasted);
+        }
+        fs::remove_file(&received).unwrap();
+        client.send(b"\x02d");
+        client.wait_success().await;
+        assert_ssh_reaped(root.path()).await;
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn remote_cli_navigator_attach_detach_preserves_daemon_and_reaps_ssh() {
     let harness = Harness::start_with("printf 'REMOTE_READY\\r\\n'; while IFS= read -r line; do printf 'REMOTE:%s\\r\\n' \"$line\"; done", |root| {
         let extension = root.join("remote-extension");

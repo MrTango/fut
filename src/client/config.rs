@@ -1506,6 +1506,8 @@ pub(crate) struct UiConfig {
     #[serde(skip)]
     pub(super) terminal: crate::terminal::TerminalConfig,
     #[serde(skip)]
+    remote: RemoteConfig,
+    #[serde(skip)]
     pub(super) extensions: Vec<Extension>,
     #[serde(skip)]
     extension_config: ExtensionConfigCatalog,
@@ -1526,6 +1528,7 @@ impl Default for UiConfig {
             sidebar: SidebarConfig::default(),
             alerts: AlertsConfig::default(),
             terminal: crate::terminal::TerminalConfig::default(),
+            remote: RemoteConfig::default(),
             extensions: Vec::new(),
             extension_config: ExtensionConfigCatalog::default(),
         }
@@ -1539,6 +1542,10 @@ pub(crate) struct AlertsConfig {
 }
 
 impl UiConfig {
+    pub(crate) fn remote_upload_image_paths(&self) -> bool {
+        self.remote.upload_image_paths
+    }
+
     pub(crate) fn icon_preset_name(&self) -> &'static str {
         match self.icons.preset {
             IconPreset::Ascii => "ascii",
@@ -1583,15 +1590,19 @@ struct Config {
     extension: BTreeMap<String, ExtensionConfigTable>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RemoteConfig {
     autostart: bool,
+    upload_image_paths: bool,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
-        Self { autostart: true }
+        Self {
+            autostart: true,
+            upload_image_paths: true,
+        }
     }
 }
 
@@ -2136,6 +2147,7 @@ fn materialize_config(
     let home = env::var_os("HOME").map(PathBuf::from);
     validate_terminal(&mut config.terminal, home.as_deref())?;
     config.ui.terminal = config.terminal;
+    config.ui.remote = config.remote;
     let prefix = parse_key(&config.ui.prefix)
         .map(|(bytes, _)| bytes)
         .context("ui.prefix must be one character or a named key such as ctrl-a")?;
@@ -3016,6 +3028,43 @@ fn validate_text(path: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_image_path_upload_defaults_on_and_local_override_survives_materialization() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        let location = ConfigLocation {
+            path: Some(path.clone()),
+            explicit: false,
+            source: "test",
+        };
+        assert!(UiConfig::default().remote_upload_image_paths());
+        for (setting, expected) in [("", true), ("false", false), ("true", true)] {
+            let contents = if setting.is_empty() {
+                String::new()
+            } else {
+                format!("[remote]\nupload_image_paths = {setting}\n")
+            };
+            fs::write(&path, contents).unwrap();
+            let staged = stage_location(&location).unwrap();
+            assert_eq!(
+                staged
+                    .materialize_remote(None)
+                    .unwrap()
+                    .remote_upload_image_paths(),
+                expected
+            );
+            assert_eq!(
+                load_location(&location)
+                    .unwrap()
+                    .ui
+                    .remote_upload_image_paths(),
+                expected
+            );
+        }
+        fs::write(&path, "[remote]\nupload_image_paths = 'false'\n").unwrap();
+        assert!(stage_location(&location).is_err());
+    }
 
     #[test]
     fn remote_autostart_defaults_on_and_can_be_disabled_locally() {

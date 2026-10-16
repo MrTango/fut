@@ -21,6 +21,7 @@ mod fuzzy;
 mod graphics;
 mod handoff;
 mod hotkey;
+mod image_path;
 pub(crate) mod input;
 mod layout;
 mod messages;
@@ -3870,6 +3871,32 @@ async fn run_loop(
                         }
                     },
                     Event::Paste(text) if surface.is_none() && copy_mode.is_none() => {
+                        if attachment.locality() == Locality::Remote
+                            && attachment.supports_attachments()
+                            && ui.remote_upload_image_paths()
+                            && let Some(path) = image_path::parse(&text)
+                        {
+                            // Serialize preflight with input: a non-image must paste
+                            // unchanged into the same focus, not a later selection.
+                            let terminal_id = view.focused().terminal_id;
+                            match image_path::read(&path).await {
+                                Ok(Some(png)) => {
+                                    // start_png refuses a busy queue without replacing
+                                    // its original upload (including clipboard reads).
+                                    if let Err(error) = image_upload.start_png(terminal_id, png) {
+                                        toasts.error(one_line_error(&error));
+                                    }
+                                    force_draw = true;
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    toasts.error(one_line_error(&error));
+                                    force_draw = true;
+                                    continue;
+                                }
+                            }
+                        }
                         send(framed, ClientMessage::Paste { text }).await?
                     }
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {

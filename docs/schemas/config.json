@@ -9,6 +9,22 @@
     "terminal": { "$ref": "#/definitions/terminal" },
     "alerts": { "$ref": "#/definitions/alerts" },
     "ui": { "$ref": "#/definitions/ui" },
+    "remote": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "autostart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the remote daemon when connecting."
+        },
+        "upload_image_paths": {
+          "type": "boolean",
+          "default": true,
+          "description": "Upload a dropped or pasted absolute local PNG path to a remote terminal when attachment support is available. Disable to paste the original path text."
+        }
+      }
+    },
     "extensions": {
       "type": "array",
       "description": "Trusted local extension package directories.",

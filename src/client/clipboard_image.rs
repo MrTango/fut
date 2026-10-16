@@ -54,6 +54,14 @@ impl Upload {
         self.start_reading(terminal_id, read_clipboard())
     }
 
+    pub(super) fn start_png(
+        &mut self,
+        terminal_id: TerminalId,
+        png: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        self.start_reading(terminal_id, async move { Ok(png) })
+    }
+
     fn start_reading(
         &mut self,
         terminal_id: TerminalId,
@@ -416,6 +424,28 @@ mod tests {
         png: Vec<u8>,
     ) -> anyhow::Result<()> {
         enqueue(&sender, terminal, png).await
+    }
+
+    #[tokio::test]
+    async fn local_path_bytes_use_pinned_queue_without_overwriting_clipboard_upload() {
+        let original = TerminalId::new();
+        let other = TerminalId::new();
+        let mut upload = Upload::default();
+        upload.start_png(original, PNG_SIGNATURE.to_vec()).unwrap();
+        assert!(upload.start_png(other, vec![42]).is_err());
+        assert!(upload.start(other).is_err());
+        assert!(matches!(upload.next().await,
+            Update::Message(ClientMessage::AttachmentBegin { terminal_id, .. }) if terminal_id == original));
+        assert!(matches!(upload.next().await,
+            Update::Message(ClientMessage::AttachmentChunk { bytes, .. }) if bytes == PNG_SIGNATURE));
+        assert!(matches!(
+            upload.next().await,
+            Update::Message(ClientMessage::AttachmentCommit { .. })
+        ));
+        assert!(matches!(upload.next().await, Update::Finished(Ok(()))));
+        assert!(!upload.is_pending());
+        upload.start_reading(other, std::future::pending()).unwrap();
+        assert!(upload.start_png(original, PNG_SIGNATURE.to_vec()).is_err());
     }
 
     #[tokio::test]

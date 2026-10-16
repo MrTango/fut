@@ -72,6 +72,22 @@ terminal bell arrives; whether that BEL is audible, visual, or ignored remains
 under the containing terminal emulator's control. It is deliberately off by
 default.
 
+## Remote image-path uploads
+
+By default, a bracketed paste containing a single absolute path to an existing
+local PNG uploads that image to the remote daemon and substitutes its remote
+path. This supports terminal file drops as well as manually pasted image paths.
+Ordinary text and local connections are unchanged. Disable this client-local
+behavior with:
+
+```toml
+[remote]
+upload_image_paths = false # Default: true.
+```
+
+Reattach after changing this setting. See [image drops](usage.md#drop-an-image-into-a-remote-terminal)
+for supported path formats and terminal limitations.
+
 ## Terminal scrollback
 
 Fut retains up to **100 MiB of scrollback per terminal** by default. Storage grows
