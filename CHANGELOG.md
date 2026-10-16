@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- Unify OSC 7501 program status, progress, and actionable results throughout Fut, with agent reports and screen detection feeding the same terminal-owned records.
-- Paste clipboard images into local or remote terminals by uploading them and inserting their file paths.
-- Drop a PNG into a remote terminal to upload it automatically and insert its remote path.
+## 0.35
+
+- Any program that speaks OSC 7501 now shows its status in Fut without a plugin: working with progress, blocked with a reason, done, and error, rolled up into tabs, workspaces, the navigator, and the Agents sidebar. Agent integrations and Codex screen detection feed the same records, `fut agent report` accepts progress, message, kind, app, and record IDs, and new `tab.progress` and `workspace.progress` tokens show determinate progress.
+- Paste clipboard images or drop a PNG into a local or remote terminal; Fut uploads the file and inserts its path.
 - Render faint text from terminal programs dimmed instead of at full brightness.
 - Draw the rename prompt in the same bordered dialog frame as the command palette and other dialogs.
 - Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
