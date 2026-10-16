@@ -17,4 +17,4 @@ Send full screens (and large deltas) as row-range chunks tied to one revision, c
 
 ## Acceptance Criteria
 
-Grids beyond 150,000 cells attach and render; no frame exceeds MAX_FRAME_LEN; older remote peers keep their bounds. Do this after scroll-aware deltas: at 150,000 cells, full-screen sends during scrolling, not frame size or snapshot construction, dominate cost (PERF.md Round 7).
+Grids beyond 150,000 cells attach and render; no frame exceeds MAX_FRAME_LEN; older remote peers keep their bounds. Coordinate with scroll-aware deltas; compare their end-to-end costs before prioritizing either approach.

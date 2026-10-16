@@ -1444,7 +1444,7 @@ mod tests {
                 true,
             ),
             selected: true,
-            hyperlink: Some(511),
+            hyperlink: Some(u16::MAX),
         };
         let mut screen = ScreenSnapshot::new(
             u64::MAX,
@@ -1459,11 +1459,11 @@ mod tests {
             },
         )
         .unwrap();
-        // The rest of the frame's budget: a full hyperlink table whose
-        // indices need MessagePack's three-byte encoding, and the maximum
-        // number of placements, each referencing its own image.
-        let uri = "h".repeat(crate::domain::MAX_SCREEN_HYPERLINK_BYTES / 512);
-        screen.hyperlinks = vec![uri.into(); 512];
+        // Maximize both URI bytes and per-entry string headers, not just URI
+        // bytes. Every cell also uses a three-byte hyperlink index.
+        let entries = usize::from(u16::MAX) + 1;
+        let uri = "h".repeat(crate::domain::MAX_SCREEN_HYPERLINK_BYTES / entries);
+        screen.hyperlinks = vec![uri.into(); entries];
         screen.graphics = crate::domain::KittyGraphics {
             images: (0..crate::domain::MAX_KITTY_PLACEMENTS)
                 .map(|index| crate::domain::KittyImage {

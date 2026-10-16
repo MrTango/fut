@@ -9,7 +9,7 @@ priority: 2
 ---
 # Send scrolling as a row shift instead of a full screen
 
-When output scrolls, every row of the grid changes, so the row diff exceeds DELTA_ROW_FALLBACK_THRESHOLD and the daemon sends a full screen. At 508x160 a flood sends 163 KB up to 125 times per second (about 20 MB/s, roughly 25% of a client core decoding); at 150,000 cells it is about 300 KB per screen (PERF.md Round 7).
+When output scrolls, every row of the grid changes, so the row diff exceeds DELTA_ROW_FALLBACK_THRESHOLD and the daemon sends a full screen. The measured plain 508x160 screen is 163 KB and takes 1.9 ms to decode (PERF.md Round 7). Whole-system flood throughput and CPU have not been measured here.
 
 ## Design
 

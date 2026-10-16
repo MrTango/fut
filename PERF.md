@@ -265,8 +265,10 @@ compared them byte by byte. The 50,000-cell cap reserved the 8 MiB frame's
 remaining space for those images (4 MiB). Pixels now live behind `Arc` and
 travel once per generation in their own `kitty_image` frame; screens carry
 references. That frees the frame for cells: the visible cap is now 150,000
-(a measured worst case of 7.83 of 8.39 MB, including a full hyperlink table and
-1,024 placements), enough for a 5120x2160 display at small fonts. Remote peers
+(a measured styled frame of 7.83 of 8.39 MB, including 512 KiB of hyperlink
+URIs and 1,024 placements), enough for a 5120x2160 display at small fonts.
+Protocol tests additionally maximize the hyperlink table's entry count and
+check that the resulting frame fits. Remote peers
 without `large-screens.v1` keep embedded images and the 50,000-cell bound.
 
 `benches/render.rs` gained `graphics` (200x50 with a 640x480 noise image) and
@@ -305,17 +307,13 @@ program's output, not Fut's screen construction:
 
 At 833x180 the split is 22.4 ms parse and 4.2 ms construction (dense), and
 2.6 ms feed with a 3.3 ms decode (plain). Dense animation exceeds the 8 ms
-publication interval because of input volume, which any emulator must parse;
-pacing then lowers the frame rate while bounded queues apply backpressure, so
-lag does not accumulate. Capture proportional to the changed area would save
-only the 2–4 ms construction share.
+publication interval in these measurements; end-to-end latency and queue
+backpressure were not measured by these microbenchmarks.
 
-The larger cost at these sizes is scrolling: every row shifts, so deltas fall
-back to full screens. A flood at 508x160 can send 163 KB up to 125 times per
-second (about 20 MB/s, and roughly 25% of a core decoding on the client).
-Scroll-aware deltas that shift retained rows would remove most of that, and
-come before row-chunked screens lift the cap further. Client draw cost at
-these sizes is not yet measured.
+Scrolling shifts every row, so the current row diff falls back to full
+screens. The measured plain 508x160 screen is 163 KB and takes 1.9 ms to
+decode. Scroll-aware deltas and row-chunked screens remain follow-up work;
+their savings and client draw cost at these sizes are not yet measured.
 
 ### External multiplexer baseline (2026-08-10)
 

@@ -2275,6 +2275,28 @@ mod tests {
         assert_eq!((placement.columns, placement.rows), (2, 2));
     }
 
+    #[test]
+    fn excessive_kitty_placements_are_truncated_without_losing_the_screen() {
+        let mut terminal = terminal(10, 4);
+        let mut input = String::from(
+            "\x1b_Ga=t,f=100,q=2,i=7;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\",
+        );
+        for placement in 1..=MAX_KITTY_PLACEMENTS + 1 {
+            use std::fmt::Write as _;
+            write!(
+                input,
+                "\x1b[H\x1b_Ga=p,i=7,p={placement},q=2,c=1,r=1;\x1b\\"
+            )
+            .unwrap();
+        }
+        input.push_str("\x1b[HOK");
+        let screen = terminal.feed(input.as_bytes()).unwrap().unwrap();
+        assert_eq!(screen.graphics.placements.len(), MAX_KITTY_PLACEMENTS);
+        assert_eq!(screen.graphics.images.len(), 1);
+        assert_eq!(screen.cells[0].contents, "O");
+        assert_eq!(screen.cells[1].contents, "K");
+    }
+
     fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
