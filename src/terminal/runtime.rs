@@ -886,7 +886,7 @@ fn run(
                     if let Some(colors) = configuration.colors
                         && let Err(error) = terminal.set_colors(colors)
                     {
-                        send_error(publishers.events, error);
+                        send_input_error(publishers.events, terminal_input_error(error));
                     }
                     if configuration.size == terminal.size() {
                         continue;
@@ -1662,7 +1662,7 @@ fn output_queue() -> (OutputProducer, OutputQueue) {
 /// reported by the next write instead; by then the child is gone and the
 /// runtime sees its exit.
 struct PtyInputQueue {
-    sender: channel::Sender<Vec<u8>>,
+    sender: channel::Sender<QueuedInput>,
     /// Queued bytes the PTY has not yet accepted. Writes are serialized by the
     /// shared writer's mutex, so the limit check and the add cannot race; the
     /// writer thread only subtracts.
@@ -1670,9 +1670,21 @@ struct PtyInputQueue {
     failure: Arc<Mutex<Option<PtyWriteFailure>>>,
 }
 
+/// Each queued buffer owns its backlog reservation, including when the writer
+/// fails and the receiver discards buffers it never started writing.
+struct QueuedInput {
+    bytes: Vec<u8>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedInput {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes.len(), Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct PtyWriteFailure {
-    kind: std::io::ErrorKind,
     message: String,
 }
 
@@ -1680,7 +1692,7 @@ fn spawn_pty_writer(
     id: TerminalId,
     mut pty: Box<dyn Write + Send>,
 ) -> std::io::Result<PtyInputQueue> {
-    let (sender, receiver) = channel::unbounded::<Vec<u8>>();
+    let (sender, receiver) = channel::unbounded::<QueuedInput>();
     let pending = Arc::new(AtomicUsize::new(0));
     let failure = Arc::new(Mutex::new(None));
     let writer_pending = Arc::clone(&pending);
@@ -1690,12 +1702,14 @@ fn spawn_pty_writer(
         .spawn(move || {
             // Exits once every queue handle is dropped, which also drops the
             // PTY writer.
-            for bytes in receiver {
+            for mut input in receiver {
+                // Transfer the active reservation to write_counting, which
+                // releases accepted chunks and any unwritten remainder.
+                let bytes = std::mem::take(&mut input.bytes);
                 if let Err(error) = write_counting(&mut *pty, &bytes, &writer_pending) {
                     // Publish the failure before exiting, so later writes are
                     // refused instead of queued behind a writer that is gone.
                     let failure = PtyWriteFailure {
-                        kind: error.kind(),
                         message: error.to_string(),
                     };
                     match writer_failure.lock() {
@@ -1751,8 +1765,10 @@ impl Write for PtyInputQueue {
             Ok(failure) => failure.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if let Some(PtyWriteFailure { kind, message }) = failure {
-            return Err(std::io::Error::new(kind, message));
+        if let Some(PtyWriteFailure { message }) = failure {
+            // A failed worker is stopped even if its underlying error was
+            // WouldBlock, which is reserved for admission refusals here.
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, message));
         }
         if bytes.is_empty() {
             return Ok(0);
@@ -1766,8 +1782,11 @@ impl Write for PtyInputQueue {
             ));
         }
         self.pending.fetch_add(bytes.len(), Ordering::Relaxed);
-        if self.sender.send(bytes.to_vec()).is_err() {
-            self.pending.fetch_sub(bytes.len(), Ordering::Relaxed);
+        let input = QueuedInput {
+            bytes: bytes.to_vec(),
+            pending: Arc::clone(&self.pending),
+        };
+        if self.sender.send(input).is_err() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "PTY writer stopped",
@@ -3205,6 +3224,125 @@ mod tests {
                 "backlog {backlog}, pty input allowed {pty_input_allowed}"
             );
         }
+    }
+
+    #[test]
+    fn failed_writer_releases_all_queued_backlog_and_reports_stopped() {
+        struct GatedFailure(channel::Receiver<()>);
+
+        impl Write for GatedFailure {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0.recv().unwrap();
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (release, gate) = channel::bounded(1);
+        let mut queue = spawn_pty_writer(TerminalId::new(), Box::new(GatedFailure(gate))).unwrap();
+        queue.write_all(b"first").unwrap();
+        queue.write_all(b"second").unwrap();
+        assert_eq!(queue.pending.load(Ordering::Relaxed), 11);
+        release.send(()).unwrap();
+        wait_until(|| queue.failure.lock().unwrap().is_some());
+        wait_until(|| queue.pending.load(Ordering::Relaxed) == 0);
+        assert!(matches!(
+            terminal_input_error(queue.write_all(b"later").unwrap_err().into()),
+            CommandError::Stopped
+        ));
+    }
+
+    #[test]
+    fn interrupted_and_failed_partial_writes_release_only_their_reservation() {
+        struct PartialFailure(usize);
+
+        impl Write for PartialFailure {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Err(std::io::ErrorKind::Interrupted.into()),
+                    2 => Ok(3),
+                    _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+                }
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let pending = AtomicUsize::new(15);
+        assert!(write_counting(&mut PartialFailure(0), &[0; 10], &pending).is_err());
+        assert_eq!(pending.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn dropping_the_queue_stops_the_writer_and_drops_the_pty() {
+        struct DropWriter(channel::Sender<()>);
+
+        impl Write for DropWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Drop for DropWriter {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+            }
+        }
+
+        let (dropped, observed) = channel::bounded(1);
+        let mut queue = spawn_pty_writer(TerminalId::new(), Box::new(DropWriter(dropped))).unwrap();
+        queue.write_all(b"input").unwrap();
+        let pending = Arc::clone(&queue.pending);
+        drop(queue);
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn refused_color_scheme_report_is_not_fatal_to_attached_clients() {
+        let handle = spawn_terminal(shell(
+            "printf '\\033[?2031hREADY'; exec sleep 60",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "READY").await;
+        let mut events = handle.subscribe_events();
+        handle
+            .input_backlog
+            .store(2 * INPUT_QUEUE_BYTE_LIMIT, Ordering::Relaxed);
+        handle
+            .configure_attachment(AttachmentConfiguration {
+                colors: Some(crate::domain::TerminalColors {
+                    background: Some(crate::domain::Rgb {
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                    }),
+                    ..Default::default()
+                }),
+                revision: 1,
+                size: handle.snapshots.borrow().size,
+            })
+            .await
+            .unwrap();
+        handle.foreground_process_id().await.unwrap();
+        handle.input_backlog.store(0, Ordering::Relaxed);
+        handle.close().await.unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
