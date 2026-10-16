@@ -1,4 +1,4 @@
-# Remote endpoint contract, generation 1
+# Remote endpoint contract, generation 2
 
 Remote compatibility is independent of `CARGO_PKG_VERSION` and the local
 `PROTOCOL_VERSION` (package minor). Local `hello` / `welcome`, exact protocol
@@ -35,13 +35,13 @@ the request ID, and unsolicited updates omit it. The current remote client uses
 a fresh ID for the handshake and verifies its echo. The first message is:
 
 ```json
-{"message":{"type":"remote_hello","generation":1,"codec":"msgpack-map-v1","client_version":"0.22.0","required":["metadata.v1"],"optional":["health.v1","control-alerts.v1","extension-catalog.v1"],"mode":"control"}}
+{"message":{"type":"remote_hello","generation":2,"codec":"msgpack-map-v1","client_version":"0.35.0","required":["metadata.v2"],"optional":["health.v1","control-alerts.v1","extension-catalog.v1"],"mode":"control"}}
 ```
 
 `mode` uses the frozen `ClientMode` payload: `control`, or
 `{"interactive":{"size":{"columns":80,"rows":24},"selector":...}}`.
-Interactive offers must require both `metadata.v1` and `interactive.v1` and
-provide a valid terminal size. Control offers must require `metadata.v1`.
+Interactive offers must require both `metadata.v2` and `interactive.v1` and
+provide a valid terminal size. Control offers must require `metadata.v2`.
 Selectors, UUIDs and terminal dimensions retain their existing encoding.
 
 The daemon replies with `remote_welcome`, containing `generation`, `codec`,
@@ -79,11 +79,11 @@ are common to every negotiated connection.
 
 <div class="wide-table" markdown="1">
 
-| Capability | Generation-1 methods and messages | When omitted |
+| Capability | Generation-2 methods and messages | When omitted |
 | --- | --- | --- |
 | `project-open.v1` | `open_project` with a catalog name; `location_opened` | Named project opening is unavailable |
-| `metadata.v1` | `list_resources`, `watch_resources`; resource snapshots/changes and client presence | Required for the navigator and attachment |
-| `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-1 metadata payloads are unchanged |
+| `metadata.v2` | `list_resources`, `watch_resources`; resource snapshots/changes, program-status records and client presence | Required for the navigator and attachment |
+| `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-2 metadata payloads are unchanged |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
 | `large-screens.v1` | Interactive screens up to 150,000 visible cells; Kitty images arrive once per generation in `kitty_image` messages, and screen images carry an empty `d` as a reference to those pixels | Screens embed image pixels and stay within 50,000 visible cells; larger hello or resize sizes are rejected |
 | `terminal-colors.v1` | Interactive `terminal_colors` updates with host foreground, background, and 16 ANSI palette colors | Child applications retain the emulator’s last known colors; host color updates are not sent |
@@ -105,7 +105,7 @@ Pane links and ordinary terminal/navigation/layout operations remain usable.
 An extension's Fut package requirement applies to the hosting daemon, not the
 local renderer; remote catalog validation retains structural/fingerprint checks
 without imposing the local package version on remote declarations.
-No capability in generation 1 permits daemon shutdown, configuration mutation,
+No capability in generation 2 permits daemon shutdown, configuration mutation,
 agent reporting, token publication, or private control/automation methods.
 
 ### Image attachment uploads
@@ -154,13 +154,20 @@ difference between `ssh -t host fut` and `fut --machine host` are documented in
 
 ## Frozen semantics and evolution
 
-Generation 1 deliberately reuses `Envelope`, `ClientMode`, `SelectedView`,
+Generation 2 deliberately reuses `Envelope`, `ClientMode`, `SelectedView`,
 `ExtensionCatalog`, and the allowlisted `ClientMessage` / `ServerMessage`
 payloads and their transitive resource, screen, split, copy, alert and domain
 types. Their wire names, enum cases, field representations, defaults, bounds,
 request correlation, event ordering and behavior are a **frozen remote
-contract**, based on the payloads at commit `f77344c`. A package minor bump does
-not change that contract. This is not permission to expose every local message.
+contract**. In generation 2, `PaneSnapshot.activity` is a `ProgramStatus` with
+OSC 7501 records; `metadata.v2` freezes that transitive shape. A package minor
+bump does not change the contract. This is not permission to expose every local
+message.
+
+Generation 1 and `metadata.v1` froze the earlier agent-activity shape at commit
+`f77344c`. Generation 2 intentionally has no generation-1 adapter: peers offering
+generation 1 are rejected as incompatible rather than receiving a lossy status
+translation.
 
 Changes to shared local types must preserve the selected remote contract. New
 behavior must have a new optional capability and be emitted only after selection;
@@ -169,8 +176,8 @@ an existing peer cannot decode requires a new capability payload/adapter or a
 new remote generation. Do not send new shared fields merely because local serde
 currently ignores unknown fields. The handshake DTOs themselves are frozen;
 future generations with additional handshake fields need separately decoded
-DTOs rather than extending generation 1 in place. Extension points are the
+DTOs rather than extending generation 2 in place. Extension points are the
 bounded capability lists. Keep wire fixtures and tests
 for older offers, optional omission, rejection isolation, and the local protocol
-when evolving this contract. Multiple generations or codecs are not implemented
-until needed.
+when evolving this contract. Multiple simultaneous generations or codecs are not
+implemented.

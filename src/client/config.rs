@@ -1832,23 +1832,35 @@ fn remove_extension_tokens(ui: &mut UiConfig) {
     remove(&mut ui.tab_bar.item.segments);
     for sidebar in [&mut ui.sidebar.left, &mut ui.sidebar.right] {
         for component in &mut sidebar.components {
-            if let SidebarComponentConfig::Workspaces {
-                header,
-                footer,
-                row,
-                ..
-            } = component
-            {
-                for segments in [
+            match component {
+                SidebarComponentConfig::Workspaces {
                     header,
                     footer,
-                    &mut row.left,
-                    &mut row.body,
-                    &mut row.right,
-                    &mut row.detail,
-                ] {
-                    remove(segments);
+                    row,
+                    ..
+                } => {
+                    for segments in [
+                        header,
+                        footer,
+                        &mut row.left,
+                        &mut row.body,
+                        &mut row.right,
+                        &mut row.detail,
+                    ] {
+                        remove(segments);
+                    }
                 }
+                SidebarComponentConfig::Agents { row: Some(row), .. } => {
+                    for segments in [
+                        &mut row.left,
+                        &mut row.body,
+                        &mut row.right,
+                        &mut row.detail,
+                    ] {
+                        remove(segments);
+                    }
+                }
+                SidebarComponentConfig::Agents { row: None, .. } => {}
             }
         }
     }
@@ -2926,9 +2938,12 @@ fn token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bo
                 | "session.name"
                 | "workspace.name"
                 | "workspace.icon"
+                | "workspace.progress"
                 | "tab.name"
                 | "tab.index"
                 | "tab.pane_count"
+                | "tab.activity"
+                | "tab.progress"
                 | "client.zoom"
                 | "client.help"
                 | "client.waiting"
@@ -2944,6 +2959,7 @@ fn token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bo
                 | "tab.pane_count"
                 | "tab.icon"
                 | "tab.activity"
+                | "tab.progress"
         ),
         TokenScope::Workspace => matches!(
             token,
@@ -2957,6 +2973,7 @@ fn token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bo
                 | "workspace.tab_count"
                 | "workspace.icon"
                 | "workspace.activity"
+                | "workspace.progress"
                 | "workspace.git_branch"
                 | "workspace.git_added"
                 | "workspace.git_deleted"
@@ -3882,6 +3899,28 @@ program = "/bin/true"
     }
 
     #[test]
+    fn progress_tokens_are_valid_in_tab_bar_and_workspace_presentations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("progress.toml");
+        fs::write(
+            &path,
+            r#"
+[ui.tab_bar]
+left = [{ segments = [{ token = 'tab.activity' }, { token = 'tab.progress' }, { token = 'workspace.progress' }] }]
+
+[ui.tab_bar.item]
+segments = [{ token = 'tab.progress' }]
+
+[ui.sidebar.left]
+components = [{ component = 'workspaces', row = { body = [{ token = 'workspace.progress' }] } }]
+"#,
+        )
+        .unwrap();
+
+        load_path(&path, true).unwrap();
+    }
+
+    #[test]
     fn each_sidebar_side_rejects_more_than_one_workspaces_component() {
         let temporary = tempfile::tempdir().unwrap();
         for side in ["left", "right"] {
@@ -4145,7 +4184,7 @@ program = "/bin/true"
         fs::write(
             temporary.path().join("config.toml"),
             format!(
-                "extensions = [{:?}]\n[ui.bindings]\n\"catalog:launch\" = \"N\"\n[extension_commands.\"catalog:launch\"]\nargs = [\"configured\"]\n[extension.catalog]\nenabled = true\n[ui.tab_bar.item]\nsegments = [{{ token = 'tab.extension.catalog.badge' }}]\n",
+                "extensions = [{:?}]\n[ui.bindings]\n\"catalog:launch\" = \"N\"\n[extension_commands.\"catalog:launch\"]\nargs = [\"configured\"]\n[extension.catalog]\nenabled = true\n[ui.tab_bar.item]\nsegments = [{{ token = 'tab.extension.catalog.badge' }}]\n[ui.sidebar.right]\ncomponents = [{{ component = 'agents', row = {{ body = [{{ token = 'tab.extension.catalog.badge' }}] }} }}]\n",
                 extension_root.display().to_string()
             ),
         )
@@ -4163,6 +4202,14 @@ program = "/bin/true"
         assert!(without_catalog.extensions.is_empty());
         assert!(without_catalog.bindings.command(0).is_none());
         assert!(without_catalog.tab_bar.item.segments.is_empty());
+        let SidebarComponentConfig::Agents {
+            row: Some(agent_row),
+            ..
+        } = &without_catalog.sidebar.right.components[0]
+        else {
+            panic!("configured agent row should remain available");
+        };
+        assert!(agent_row.body.is_empty());
         assert!(without_catalog.bindings.action_for_suffix(b"N").is_none());
         let ui = staged.materialize(&catalog).unwrap();
         let command = ui.bindings.command(0).unwrap();

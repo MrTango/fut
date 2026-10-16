@@ -13,9 +13,8 @@ use thiserror::Error;
 
 use crate::{
     domain::{
-        AgentActivity, AgentDetection, AgentEvent, AgentIntegration, AgentReport,
-        AgentReportMetadata, AgentState, PaneId, SessionId, SplitId, TabId, TerminalId,
-        WorkspaceId,
+        PaneId, ProgramStatus, SessionId, SplitId, StatusBookkeeping, StatusReport, StatusSource,
+        StatusUpdate, TabId, TerminalId, WorkspaceId,
     },
     splits::{SplitDirection, SplitRatio, SplitTree},
 };
@@ -332,7 +331,7 @@ pub struct PaneSnapshot {
     pub closing: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: MaterializedTokenMap,
-    pub activity: AgentActivity,
+    pub activity: ProgramStatus,
     /// Observed working directory of the pane's foreground process; absent
     /// until the daemon's process observer has resolved one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -427,7 +426,7 @@ impl ResourceSnapshot {
         found.ok_or(ResourceError::NotFound("terminal"))
     }
 
-    /// Preserve the frozen remote metadata.v1 payload for peers that did not
+    /// Preserve the frozen remote metadata.v2 payload for peers that did not
     /// negotiate nested workspace metadata.
     pub(crate) fn clear_workspace_parents(&mut self) {
         for session in &mut self.sessions {
@@ -685,8 +684,8 @@ pub enum ResourceError {
     TargetRequired,
     #[error("target is ambiguous")]
     AmbiguousTarget,
-    #[error("invalid agent report: {0}")]
-    InvalidAgentReport(&'static str),
+    #[error("invalid program status: {0}")]
+    InvalidStatusReport(&'static str),
     #[error("invalid split ratio")]
     InvalidSplitRatio,
     #[error("maximum of {MAX_MATERIALIZED_TOKEN_VALUES} materialized token values reached")]
@@ -731,7 +730,10 @@ struct Pane {
     terminal_id: TerminalId,
     creation_order: u64,
     tokens: MaterializedTokenMap,
-    activity: AgentActivity,
+    activity: ProgramStatus,
+    /// Receipt order, per-record provenance, and explicit ownership leases are
+    /// authoritative private state rather than part of the serialized model.
+    status_bookkeeping: StatusBookkeeping,
     cwd: Option<PathBuf>,
     worktree: Option<PathBuf>,
 }
@@ -1311,16 +1313,7 @@ impl ResourceTree {
         }
     }
 
-    pub fn report_agent(
-        &mut self,
-        terminal_id: TerminalId,
-        report: AgentReport,
-        now_ms: u64,
-    ) -> Result<u64, ResourceError> {
-        self.report_agent_with_metadata(terminal_id, report, AgentReportMetadata::default(), now_ms)
-    }
-
-    pub fn agent_activity(&self, terminal_id: TerminalId) -> Result<&AgentActivity, ResourceError> {
+    pub fn program_status(&self, terminal_id: TerminalId) -> Result<&ProgramStatus, ResourceError> {
         let pane_id = self
             .terminals
             .get(&terminal_id)
@@ -1328,6 +1321,20 @@ impl ResourceTree {
         self.panes
             .get(pane_id)
             .map(|pane| &pane.activity)
+            .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))
+    }
+
+    pub(crate) fn has_detection_status(
+        &self,
+        terminal_id: TerminalId,
+    ) -> Result<bool, ResourceError> {
+        let pane_id = self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        self.panes
+            .get(pane_id)
+            .map(|pane| pane.status_bookkeeping.has_detection())
             .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))
     }
 
@@ -1340,61 +1347,184 @@ impl ResourceTree {
             .terminals
             .get(&terminal_id)
             .ok_or(ResourceError::NotFound("terminal"))?;
-        let activity = &mut self
+        let status = &mut self
             .panes
             .get_mut(&pane_id)
             .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))?
             .activity;
-        let Some(attention) = activity.attention() else {
+        let Some(attention) = status.attention() else {
             return Ok(None);
         };
-        if attention.revision != event_revision || activity.read_revision >= event_revision {
+        if attention.attention_revision != event_revision || status.read_revision >= event_revision
+        {
             return Ok(None);
         }
-        activity.read_revision = event_revision;
         self.revision += 1;
+        status.read_revision = event_revision;
+        status.revision = self.revision;
         Ok(Some(self.revision))
     }
 
-    pub fn update_agent_detection(
+    pub fn apply_status_report(
         &mut self,
         terminal_id: TerminalId,
-        detection: Option<AgentDetection>,
-        state: AgentState,
+        report: StatusReport,
+        source: StatusSource,
         now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        self.apply_status_updates(
+            terminal_id,
+            vec![StatusUpdate::Report(report)],
+            source,
+            now_ms,
+        )
+    }
+
+    pub fn apply_status_updates(
+        &mut self,
+        terminal_id: TerminalId,
+        updates: Vec<StatusUpdate>,
+        source: StatusSource,
+        now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        ProgramStatus::validate_source(&source).map_err(ResourceError::InvalidStatusReport)?;
+        self.apply_status_mutation(terminal_id, updates, Some(source), None, now_ms)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_automatic_status_update(
+        &mut self,
+        terminal_id: TerminalId,
+        update: StatusUpdate,
+        source: StatusSource,
+        automatic_pid: u32,
+        now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        self.apply_automatic_status_updates(
+            terminal_id,
+            vec![update],
+            source,
+            automatic_pid,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn apply_automatic_status_updates(
+        &mut self,
+        terminal_id: TerminalId,
+        updates: Vec<StatusUpdate>,
+        source: StatusSource,
+        automatic_pid: u32,
+        now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        ProgramStatus::validate_source(&source).map_err(ResourceError::InvalidStatusReport)?;
+        self.apply_status_mutation(
+            terminal_id,
+            updates,
+            Some(source),
+            Some(automatic_pid),
+            now_ms,
+        )
+    }
+
+    fn apply_status_mutation(
+        &mut self,
+        terminal_id: TerminalId,
+        updates: Vec<StatusUpdate>,
+        source: Option<StatusSource>,
+        automatic_pid: Option<u32>,
+        now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        for update in &updates {
+            update
+                .validate()
+                .map_err(ResourceError::InvalidStatusReport)?;
+        }
+        self.mutate_status(terminal_id, move |status, bookkeeping, revision| {
+            status.apply_updates_with_bookkeeping(
+                updates,
+                source,
+                automatic_pid,
+                revision,
+                now_ms,
+                bookkeeping,
+            )
+        })
+    }
+
+    fn mutate_status(
+        &mut self,
+        terminal_id: TerminalId,
+        mutation: impl FnOnce(&mut ProgramStatus, &mut StatusBookkeeping, u64) -> bool,
     ) -> Result<u64, ResourceError> {
         let pane_id = *self
             .terminals
             .get(&terminal_id)
             .ok_or(ResourceError::NotFound("terminal"))?;
-        let activity = &mut self
-            .panes
-            .get_mut(&pane_id)
-            .expect("terminal pane exists")
-            .activity;
-        if activity.has_active_integration()
-            || (activity.detection == detection && activity.state == state)
-        {
-            return Ok(self.revision);
-        }
-        let completed = activity.detection.is_some()
-            && activity.state == AgentState::Working
-            && state == AgentState::Idle
-            && detection.is_some();
-        self.revision += 1;
-        activity.detection = detection;
-        activity.state = state;
-        activity.revision = self.revision;
-        activity.updated_at_ms = now_ms;
-        if completed {
-            activity.last_event = Some(AgentEvent {
-                revision: self.revision,
-                kind: AgentReport::Completed,
-                occurred_at_ms: now_ms,
-                turn_id: None,
-            });
+        let pane = self.panes.get_mut(&pane_id).expect("terminal pane exists");
+        // The complete batch is validated before this infallible mutation.
+        // Mutate both halves together rather than cloning the record payloads.
+        if mutation(
+            &mut pane.activity,
+            &mut pane.status_bookkeeping,
+            self.revision + 1,
+        ) {
+            self.revision += 1;
         }
         Ok(self.revision)
+    }
+
+    pub(crate) fn automatic_status_owners(&self) -> Vec<(TerminalId, u32)> {
+        self.terminals
+            .iter()
+            .flat_map(|(terminal_id, pane_id)| {
+                self.panes[pane_id]
+                    .status_bookkeeping
+                    .automatic_pids()
+                    .into_iter()
+                    .map(|pid| (*terminal_id, pid))
+            })
+            .collect()
+    }
+
+    pub(crate) fn release_automatic_status_owner(
+        &mut self,
+        terminal_id: TerminalId,
+        automatic_pid: u32,
+    ) -> Result<u64, ResourceError> {
+        self.mutate_status(terminal_id, |status, bookkeeping, revision| {
+            status.release_automatic_pid(automatic_pid, revision, bookkeeping)
+        })
+    }
+
+    pub fn clear_status(
+        &mut self,
+        terminal_id: TerminalId,
+        id: Option<&str>,
+    ) -> Result<u64, ResourceError> {
+        self.apply_status_mutation(
+            terminal_id,
+            vec![StatusUpdate::Clear {
+                id: id.map(str::to_owned),
+            }],
+            None,
+            None,
+            0,
+        )
+    }
+
+    pub fn drop_transient_status(
+        &mut self,
+        terminal_id: TerminalId,
+        _now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        self.apply_status_mutation(
+            terminal_id,
+            vec![StatusUpdate::ProcessExit],
+            None,
+            None,
+            _now_ms,
+        )
     }
 
     /// Record the readable foreground process for a pane. Automatic tab names
@@ -1462,56 +1592,6 @@ impl ResourceTree {
         session.trusted_project_config = config;
         self.revision += 1;
         Ok((self.revision, true))
-    }
-
-    pub fn report_agent_with_metadata(
-        &mut self,
-        terminal_id: TerminalId,
-        report: AgentReport,
-        metadata: AgentReportMetadata,
-        now_ms: u64,
-    ) -> Result<u64, ResourceError> {
-        metadata
-            .validate()
-            .map_err(ResourceError::InvalidAgentReport)?;
-        let pane_id = *self
-            .terminals
-            .get(&terminal_id)
-            .ok_or(ResourceError::NotFound("terminal"))?;
-        self.revision += 1;
-        let revision = self.revision;
-        let activity = &mut self
-            .panes
-            .get_mut(&pane_id)
-            .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))?
-            .activity;
-        let integration = activity
-            .integration
-            .get_or_insert_with(AgentIntegration::default);
-        integration.active = report != AgentReport::Exited;
-        activity.detection = None;
-        if metadata.source.is_some() {
-            integration.source.clone_from(&metadata.source);
-        }
-        if metadata.agent_session_id.is_some() {
-            integration
-                .agent_session_id
-                .clone_from(&metadata.agent_session_id);
-        }
-        activity.state = match report {
-            AgentReport::Idle | AgentReport::Completed | AgentReport::Exited => AgentState::Idle,
-            AgentReport::Working => AgentState::Working,
-            AgentReport::Blocked => AgentState::Blocked,
-        };
-        activity.revision = revision;
-        activity.updated_at_ms = now_ms;
-        activity.last_event = Some(AgentEvent {
-            revision,
-            kind: report,
-            occurred_at_ms: now_ms,
-            turn_id: metadata.turn_id,
-        });
-        Ok(revision)
     }
 
     pub fn create_session(&mut self, path: InitialPath) -> Result<Mutation, ResourceError> {
@@ -2667,7 +2747,8 @@ impl ResourceTree {
                 terminal_id,
                 creation_order,
                 tokens: BTreeMap::new(),
-                activity: AgentActivity::default(),
+                activity: ProgramStatus::default(),
+                status_bookkeeping: StatusBookkeeping::default(),
                 cwd: None,
                 worktree: None,
             },
@@ -3796,269 +3877,963 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_reports_replace_and_override_screen_detection() {
+    fn invalid_status_batches_preserve_records_revision_and_ownership() {
         let mut tree = ResourceTree::default();
         let path = initial("agent", "/agent");
         let terminal_id = path.terminal_id;
         tree.create_session(path).unwrap();
-
-        let detection = AgentDetection {
-            agent: "codex".into(),
-            rule: "working_indicator".into(),
-        };
-        tree.update_agent_detection(terminal_id, Some(detection), AgentState::Working, 10)
-            .unwrap();
-        let detected = tree.agent_activity(terminal_id).unwrap();
-        assert_eq!(detected.state, AgentState::Working);
-        assert!(detected.detection.is_some());
-        assert!(detected.integration.is_none());
-        assert!(detected.last_event.is_none());
-
-        tree.update_agent_detection(
+        tree.apply_automatic_status_update(
             terminal_id,
-            Some(AgentDetection {
-                agent: "codex".into(),
-                rule: "idle_fallback".into(),
-            }),
-            AgentState::Idle,
-            15,
+            StatusUpdate::Report(status_report("", crate::domain::StatusState::Working)),
+            StatusSource::Report {
+                source: Some("test".into()),
+                agent_session_id: None,
+            },
+            42,
+            10,
         )
         .unwrap();
-        let completed = tree.agent_activity(terminal_id).unwrap();
-        assert_eq!(
-            completed.last_event.as_ref().unwrap().kind,
-            AgentReport::Completed
-        );
+        let before = tree.program_status(terminal_id).unwrap().clone();
+        let revision = tree.revision();
+        let owners = tree.automatic_status_owners();
+        let mut invalid = status_report("child", crate::domain::StatusState::Working);
+        invalid.progress = Some(101);
 
-        tree.report_agent(terminal_id, AgentReport::Idle, 20)
-            .unwrap();
-        let integrated_revision = tree.revision();
-        let integrated = tree.agent_activity(terminal_id).unwrap();
-        assert_eq!(integrated.state, AgentState::Idle);
-        assert!(integrated.detection.is_none());
-        assert!(integrated.integration.is_some());
-
-        tree.update_agent_detection(
-            terminal_id,
-            Some(AgentDetection {
-                agent: "codex".into(),
-                rule: "live_blocker".into(),
-            }),
-            AgentState::Blocked,
-            30,
-        )
-        .unwrap();
-        assert_eq!(tree.revision(), integrated_revision);
-        assert_eq!(
-            tree.agent_activity(terminal_id).unwrap().state,
-            AgentState::Idle
-        );
+        assert!(matches!(
+            tree.apply_status_updates(
+                terminal_id,
+                vec![
+                    StatusUpdate::Clear { id: None },
+                    StatusUpdate::Report(invalid)
+                ],
+                StatusSource::Osc,
+                20,
+            ),
+            Err(ResourceError::InvalidStatusReport(_))
+        ));
+        assert!(matches!(
+            tree.clear_status(terminal_id, Some("bad//id")),
+            Err(ResourceError::InvalidStatusReport(_))
+        ));
+        assert_eq!(tree.program_status(terminal_id).unwrap(), &before);
+        assert_eq!(tree.revision(), revision);
+        assert_eq!(tree.automatic_status_owners(), owners);
     }
 
     #[test]
-    fn agent_reports_are_revisioned_and_completion_remains_bounded() {
+    fn status_batches_replace_records_and_revision_once() {
         let mut tree = ResourceTree::default();
         let path = initial("agent", "/agent");
         let terminal_id = path.terminal_id;
         tree.create_session(path).unwrap();
 
-        let initial_snapshot = tree.snapshot();
-        let unintegrated = &initial_snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity;
-        assert_eq!(unintegrated.state, AgentState::Idle);
-        assert_eq!(unintegrated.integration, None);
-        assert_eq!(unintegrated.last_event, None);
-
-        let working_revision = tree
-            .report_agent_with_metadata(
+        let revision = tree
+            .apply_status_updates(
                 terminal_id,
-                AgentReport::Working,
-                AgentReportMetadata {
-                    source: Some("pi".into()),
-                    agent_session_id: Some("session-1".into()),
-                    turn_id: Some("turn-1".into()),
-                },
+                vec![
+                    StatusUpdate::Report(status_report("", crate::domain::StatusState::Working)),
+                    StatusUpdate::Report(status_report(
+                        "build/test",
+                        crate::domain::StatusState::Blocked,
+                    )),
+                ],
+                StatusSource::Osc,
                 10,
             )
             .unwrap();
-        let working = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
-            .activity
-            .clone();
-        assert_eq!(working.state, AgentState::Working);
-        assert_eq!(working.revision, working_revision);
-        assert_eq!(
-            working.integration.as_ref().unwrap().source.as_deref(),
-            Some("pi")
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.records.len(), 2);
+        assert!(
+            status
+                .records
+                .iter()
+                .all(|record| record.revision == revision)
         );
-        assert_eq!(
-            working.last_event,
-            Some(AgentEvent {
-                revision: working_revision,
-                kind: AgentReport::Working,
-                occurred_at_ms: 10,
-                turn_id: Some("turn-1".into()),
-            })
-        );
+        assert_eq!(status.summary_state(), crate::domain::StatusState::Blocked);
 
-        let completed_revision = tree
-            .report_agent(terminal_id, AgentReport::Completed, 20)
+        let no_op = tree
+            .clear_status(terminal_id, Some("not-a-record"))
             .unwrap();
-        let completed = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
-            .activity
-            .clone();
-        assert_eq!(completed.state, AgentState::Idle);
-        assert_eq!(
-            completed.last_event,
-            Some(AgentEvent {
-                revision: completed_revision,
-                kind: AgentReport::Completed,
-                occurred_at_ms: 20,
-                turn_id: None,
-            })
-        );
-        let serialized_snapshot = serde_json::to_value(tree.snapshot()).unwrap();
-        let serialized_activity =
-            &serialized_snapshot["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]["activity"];
-        assert!(serialized_activity.get("integration").is_some());
-        assert_eq!(serialized_activity["last_event"]["kind"], "completed");
-        assert!(serialized_activity.get("attention").is_none());
-        assert!(completed.has_unread_attention());
-        let acknowledged_revision = tree
-            .acknowledge_agent(terminal_id, completed_revision)
-            .unwrap()
-            .unwrap();
-        let acknowledged = tree.agent_activity(terminal_id).unwrap();
-        assert_eq!(acknowledged.read_revision, completed_revision);
-        assert!(!acknowledged.has_unread_attention());
-        assert_eq!(
-            tree.acknowledge_agent(terminal_id, completed_revision)
-                .unwrap(),
-            None
-        );
-        assert_eq!(tree.revision(), acknowledged_revision);
-        tree.report_agent(terminal_id, AgentReport::Blocked, 30)
-            .unwrap();
-        let blocked = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
-            .activity
-            .clone();
-        assert_eq!(blocked.state, AgentState::Blocked);
-        assert_eq!(
-            blocked.last_event.as_ref().unwrap().kind,
-            AgentReport::Blocked
-        );
-        assert!(blocked.has_unread_attention());
-        assert_eq!(
-            blocked.integration.as_ref().unwrap().source.as_deref(),
-            Some("pi")
-        );
+        assert_eq!(no_op, revision);
+        tree.clear_status(terminal_id, Some("build")).unwrap();
+        assert_eq!(tree.program_status(terminal_id).unwrap().records.len(), 1);
 
-        let before_rejected_report = tree.revision();
-        assert_eq!(
-            tree.report_agent_with_metadata(
+        let fast_revision = tree
+            .apply_status_updates(
                 terminal_id,
-                AgentReport::Working,
-                AgentReportMetadata {
-                    source: Some("x".repeat(crate::domain::MAX_AGENT_METADATA_VALUE_BYTES + 1)),
-                    ..AgentReportMetadata::default()
-                },
-                40,
-            ),
-            Err(ResourceError::InvalidAgentReport(
-                "agent report metadata value is too long"
-            ))
-        );
-        assert_eq!(tree.revision(), before_rejected_report);
+                vec![
+                    StatusUpdate::Report(status_report(
+                        "fast",
+                        crate::domain::StatusState::Working,
+                    )),
+                    StatusUpdate::Report(status_report("fast", crate::domain::StatusState::Done)),
+                ],
+                StatusSource::Osc,
+                20,
+            )
+            .unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        let fast = status
+            .records
+            .iter()
+            .find(|record| record.id == "fast")
+            .unwrap();
+        assert_eq!(fast.state, crate::domain::StatusState::Done);
+        assert_eq!(fast.attention_revision, fast_revision);
+        assert_eq!(status.working_revision, fast_revision);
+    }
+
+    #[test]
+    fn status_identical_reports_only_refresh_lru_while_source_changes_are_observable() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let report = status_report("", crate::domain::StatusState::Working);
+
+        let first_revision = tree
+            .apply_status_report(terminal_id, report.clone(), StatusSource::Osc, 10)
+            .unwrap();
+        let first_record = tree
+            .program_status(terminal_id)
+            .unwrap()
+            .root()
+            .unwrap()
+            .clone();
         assert_eq!(
-            tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
-                .activity
-                .last_event
-                .as_ref()
-                .unwrap()
-                .kind,
-            AgentReport::Blocked
+            tree.apply_status_report(terminal_id, report.clone(), StatusSource::Osc, 99)
+                .unwrap(),
+            first_revision
+        );
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.revision, first_revision);
+        assert_eq!(status.root().unwrap(), &first_record);
+
+        let changed_source = StatusSource::Report {
+            source: Some("manual".into()),
+            agent_session_id: Some("session-1".into()),
+        };
+        let source_revision = tree
+            .apply_status_report(terminal_id, report.clone(), changed_source.clone(), 100)
+            .unwrap();
+        assert_eq!(source_revision, first_revision + 1);
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.source.as_ref(), Some(&changed_source));
+        assert_eq!(status.root().unwrap(), &first_record);
+        assert_eq!(status.revision, source_revision);
+
+        assert_eq!(
+            tree.apply_status_report(terminal_id, report, changed_source, 101)
+                .unwrap(),
+            source_revision
         );
     }
 
     #[test]
-    fn exited_agent_integration_becomes_inactive_until_the_next_report() {
+    fn status_lru_tracks_identical_same_timestamp_receipts_without_reordering_records() {
         let mut tree = ResourceTree::default();
         let path = initial("agent", "/agent");
         let terminal_id = path.terminal_id;
         tree.create_session(path).unwrap();
 
-        tree.report_agent_with_metadata(
+        tree.apply_status_report(
             terminal_id,
-            AgentReport::Idle,
-            AgentReportMetadata {
+            status_report("", crate::domain::StatusState::Idle),
+            StatusSource::Osc,
+            10,
+        )
+        .unwrap();
+        for index in 0..crate::domain::MAX_STATUS_RECORDS - 1 {
+            tree.apply_status_report(
+                terminal_id,
+                status_report(&format!("r{index}"), crate::domain::StatusState::Idle),
+                StatusSource::Osc,
+                10,
+            )
+            .unwrap();
+        }
+        let before_touch = tree.revision();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Idle),
+            StatusSource::Osc,
+            10,
+        )
+        .unwrap();
+        assert_eq!(tree.revision(), before_touch);
+        assert!(
+            tree.program_status(terminal_id).unwrap().records[0]
+                .id
+                .is_empty()
+        );
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("overflow", crate::domain::StatusState::Idle),
+            StatusSource::Osc,
+            10,
+        )
+        .unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.records.len(), crate::domain::MAX_STATUS_RECORDS);
+        assert!(
+            status.root().is_some(),
+            "the touched root is no longer least recent"
+        );
+        assert!(!status.records.iter().any(|record| record.id == "r0"));
+        assert!(status.records[0].id.is_empty());
+    }
+
+    #[test]
+    fn status_attention_is_per_record_and_transient_lifetimes_are_applied() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("old", crate::domain::StatusState::Done),
+            StatusSource::Osc,
+            10,
+        )
+        .unwrap();
+        let old_attention = tree
+            .program_status(terminal_id)
+            .unwrap()
+            .attention()
+            .unwrap()
+            .attention_revision;
+        tree.apply_status_report(
+            terminal_id,
+            status_report("new", crate::domain::StatusState::Blocked),
+            StatusSource::Osc,
+            20,
+        )
+        .unwrap();
+        tree.clear_status(terminal_id, Some("new")).unwrap();
+        assert_eq!(
+            tree.program_status(terminal_id)
+                .unwrap()
+                .attention()
+                .unwrap()
+                .attention_revision,
+            old_attention,
+            "removing newer attention reveals the older unread record"
+        );
+        tree.acknowledge_agent(terminal_id, old_attention)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !tree
+                .program_status(terminal_id)
+                .unwrap()
+                .has_unread_attention()
+        );
+        assert_eq!(
+            tree.acknowledge_agent(terminal_id, old_attention).unwrap(),
+            None
+        );
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("live", crate::domain::StatusState::Working),
+            StatusSource::Osc,
+            30,
+        )
+        .unwrap();
+        tree.drop_transient_status(terminal_id, 40).unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.records.len(), 1);
+        assert_eq!(status.records[0].id, "old");
+    }
+
+    #[test]
+    fn status_prompt_and_process_exit_release_explicit_ownership_without_hidden_revisions() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("result", crate::domain::StatusState::Done),
+            StatusSource::Report {
                 source: Some("pi".into()),
                 agent_session_id: Some("session-1".into()),
-                turn_id: None,
             },
             10,
         )
         .unwrap();
-        assert!(
-            tree.agent_activity(terminal_id)
-                .unwrap()
-                .has_active_integration()
-        );
-
-        tree.report_agent(terminal_id, AgentReport::Exited, 20)
-            .unwrap();
-        let exited = tree.agent_activity(terminal_id).unwrap();
-        assert!(!exited.has_active_integration());
-        assert_eq!(exited.state, AgentState::Idle);
-        assert_eq!(
-            exited.last_event.as_ref().unwrap().kind,
-            AgentReport::Exited
-        );
-        assert_eq!(
-            exited.integration.as_ref().unwrap().source.as_deref(),
-            Some("pi")
-        );
-
-        tree.update_agent_detection(
+        let explicit_revision = tree.revision();
+        tree.apply_status_report(
             terminal_id,
-            Some(AgentDetection {
+            status_report("", crate::domain::StatusState::Working),
+            StatusSource::Detection {
                 agent: "codex".into(),
                 rule: "working_indicator".into(),
-            }),
-            AgentState::Working,
-            25,
+            },
+            20,
         )
         .unwrap();
-        tree.update_agent_detection(
+        assert_eq!(tree.revision(), explicit_revision);
+
+        let prompt_revision = tree
+            .apply_status_updates(
+                terminal_id,
+                vec![StatusUpdate::PromptStart],
+                StatusSource::Osc,
+                22,
+            )
+            .unwrap();
+        assert_eq!(prompt_revision, explicit_revision);
+        let detected_revision = tree
+            .apply_status_report(
+                terminal_id,
+                status_report("", crate::domain::StatusState::Working),
+                StatusSource::Detection {
+                    agent: "codex".into(),
+                    rule: "working_indicator".into(),
+                },
+                23,
+            )
+            .unwrap();
+        assert_eq!(detected_revision, explicit_revision + 1);
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.records.len(), 2);
+        assert!(status.records.iter().any(|record| record.id == "result"));
+        assert!(matches!(status.source, Some(StatusSource::Report { .. })));
+        assert!(status.is_reporting());
+
+        tree.drop_transient_status(terminal_id, 25).unwrap();
+        let process_exit_revision = tree.revision();
+        assert_eq!(
+            tree.drop_transient_status(terminal_id, 26).unwrap(),
+            process_exit_revision,
+            "releasing hidden ownership alone is not a resource change"
+        );
+        tree.apply_status_report(
             terminal_id,
-            Some(AgentDetection {
+            status_report("", crate::domain::StatusState::Working),
+            StatusSource::Detection {
                 agent: "codex".into(),
-                rule: "idle_fallback".into(),
-            }),
-            AgentState::Idle,
-            26,
+                rule: "working_indicator".into(),
+            },
+            30,
         )
         .unwrap();
+        assert_eq!(tree.program_status(terminal_id).unwrap().records.len(), 2);
+    }
+
+    #[test]
+    fn status_explicit_takeover_removes_only_detection_records_and_clear_releases_lease() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let explicit_source = StatusSource::Report {
+            source: Some("pi".into()),
+            agent_session_id: Some("session-1".into()),
+        };
+        let detection_source = || StatusSource::Detection {
+            agent: "codex".into(),
+            rule: "screen".into(),
+        };
+        assert!(!tree.has_detection_status(terminal_id).unwrap());
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("result", crate::domain::StatusState::Done),
+            explicit_source.clone(),
+            10,
+        )
+        .unwrap();
+        tree.apply_status_updates(
+            terminal_id,
+            vec![StatusUpdate::PromptStart],
+            StatusSource::Osc,
+            11,
+        )
+        .unwrap();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Working),
+            detection_source(),
+            12,
+        )
+        .unwrap();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Idle),
+            detection_source(),
+            13,
+        )
+        .unwrap();
+        assert!(tree.has_detection_status(terminal_id).unwrap());
+
+        let takeover_revision = tree
+            .apply_status_report(
+                terminal_id,
+                status_report("new-child", crate::domain::StatusState::Working),
+                explicit_source,
+                14,
+            )
+            .unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.revision, takeover_revision);
+        assert_eq!(status.records.len(), 2);
+        assert!(status.root().is_none(), "the inferred root was removed");
+        assert!(status.records.iter().any(|record| record.id == "result"));
+        assert!(status.records.iter().any(|record| record.id == "new-child"));
+        let owned = status.clone();
+        assert!(!tree.has_detection_status(terminal_id).unwrap());
+        for update in [
+            StatusUpdate::ProcessExit,
+            StatusUpdate::PromptStart,
+            StatusUpdate::Clear { id: None },
+            StatusUpdate::Report(status_report("", crate::domain::StatusState::Working)),
+        ] {
+            assert_eq!(
+                tree.apply_status_updates(terminal_id, vec![update], detection_source(), 14)
+                    .unwrap(),
+                takeover_revision
+            );
+            assert_eq!(tree.program_status(terminal_id).unwrap(), &owned);
+        }
+
+        tree.clear_status(terminal_id, Some("new-child")).unwrap();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Working),
+            detection_source(),
+            15,
+        )
+        .unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.records.len(), 2);
+        assert!(status.records.iter().any(|record| record.id == "result"));
+        assert!(matches!(status.source, Some(StatusSource::Report { .. })));
+        assert!(status.is_reporting());
+        assert!(tree.has_detection_status(terminal_id).unwrap());
+
+        tree.clear_status(terminal_id, Some("result")).unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
         assert!(matches!(
-            tree.agent_activity(terminal_id)
-                .unwrap()
-                .last_event
-                .as_ref()
-                .map(|event| event.kind),
-            Some(AgentReport::Completed)
+            status.source,
+            Some(StatusSource::Detection { .. })
         ));
         assert!(
-            !tree
-                .agent_activity(terminal_id)
+            !status.is_reporting(),
+            "detection-only status is not an agent"
+        );
+        tree.drop_transient_status(terminal_id, 16).unwrap();
+        assert!(tree.program_status(terminal_id).unwrap().records.is_empty());
+        assert!(!tree.has_detection_status(terminal_id).unwrap());
+    }
+
+    #[test]
+    fn status_clears_do_not_claim_ownership_and_full_clear_releases_it() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let detection = || StatusSource::Detection {
+            agent: "codex".into(),
+            rule: "screen".into(),
+        };
+
+        let empty_revision = tree.clear_status(terminal_id, None).unwrap();
+        assert_eq!(empty_revision, tree.revision());
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Working),
+            detection(),
+            10,
+        )
+        .unwrap();
+        assert!(!tree.program_status(terminal_id).unwrap().is_reporting());
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("child", crate::domain::StatusState::Working),
+            StatusSource::Osc,
+            11,
+        )
+        .unwrap();
+        tree.clear_status(terminal_id, None).unwrap();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Working),
+            detection(),
+            12,
+        )
+        .unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.records.len(), 1);
+        assert!(matches!(
+            status.source,
+            Some(StatusSource::Detection { .. })
+        ));
+        assert!(!status.is_reporting());
+    }
+
+    #[test]
+    fn automatic_pid_cleanup_is_record_scoped_across_native_replacements() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let cli_source = StatusSource::Report {
+            source: Some("cli".into()),
+            agent_session_id: None,
+        };
+
+        let root = status_report("", crate::domain::StatusState::Working);
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(root.clone()),
+            cli_source.clone(),
+            7,
+            10,
+        )
+        .unwrap();
+        tree.apply_status_report(terminal_id, root, StatusSource::Osc, 11)
+            .unwrap();
+        let native_revision = tree.revision();
+        assert!(tree.automatic_status_owners().is_empty());
+        assert_eq!(
+            tree.release_automatic_status_owner(terminal_id, 7).unwrap(),
+            native_revision
+        );
+        assert_eq!(
+            tree.program_status(terminal_id)
                 .unwrap()
-                .has_active_integration(),
-            "screen inference must not reactivate exited integration metadata"
+                .root()
+                .unwrap()
+                .state,
+            crate::domain::StatusState::Working
         );
 
-        tree.report_agent(terminal_id, AgentReport::Idle, 30)
-            .unwrap();
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(status_report(
+                "cli/task",
+                crate::domain::StatusState::Working,
+            )),
+            cli_source.clone(),
+            8,
+            20,
+        )
+        .unwrap();
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(status_report(
+                "cli/result",
+                crate::domain::StatusState::Done,
+            )),
+            cli_source.clone(),
+            8,
+            21,
+        )
+        .unwrap();
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(status_report(
+                "cli/error",
+                crate::domain::StatusState::Error,
+            )),
+            cli_source,
+            8,
+            21,
+        )
+        .unwrap();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("cli/task/child", crate::domain::StatusState::Working),
+            StatusSource::Osc,
+            22,
+        )
+        .unwrap();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("native", crate::domain::StatusState::Working),
+            StatusSource::Osc,
+            23,
+        )
+        .unwrap();
+
+        tree.release_automatic_status_owner(terminal_id, 8).unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert!(!status.records.iter().any(|record| record.id == "cli/task"));
         assert!(
-            tree.agent_activity(terminal_id)
-                .unwrap()
-                .has_active_integration()
+            status
+                .records
+                .iter()
+                .any(|record| record.id == "cli/task/child")
         );
+        assert!(
+            status.records.iter().any(|record| record.id == "cli/result"
+                && record.state == crate::domain::StatusState::Done)
+        );
+        assert!(
+            status.records.iter().any(|record| record.id == "cli/error"
+                && record.state == crate::domain::StatusState::Error)
+        );
+        assert!(status.records.iter().any(|record| record.id == "native"));
+        assert!(tree.automatic_status_owners().is_empty());
+    }
+
+    #[test]
+    fn automatic_private_ownership_changes_do_not_publish_revisions() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let source = StatusSource::Report {
+            source: Some("cli".into()),
+            agent_session_id: None,
+        };
+        let done = status_report("result", crate::domain::StatusState::Done);
+
+        let revision = tree
+            .apply_automatic_status_update(
+                terminal_id,
+                StatusUpdate::Report(done.clone()),
+                source.clone(),
+                10,
+                10,
+            )
+            .unwrap();
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 10)]);
+        assert_eq!(
+            tree.apply_automatic_status_update(
+                terminal_id,
+                StatusUpdate::Report(done.clone()),
+                source.clone(),
+                11,
+                11,
+            )
+            .unwrap(),
+            revision,
+            "identical payload PID reassignment is private"
+        );
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 11)]);
+        assert_eq!(
+            tree.release_automatic_status_owner(terminal_id, 10)
+                .unwrap(),
+            revision
+        );
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 11)]);
+        assert_eq!(
+            tree.release_automatic_status_owner(terminal_id, 11)
+                .unwrap(),
+            revision,
+            "retaining Done while releasing its PID lease is private"
+        );
+        assert!(tree.automatic_status_owners().is_empty());
+        assert_eq!(
+            tree.program_status(terminal_id)
+                .unwrap()
+                .records
+                .first()
+                .unwrap()
+                .state,
+            crate::domain::StatusState::Done
+        );
+
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(done.clone()),
+            source.clone(),
+            12,
+            12,
+        )
+        .unwrap();
+        assert_eq!(
+            tree.apply_automatic_status_update(
+                terminal_id,
+                StatusUpdate::PromptStart,
+                source.clone(),
+                99,
+                13,
+            )
+            .unwrap(),
+            revision
+        );
+        assert!(tree.automatic_status_owners().is_empty());
+
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(done),
+            source.clone(),
+            13,
+            14,
+        )
+        .unwrap();
+        assert_eq!(
+            tree.apply_automatic_status_update(
+                terminal_id,
+                StatusUpdate::ProcessExit,
+                source,
+                99,
+                15,
+            )
+            .unwrap(),
+            revision
+        );
+        assert!(tree.automatic_status_owners().is_empty());
+    }
+
+    #[test]
+    fn native_batch_ownership_replaces_one_record_and_keeps_results_on_owner_exit() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let before = tree.revision();
+        let batch_revision = tree
+            .apply_automatic_status_updates(
+                terminal_id,
+                vec![
+                    StatusUpdate::Report(status_report("one", crate::domain::StatusState::Working)),
+                    StatusUpdate::Report(status_report("two", crate::domain::StatusState::Working)),
+                ],
+                StatusSource::Osc,
+                42,
+                10,
+            )
+            .unwrap();
+        assert_eq!(batch_revision, before + 1);
+
+        assert_eq!(
+            tree.apply_automatic_status_update(
+                terminal_id,
+                StatusUpdate::Report(status_report("one", crate::domain::StatusState::Working)),
+                StatusSource::Osc,
+                84,
+                11,
+            )
+            .unwrap(),
+            batch_revision,
+            "changing only a record's PID owner is private"
+        );
+        tree.release_automatic_status_owner(terminal_id, 42)
+            .unwrap();
+        assert_eq!(tree.program_status(terminal_id).unwrap().records.len(), 1);
+        assert_eq!(
+            tree.program_status(terminal_id).unwrap().records[0].id,
+            "one"
+        );
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 84)]);
+
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(status_report("one", crate::domain::StatusState::Done)),
+            StatusSource::Osc,
+            84,
+            12,
+        )
+        .unwrap();
+        tree.release_automatic_status_owner(terminal_id, 84)
+            .unwrap();
+
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.records.len(), 1);
+        assert_eq!(status.records[0].id, "one");
+        assert_eq!(status.records[0].state, crate::domain::StatusState::Done);
+        assert!(tree.automatic_status_owners().is_empty());
+    }
+
+    #[test]
+    fn automatic_clears_prune_but_never_claim_pid_ownership() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let source = StatusSource::Report {
+            source: Some("cli".into()),
+            agent_session_id: None,
+        };
+        for id in ["one", "two"] {
+            tree.apply_automatic_status_update(
+                terminal_id,
+                StatusUpdate::Report(status_report(id, crate::domain::StatusState::Working)),
+                source.clone(),
+                20,
+                10,
+            )
+            .unwrap();
+        }
+
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Clear {
+                id: Some("absent".into()),
+            },
+            source.clone(),
+            99,
+            11,
+        )
+        .unwrap();
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 20)]);
+        tree.apply_status_updates(
+            terminal_id,
+            vec![StatusUpdate::Clear {
+                id: Some("also-absent".into()),
+            }],
+            StatusSource::Osc,
+            11,
+        )
+        .unwrap();
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 20)]);
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Clear {
+                id: Some("one".into()),
+            },
+            source.clone(),
+            99,
+            12,
+        )
+        .unwrap();
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 20)]);
+        assert_eq!(
+            tree.program_status(terminal_id).unwrap().records[0].id,
+            "two"
+        );
+        tree.release_automatic_status_owner(terminal_id, 20)
+            .unwrap();
+        assert!(tree.program_status(terminal_id).unwrap().records.is_empty());
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(status_report("three", crate::domain::StatusState::Working)),
+            source.clone(),
+            20,
+            13,
+        )
+        .unwrap();
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Clear { id: None },
+            source,
+            99,
+            14,
+        )
+        .unwrap();
+        assert!(tree.automatic_status_owners().is_empty());
+    }
+
+    #[test]
+    fn status_lru_eviction_prunes_automatic_pid_links() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let source = StatusSource::Report {
+            source: Some("cli".into()),
+            agent_session_id: None,
+        };
+        for index in 0..crate::domain::MAX_STATUS_RECORDS {
+            tree.apply_automatic_status_update(
+                terminal_id,
+                StatusUpdate::Report(status_report(
+                    &format!("r{index}"),
+                    crate::domain::StatusState::Working,
+                )),
+                source.clone(),
+                index as u32 + 1,
+                index as u64,
+            )
+            .unwrap();
+        }
+        tree.apply_automatic_status_update(
+            terminal_id,
+            StatusUpdate::Report(status_report(
+                "overflow",
+                crate::domain::StatusState::Working,
+            )),
+            source,
+            999,
+            999,
+        )
+        .unwrap();
+
+        let owners = tree.automatic_status_owners();
+        assert!(!owners.contains(&(terminal_id, 1)));
+        assert!(owners.contains(&(terminal_id, 2)));
+        assert!(owners.contains(&(terminal_id, 999)));
+        assert!(
+            !tree
+                .program_status(terminal_id)
+                .unwrap()
+                .records
+                .iter()
+                .any(|record| record.id == "r0")
+        );
+    }
+
+    #[test]
+    fn status_detection_working_to_idle_produces_a_persistent_done_record() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let source = |rule: &str| StatusSource::Detection {
+            agent: "codex".into(),
+            rule: rule.into(),
+        };
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Working),
+            source("working_indicator"),
+            10,
+        )
+        .unwrap();
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Idle),
+            source("idle_fallback"),
+            20,
+        )
+        .unwrap();
+        let done_revision = tree.revision();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(
+            status.root().unwrap().state,
+            crate::domain::StatusState::Done
+        );
+        assert!(status.has_unread_attention());
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("", crate::domain::StatusState::Idle),
+            source("idle_fallback"),
+            30,
+        )
+        .unwrap();
+        assert_eq!(tree.revision(), done_revision);
+        tree.drop_transient_status(terminal_id, 40).unwrap();
+        assert_eq!(
+            tree.program_status(terminal_id)
+                .unwrap()
+                .root()
+                .unwrap()
+                .state,
+            crate::domain::StatusState::Done
+        );
+    }
+
+    fn status_report(id: &str, state: crate::domain::StatusState) -> StatusReport {
+        StatusReport {
+            id: id.into(),
+            state,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            message: None,
+        }
     }
 
     fn assert_valid<T>(tree: &ResourceTree, result: &Result<T, ResourceError>) {

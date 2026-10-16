@@ -325,7 +325,7 @@ async fn remote_cli_navigates_and_attaches_across_versions_without_optional_capa
     let socket = root.path().join("compatible-peer.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let daemon_socket = harness.socket.clone();
-    // Simulate a generation-1 implementation from another package release
+    // Simulate a generation-2 implementation from another package release
     // which implements only the required capabilities. The real SSH bridge
     // still forwards opaque bytes; this shim exists only in the test peer.
     let peer = tokio::spawn(async move {

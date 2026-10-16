@@ -13,9 +13,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 use crate::{
     alerts::{AlertCursor, ClientAlertSnapshot},
     domain::{
-        AgentActivity, AgentReport, AgentReportMetadata, CopyModeAction, CopyModeError, MouseEvent,
-        PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId, TerminalId, TerminalOutput,
-        TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
+        CopyModeAction, CopyModeError, MouseEvent, PaneId, ProgramStatus, ScreenDelta,
+        ScreenSnapshot, SessionId, SplitId, StatusSource, StatusUpdate, TabId, TerminalId,
+        TerminalOutput, TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
     },
     resources::{PresentationTokenTarget, ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitRatio, SplitTree},
@@ -576,17 +576,15 @@ pub enum ClientMessage {
     ReloadExtensions,
     ReportAgent {
         terminal_id: TerminalId,
-        report: AgentReport,
-        #[serde(default, skip_serializing_if = "AgentReportMetadata::is_empty")]
-        metadata: AgentReportMetadata,
+        report: StatusUpdate,
+        source: StatusSource,
     },
     /// Automatic report using inherited terminal context. The daemon verifies
     /// that the socket peer belongs to the target terminal's process tree.
-    ReportTerminalAgent {
+    ReportAutomaticAgent {
         terminal_id: TerminalId,
-        report: AgentReport,
-        #[serde(default, skip_serializing_if = "AgentReportMetadata::is_empty")]
-        metadata: AgentReportMetadata,
+        report: StatusUpdate,
+        source: StatusSource,
     },
     AcknowledgeAgent {
         terminal_id: TerminalId,
@@ -752,7 +750,7 @@ pub enum ServerMessage {
         barrier_revision: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_revision: Option<u64>,
-        activity: AgentActivity,
+        activity: ProgramStatus,
     },
     Pong {
         daemon_pid: u32,
@@ -942,15 +940,22 @@ mod tests {
     }
 
     #[test]
-    fn agent_report_metadata_round_trips_and_old_requests_default_it() {
+    fn status_updates_and_sources_round_trip_without_legacy_metadata() {
         let terminal_id = TerminalId::new();
         let message = ClientMessage::ReportAgent {
             terminal_id,
-            report: AgentReport::Completed,
-            metadata: AgentReportMetadata {
+            report: StatusUpdate::Report(crate::domain::StatusReport {
+                id: "build/test".into(),
+                state: crate::domain::StatusState::Done,
+                kind: None,
+                progress: None,
+                app: Some("cargo".into()),
+                title: Some("Tests".into()),
+                message: Some("Passed".into()),
+            }),
+            source: StatusSource::Report {
                 source: Some("claude-code".into()),
                 agent_session_id: Some("session-1".into()),
-                turn_id: Some("turn-9".into()),
             },
         };
         assert_eq!(
@@ -962,14 +967,7 @@ mod tests {
             r#"{{"type":"report_agent","terminal_id":"{}","report":"working"}}"#,
             terminal_id.uuid()
         );
-        assert_eq!(
-            serde_json::from_str::<ClientMessage>(&legacy).unwrap(),
-            ClientMessage::ReportAgent {
-                terminal_id,
-                report: AgentReport::Working,
-                metadata: AgentReportMetadata::default(),
-            }
-        );
+        assert!(serde_json::from_str::<ClientMessage>(&legacy).is_err());
     }
 
     fn ping(request_id: Option<Uuid>) -> Envelope<ClientMessage> {
@@ -1196,19 +1194,27 @@ mod tests {
             );
         }
 
-        let activity = AgentActivity {
-            integration: Some(Default::default()),
-            detection: None,
-            state: crate::domain::AgentState::Blocked,
-            revision: 9,
-            updated_at_ms: 12,
-            last_event: Some(crate::domain::AgentEvent {
+        let activity = ProgramStatus {
+            records: vec![crate::domain::StatusRecord {
+                id: String::new(),
+                state: crate::domain::StatusState::Blocked,
+                kind: Some(crate::domain::BlockedKind::Question),
+                progress: None,
+                app: Some("pi".into()),
+                title: None,
+                message: Some("Continue?".into()),
                 revision: 9,
-                kind: AgentReport::Blocked,
-                occurred_at_ms: 12,
-                turn_id: Some("turn-1".into()),
+                updated_at_ms: 12,
+                attention_revision: 9,
+            }],
+            source: Some(StatusSource::Report {
+                source: Some("pi".into()),
+                agent_session_id: Some("session-1".into()),
             }),
+            revision: 9,
+            attention_revision: 9,
             read_revision: 0,
+            working_revision: 7,
         };
         let message = ServerMessage::AgentSettled {
             terminal_id,

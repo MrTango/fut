@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     ffi::OsString,
     io::{Read, Write},
@@ -20,12 +21,13 @@ use tokio::sync::{broadcast, mpsc as async_mpsc, oneshot, watch};
 use super::{DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH};
 use crate::domain::{
     ClientId, CopyModeAction, CopyModeError, MouseEvent, MouseEventKind, ScreenSnapshot,
-    TerminalId, TerminalOutputSource, TerminalSize,
+    StatusUpdate, TerminalId, TerminalOutputSource, TerminalSize,
 };
 
 use super::{
     CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
     ghostty::{CopyModeFailure, GhosttyTerminal, MouseForwarding},
+    status::{NativeStatusBatch, StatusCoalescer},
 };
 
 const QUEUE_CAPACITY: usize = 64;
@@ -57,6 +59,7 @@ const OUTPUT_DRAIN_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 // ~630µs a 200x50 snapshot costs. Interactive echo latency is unaffected: a
 // keystroke's response typically lands well after the previous snapshot.
 const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_millis(8);
+const STATUS_BATCH_CAPACITY: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
@@ -87,13 +90,9 @@ pub enum TerminalLifecycle {
     Exited { exit_code: Option<i32> },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TerminalActivity {
     pub bell_count: u64,
-    /// Number of OSC 7501 root-record reports seen, including resets.
-    pub program_status_count: u64,
-    /// The most recent of those reports, oldest first.
-    pub program_statuses: Vec<super::ProgramStatus>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +125,7 @@ pub struct TerminalHandle {
     activity: watch::Sender<TerminalActivity>,
     /// Queued input bytes the PTY has not accepted yet.
     input_backlog: Arc<AtomicUsize>,
+    status_updates: Arc<Mutex<Option<async_mpsc::Receiver<NativeStatusBatch>>>>,
 }
 
 /// Command sender paired with the runtime thread's doorbell. The runtime
@@ -369,6 +369,10 @@ impl TerminalHandle {
     }
 
     pub async fn close(&self) -> Result<(), CommandError> {
+        // Teardown must not wait for a status consumer that was never claimed
+        // (for example, a spawn rolled back before daemon registration).
+        // An active consumer already owns its receiver and is unaffected.
+        drop(self.take_status_updates());
         if matches!(*self.lifecycle.borrow(), TerminalLifecycle::Exited { .. }) {
             return Ok(());
         }
@@ -408,6 +412,15 @@ impl TerminalHandle {
     #[must_use]
     pub fn subscribe_activity(&self) -> watch::Receiver<TerminalActivity> {
         self.activity.subscribe()
+    }
+
+    /// Takes the terminal's sole ordered, lossless status-update stream.
+    ///
+    /// The daemon must continuously drain this bounded receiver. It must not
+    /// hold resource locks while waiting, because status backpressure can make
+    /// an output-barrier command wait for channel capacity.
+    pub(crate) fn take_status_updates(&self) -> Option<async_mpsc::Receiver<NativeStatusBatch>> {
+        self.status_updates.lock().ok()?.take()
     }
 
     fn send(&self, message: RuntimeMessage) -> Result<(), CommandError> {
@@ -649,6 +662,92 @@ struct RuntimePublishers<'a> {
     events: &'a broadcast::Sender<TerminalEvent>,
     lifecycle: &'a watch::Sender<TerminalLifecycle>,
     activity: &'a watch::Sender<TerminalActivity>,
+    status: RefCell<RuntimeStatusProducer<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct StatusProcess<'a> {
+    master: &'a dyn MasterPty,
+    child_pid: u32,
+}
+
+impl StatusProcess<'_> {
+    fn foreground_pid(self) -> u32 {
+        self.master
+            .process_group_leader()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .unwrap_or(self.child_pid)
+    }
+}
+
+struct RuntimeStatusProducer<'a> {
+    publisher: &'a async_mpsc::Sender<NativeStatusBatch>,
+    process: Option<StatusProcess<'a>>,
+    coalescer: StatusCoalescer,
+}
+
+impl<'a> RuntimeStatusProducer<'a> {
+    fn new(
+        publisher: &'a async_mpsc::Sender<NativeStatusBatch>,
+        process: Option<StatusProcess<'a>>,
+    ) -> Self {
+        Self {
+            publisher,
+            process,
+            coalescer: StatusCoalescer::default(),
+        }
+    }
+
+    /// Accept callbacks immediately after one VT feed. The foreground process
+    /// is sampled only when that feed actually produced status records.
+    fn receive(&mut self, terminal: &GhosttyTerminal) {
+        let updates = terminal.take_status_updates();
+        let process = self.process;
+        self.receive_updates(updates, || process.map(StatusProcess::foreground_pid));
+    }
+
+    fn receive_updates(
+        &mut self,
+        updates: Vec<StatusUpdate>,
+        foreground_pid: impl FnOnce() -> Option<u32>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+        for batch in self.coalescer.receive(NativeStatusBatch {
+            updates,
+            foreground_pid: foreground_pid(),
+        }) {
+            self.publish(batch);
+        }
+    }
+
+    fn flush(&mut self, force: bool) {
+        if let Some(batch) = self.coalescer.flush(force) {
+            self.publish(batch);
+        }
+    }
+
+    fn wait(&self) -> Option<Duration> {
+        self.coalescer.wait()
+    }
+
+    fn finish(&mut self) {
+        if let Some(batch) = self.coalescer.flush(true) {
+            self.publish(batch);
+        }
+        let batch = self.coalescer.finish();
+        self.publish(batch);
+    }
+
+    fn publish(&self, batch: NativeStatusBatch) {
+        if let Err(async_mpsc::error::TrySendError::Full(batch)) = self.publisher.try_send(batch) {
+            // This is the dedicated terminal runtime thread, never a Ghostty
+            // callback. Backpressure here bounds memory and eventually the PTY
+            // itself without pausing while the callback mutex is held.
+            let _ = self.publisher.blocking_send(batch);
+        }
+    }
 }
 
 pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
@@ -685,6 +784,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let (events, _) = broadcast::channel(16);
     let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
     let (activity, _) = watch::channel(TerminalActivity::default());
+    let (status_sender, status_updates) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
     let id = spec.id;
     let initial = ScreenSnapshot::new(
         0,
@@ -729,6 +829,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
             let Ok((child, child_pid)) = child_rx.recv() else {
                 return;
             };
+            let master = pair.master;
             run(
                 RuntimeQueues {
                     control: receiver,
@@ -741,8 +842,15 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
                     events: &runtime_events,
                     lifecycle: &runtime_lifecycle,
                     activity: &runtime_activity,
+                    status: RefCell::new(RuntimeStatusProducer::new(
+                        &status_sender,
+                        Some(StatusProcess {
+                            master: &*master,
+                            child_pid,
+                        }),
+                    )),
                 },
-                pair.master,
+                &*master,
                 writer,
                 child,
                 child_pid,
@@ -790,13 +898,14 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
         lifecycle,
         activity,
         input_backlog: handle_backlog,
+        status_updates: Arc::new(Mutex::new(Some(status_updates))),
     })
 }
 
 fn run(
     mut queues: RuntimeQueues,
     publishers: RuntimePublishers<'_>,
-    master: Box<dyn MasterPty + Send>,
+    master: &dyn MasterPty,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     child_pid: u32,
@@ -871,11 +980,7 @@ fn run(
                     {
                         send_error(publishers.events, error);
                     } else {
-                        publish(
-                            terminal.resize(size),
-                            publishers.snapshots,
-                            publishers.events,
-                        );
+                        publish_screen_update(terminal, &publishers, ScreenUpdate::Resize(size));
                     }
                 }
                 RuntimeMessage::ConfigureAttachment(configuration) => {
@@ -899,10 +1004,10 @@ fn run(
                     {
                         send_error(publishers.events, error);
                     } else {
-                        publish(
-                            terminal.resize(configuration.size),
-                            publishers.snapshots,
-                            publishers.events,
+                        publish_screen_update(
+                            terminal,
+                            &publishers,
+                            ScreenUpdate::Resize(configuration.size),
                         );
                     }
                 }
@@ -1009,117 +1114,125 @@ fn run(
                         &publishers,
                         &mut reader_complete,
                     );
-                    let result = terminal
-                        .snapshot_after_feed()
-                        .map(|screen| {
-                            if let Some(screen) = screen {
-                                publishers.snapshots.send_replace(screen);
-                            }
-                        })
-                        .map_err(|error| CommandError::Emulator(error.to_string()));
+                    let result = publish_requested_snapshot(terminal, publishers.snapshots);
                     // Synchronized output deliberately leaves the last complete
                     // frame in place until the application ends it.
                     let _ = completion.send(result);
                 }
                 RuntimeMessage::Close(completion) => {
+                    let close_deadline = Instant::now() + CLOSE_REAP_TIMEOUT;
                     // The throttle may be holding an unpublished snapshot for
                     // bytes already fed to the parser; shutdown reads state
-                    // through `drain_output_until`'s own barrier, which only
+                    // through the post-reap drain's own barrier, which only
                     // republishes messages still queued, not those already
-                    // folded into the terminal. Flush it now so the last
-                    // frame observed before exit is never stale.
+                    // folded into the terminal. Flush it now so the last frame
+                    // observed before exit is never stale.
                     if dirty {
-                        publish_optional(
-                            terminal.snapshot_after_feed(),
-                            publishers.snapshots,
-                            publishers.events,
-                        );
+                        publish_snapshot_after_feed(terminal, &publishers);
                         last_snapshot = Instant::now();
                         dirty = false;
                     }
-                    signal_terminal_processes(&*master, child_pid, libc::SIGHUP);
-                    let graceful = reap_child_while_draining(
-                        || child.try_wait(),
+                    if exit_code.is_none() {
+                        signal_terminal_processes(master, child_pid, libc::SIGHUP);
+                        let graceful = reap_child_while_draining(
+                            || child.try_wait(),
+                            &mut queues.output,
+                            terminal,
+                            &publishers,
+                            &mut reader_complete,
+                            CLOSE_GRACE_PERIOD,
+                        );
+                        let status = match graceful {
+                            Ok(status) => Ok(status),
+                            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                                // The shell may have handed the tty to a new foreground
+                                // group while handling SIGHUP. Re-read both groups, then
+                                // force only survivors down before the final reap.
+                                signal_terminal_processes(master, child_pid, libc::SIGKILL);
+                                reap_child_while_draining(
+                                    || child.try_wait(),
+                                    &mut queues.output,
+                                    terminal,
+                                    &publishers,
+                                    &mut reader_complete,
+                                    close_deadline.saturating_duration_since(Instant::now()),
+                                )
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match status {
+                            Ok(status) => exit_code = Some(status.exit_code() as i32),
+                            Err(error) => {
+                                send_error(publishers.events, anyhow!(error.to_string()));
+                                publish_screen_update(
+                                    terminal,
+                                    &publishers,
+                                    ScreenUpdate::FinishSynchronized,
+                                );
+                                let close_error = if error.kind() == std::io::ErrorKind::TimedOut {
+                                    CommandError::CloseTimeout
+                                } else {
+                                    CommandError::Stopped
+                                };
+                                let _ = completion.send(Err(close_error));
+                                continue 'runtime;
+                            }
+                        }
+                    }
+
+                    // Reaping the direct child does not prove that the PTY
+                    // reader has delivered its final bytes: queued output may
+                    // still be in flight, or an escaped descendant may retain
+                    // the slave fd. Only EOF/disconnection makes ProcessExit
+                    // and lifecycle Exited successful. If EOF misses the same
+                    // bounded close deadline, report failure and return to the
+                    // normal runtime loop so remaining output is still read.
+                    if !drain_output_until_reader_complete(
                         &mut queues.output,
                         terminal,
                         &publishers,
                         &mut reader_complete,
-                        CLOSE_GRACE_PERIOD,
-                    );
-                    let status = match graceful {
-                        Ok(status) => Ok(status),
-                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                            // The shell may have handed the tty to a new foreground
-                            // group while handling SIGHUP. Re-read both groups, then
-                            // force only survivors down before the final reap.
-                            signal_terminal_processes(&*master, child_pid, libc::SIGKILL);
-                            reap_child_while_draining(
-                                || child.try_wait(),
-                                &mut queues.output,
-                                terminal,
-                                &publishers,
-                                &mut reader_complete,
-                                CLOSE_REAP_TIMEOUT.saturating_sub(CLOSE_GRACE_PERIOD),
-                            )
-                        }
-                        Err(error) => Err(error),
-                    };
-                    match status {
-                        Ok(status) => {
-                            let code = Some(status.exit_code() as i32);
-                            drain_output_until(
-                                &mut queues.output,
-                                terminal,
-                                &publishers,
-                                Duration::from_millis(100),
-                            );
-                            publish_exit(publishers.lifecycle, code);
-                            let _ = completion.send(Ok(()));
-                            serve_exited(&mut queues.control, terminal);
-                            return;
-                        }
-                        Err(error) => {
-                            send_error(publishers.events, anyhow!(error.to_string()));
-                            drain_output_until(
-                                &mut queues.output,
-                                terminal,
-                                &publishers,
-                                Duration::from_millis(100),
-                            );
-                            publish_optional(
-                                terminal.finish_synchronized_output(),
-                                publishers.snapshots,
-                                publishers.events,
-                            );
-                            let close_error = if error.kind() == std::io::ErrorKind::TimedOut {
-                                CommandError::CloseTimeout
-                            } else {
-                                CommandError::Stopped
-                            };
-                            let _ = completion.send(Err(close_error));
-                            continue 'runtime;
-                        }
+                        close_deadline.saturating_duration_since(Instant::now()),
+                    ) {
+                        let _ = completion.send(Err(CommandError::CloseTimeout));
+                        continue 'runtime;
                     }
+                    publish_process_exit(terminal, &publishers);
+                    publish_exit(publishers.lifecycle, exit_code);
+                    let _ = completion.send(Ok(()));
+                    serve_exited(&mut queues.control, terminal, publishers.snapshots);
+                    return;
                 }
             }
         }
+        publishers.status.borrow_mut().flush(false);
         // Park until PTY output arrives, a command rings the doorbell, or the
         // synchronized-output flush interval elapses. Commands must never wait
         // out the full timeout: interactive latency depends on waking now.
         if reader_complete {
-            let _ = queues.doorbell.recv_timeout(Duration::from_millis(20));
+            let wait = publishers
+                .status
+                .borrow()
+                .wait()
+                .unwrap_or(Duration::from_millis(20))
+                .min(Duration::from_millis(20));
+            let _ = queues.doorbell.recv_timeout(wait);
+            publishers.status.borrow_mut().flush(false);
         } else {
             // Shrink the wait toward the moment a throttled snapshot comes
             // due, so a trailing edge (flood stops mid-interval) still
             // publishes promptly instead of waiting out the full 20ms
             // synchronized-output flush tick.
-            let default_timeout = if dirty {
+            let mut default_timeout = if dirty {
                 let due = last_snapshot + SNAPSHOT_MIN_INTERVAL;
                 due.saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(20))
             } else {
                 Duration::from_millis(20)
             };
+            if let Some(status_wait) = publishers.status.borrow().wait() {
+                default_timeout = default_timeout.min(status_wait);
+            }
             channel::select! {
                 recv(queues.output.receiver) -> message => match message {
                     Ok(message) => match drain_output_batch(
@@ -1145,10 +1258,10 @@ fn run(
                     Err(channel::RecvError) => {
                         reader_complete = true;
                         dirty = false;
-                        publish_optional(
-                            terminal.finish_synchronized_output(),
-                            publishers.snapshots,
-                            publishers.events,
+                        publish_screen_update(
+                            terminal,
+                            &publishers,
+                            ScreenUpdate::FinishSynchronized,
                         );
                     }
                 },
@@ -1159,11 +1272,12 @@ fn run(
                         last_snapshot = Instant::now();
                         dirty = false;
                     }
-                    publish_optional(
-                        terminal.flush_synchronized_output(),
-                        publishers.snapshots,
-                        publishers.events,
+                    publish_screen_update(
+                        terminal,
+                        &publishers,
+                        ScreenUpdate::FlushSynchronized,
                     );
+                    publishers.status.borrow_mut().flush(false);
                 }
             }
         }
@@ -1175,13 +1289,10 @@ fn run(
             }
         }
         if reader_complete && let Some(exit_code) = exit_code {
-            publish_optional(
-                terminal.finish_synchronized_output(),
-                publishers.snapshots,
-                publishers.events,
-            );
+            publish_screen_update(terminal, &publishers, ScreenUpdate::FinishSynchronized);
+            publish_process_exit(terminal, &publishers);
             publish_exit(publishers.lifecycle, Some(exit_code));
-            serve_exited(&mut queues.control, terminal);
+            serve_exited(&mut queues.control, terminal, publishers.snapshots);
             break;
         }
     }
@@ -1219,11 +1330,7 @@ where
         match output.receiver.recv_timeout(poll) {
             Ok(message) => match drain_output_batch(output, message, terminal, publishers) {
                 DrainOutcome::ReaderComplete => *reader_complete = true,
-                DrainOutcome::Fed => publish_optional(
-                    terminal.snapshot_after_feed(),
-                    publishers.snapshots,
-                    publishers.events,
-                ),
+                DrainOutcome::Fed => publish_snapshot_after_feed(terminal, publishers),
             },
             Err(channel::RecvTimeoutError::Disconnected) => *reader_complete = true,
             Err(channel::RecvTimeoutError::Timeout) => {}
@@ -1231,9 +1338,24 @@ where
     }
 }
 
+fn publish_requested_snapshot(
+    terminal: &mut GhosttyTerminal,
+    snapshots: &watch::Sender<ScreenSnapshot>,
+) -> Result<(), CommandError> {
+    terminal
+        .snapshot_after_feed()
+        .map(|screen| {
+            if let Some(screen) = screen {
+                snapshots.send_replace(screen);
+            }
+        })
+        .map_err(|error| CommandError::Emulator(error.to_string()))
+}
+
 fn serve_exited(
     control: &mut async_mpsc::Receiver<RuntimeMessage>,
     terminal: &mut GhosttyTerminal,
+    snapshots: &watch::Sender<ScreenSnapshot>,
 ) {
     while let Some(message) = control.blocking_recv() {
         match message {
@@ -1272,7 +1394,10 @@ fn serve_exited(
                 let _ = completion.send(Err(CommandError::Stopped));
             }
             RuntimeMessage::RefreshSnapshot { completion } => {
-                let _ = completion.send(Err(CommandError::Stopped));
+                // A detached terminal skipped grid construction while alive.
+                // Its retained final emulator state remains readable by a late
+                // subscriber, just like ReadOutput after process exit.
+                let _ = completion.send(publish_requested_snapshot(terminal, snapshots));
             }
             RuntimeMessage::Input(_)
             | RuntimeMessage::KeyInput(_)
@@ -1385,17 +1510,13 @@ fn drain_output_barrier(
             match output.receiver.recv() {
                 Ok(OutputMessage::Bytes(bytes)) => {
                     terminal.vt_write(&bytes);
-                    publish_activity(terminal, publishers.activity);
+                    publish_terminal_observations(terminal, publishers);
                     output.record_consumed();
                     fed = true;
                 }
                 Ok(message) => {
                     if fed {
-                        publish_optional(
-                            terminal.snapshot_after_feed(),
-                            publishers.snapshots,
-                            publishers.events,
-                        );
+                        publish_snapshot_after_feed(terminal, publishers);
                         fed = false;
                     }
                     *reader_complete =
@@ -1406,21 +1527,13 @@ fn drain_output_barrier(
                     // disconnected queue. Stop waiting rather than hanging on
                     // a sequence for which no message can arrive.
                     *reader_complete = true;
-                    publish_optional(
-                        terminal.finish_synchronized_output(),
-                        publishers.snapshots,
-                        publishers.events,
-                    );
+                    publish_screen_update(terminal, publishers, ScreenUpdate::FinishSynchronized);
                     break;
                 }
             }
         }
         if fed {
-            publish_optional(
-                terminal.snapshot_after_feed(),
-                publishers.snapshots,
-                publishers.events,
-            );
+            publish_snapshot_after_feed(terminal, publishers);
         }
     }
 }
@@ -1491,17 +1604,13 @@ fn drain_output_batch(
             },
         };
         let OutputMessage::Bytes(bytes) = message else {
-            publish_optional(
-                terminal.snapshot_after_feed(),
-                publishers.snapshots,
-                publishers.events,
-            );
+            publish_snapshot_after_feed(terminal, publishers);
             consume_output_message(output, message, terminal, publishers);
             return DrainOutcome::ReaderComplete;
         };
         budget = budget.saturating_sub(bytes.len());
         terminal.vt_write(&bytes);
-        publish_activity(terminal, publishers.activity);
+        publish_terminal_observations(terminal, publishers);
         output.record_consumed();
         if budget == 0 {
             break;
@@ -1528,12 +1637,9 @@ fn process_output_message(
 ) -> bool {
     match message {
         OutputMessage::Bytes(bytes) => {
-            publish_optional(
-                terminal.feed(&bytes),
-                publishers.snapshots,
-                publishers.events,
-            );
-            publish_activity(terminal, publishers.activity);
+            terminal.vt_write(&bytes);
+            publish_snapshot_after_feed(terminal, publishers);
+            publish_terminal_observations(terminal, publishers);
             false
         }
         OutputMessage::ReaderError {
@@ -1543,19 +1649,11 @@ fn process_output_message(
             if raw_os_error != Some(libc::EIO) {
                 let _ = publishers.events.send(TerminalEvent::Error { message });
             }
-            publish_optional(
-                terminal.finish_synchronized_output(),
-                publishers.snapshots,
-                publishers.events,
-            );
+            publish_screen_update(terminal, publishers, ScreenUpdate::FinishSynchronized);
             true
         }
         OutputMessage::ReaderEof => {
-            publish_optional(
-                terminal.finish_synchronized_output(),
-                publishers.snapshots,
-                publishers.events,
-            );
+            publish_screen_update(terminal, publishers, ScreenUpdate::FinishSynchronized);
             true
         }
     }
@@ -1563,46 +1661,54 @@ fn process_output_message(
 
 fn publish_activity(terminal: &GhosttyTerminal, publisher: &watch::Sender<TerminalActivity>) {
     let bell_count = terminal.bell_count();
-    let (program_status_count, program_statuses) = terminal.program_statuses();
     publisher.send_if_modified(|activity| {
-        if activity.bell_count == bell_count
-            && activity.program_status_count == program_status_count
-        {
+        if activity.bell_count == bell_count {
             return false;
         }
         activity.bell_count = bell_count;
-        if activity.program_status_count != program_status_count {
-            activity.program_status_count = program_status_count;
-            activity.program_statuses = program_statuses.iter().cloned().collect();
-        }
         true
     });
 }
 
-fn drain_output_until(
+fn publish_terminal_observations(terminal: &GhosttyTerminal, publishers: &RuntimePublishers<'_>) {
+    publish_activity(terminal, publishers.activity);
+    publishers.status.borrow_mut().receive(terminal);
+}
+
+fn publish_process_exit(_terminal: &GhosttyTerminal, publishers: &RuntimePublishers<'_>) {
+    publishers.status.borrow_mut().finish();
+}
+
+fn drain_output_until_reader_complete(
     output: &mut OutputQueue,
     terminal: &mut GhosttyTerminal,
     publishers: &RuntimePublishers<'_>,
+    reader_complete: &mut bool,
     timeout: Duration,
-) {
-    let deadline = std::time::Instant::now() + timeout;
-    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+) -> bool {
+    if *reader_complete {
+        return true;
+    }
+
+    let deadline = Instant::now() + timeout;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         match output.receiver.recv_timeout(remaining) {
-            Ok(message) => {
-                if consume_output_message(output, message, terminal, publishers) {
+            Ok(message) => match drain_output_batch(output, message, terminal, publishers) {
+                DrainOutcome::ReaderComplete => {
+                    *reader_complete = true;
                     break;
                 }
-            }
-            Err(channel::RecvTimeoutError::Disconnected | channel::RecvTimeoutError::Timeout) => {
+                DrainOutcome::Fed => publish_snapshot_after_feed(terminal, publishers),
+            },
+            Err(channel::RecvTimeoutError::Disconnected) => {
+                *reader_complete = true;
+                publish_screen_update(terminal, publishers, ScreenUpdate::FinishSynchronized);
                 break;
             }
+            Err(channel::RecvTimeoutError::Timeout) => break,
         }
     }
-    publish_optional(
-        terminal.finish_synchronized_output(),
-        publishers.snapshots,
-        publishers.events,
-    );
+    *reader_complete
 }
 
 #[cfg(unix)]
@@ -1831,18 +1937,6 @@ fn read_pty(mut reader: Box<dyn Read + Send>, output: OutputProducer) {
     }
 }
 
-fn publish(
-    result: Result<ScreenSnapshot>,
-    snapshots: &watch::Sender<ScreenSnapshot>,
-    events: &broadcast::Sender<TerminalEvent>,
-) {
-    match result {
-        Ok(snapshot) => {
-            snapshots.send_replace(snapshot);
-        }
-        Err(error) => send_error(events, error),
-    }
-}
 fn publish_optional(
     result: Result<Option<ScreenSnapshot>>,
     snapshots: &watch::Sender<ScreenSnapshot>,
@@ -1857,18 +1951,36 @@ fn publish_optional(
     }
 }
 
-/// Snapshot construction is the dominant background cost for animated
-/// terminals. The emulator remains current without it, so only materialize a
-/// frame when an attachment (or another explicit observer) has subscribed.
+#[derive(Clone, Copy)]
+enum ScreenUpdate {
+    AfterFeed,
+    FlushSynchronized,
+    FinishSynchronized,
+    Resize(TerminalSize),
+}
+
 fn publish_snapshot_after_feed(terminal: &mut GhosttyTerminal, publishers: &RuntimePublishers<'_>) {
-    if publishers.snapshots.receiver_count() == 0 {
-        return;
-    }
-    publish_optional(
-        terminal.snapshot_after_feed(),
-        publishers.snapshots,
-        publishers.events,
-    );
+    publish_screen_update(terminal, publishers, ScreenUpdate::AfterFeed);
+}
+
+/// Advance all terminal state regardless of attachment, but materialize the
+/// expensive full grid only for a real screen observer. Operations that
+/// explicitly return screen data bypass this helper.
+fn publish_screen_update(
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+    update: ScreenUpdate,
+) {
+    let capture_screen = publishers.snapshots.receiver_count() > 0;
+    let result = match update {
+        ScreenUpdate::AfterFeed => terminal.snapshot_after_feed_if(capture_screen),
+        ScreenUpdate::FlushSynchronized => terminal.flush_synchronized_output_if(capture_screen),
+        ScreenUpdate::FinishSynchronized => terminal.finish_synchronized_output_if(capture_screen),
+        ScreenUpdate::Resize(size) => terminal
+            .resize_state(size)
+            .and_then(|()| capture_screen.then(|| terminal.snapshot()).transpose()),
+    };
+    publish_optional(result, publishers.snapshots, publishers.events);
 }
 fn publish_exit(lifecycle: &watch::Sender<TerminalLifecycle>, exit_code: Option<i32>) {
     lifecycle.send_replace(TerminalLifecycle::Exited { exit_code });
@@ -2102,11 +2214,13 @@ mod tests {
         let (events, mut event_receiver) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
         let (output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -2155,11 +2269,13 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
         let (_output, mut queued_output) = output_queue();
 
@@ -2198,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn animated_output_is_only_snapshotted_while_observed() {
+    fn output_barriers_and_eof_only_snapshot_while_observed() {
         let mut terminal = test_terminal(Box::new(Vec::<u8>::new()));
         let initial = terminal.snapshot().unwrap();
         let initial_revision = initial.revision;
@@ -2207,11 +2323,13 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
 
         terminal.vt_write(b"unobserved");
@@ -2231,6 +2349,37 @@ mod tests {
                 .collect::<String>()
                 .contains("unobserved observed")
         );
+
+        drop(observed);
+        let detached_revision = snapshots.borrow().revision;
+        let (output, mut queued_output) = output_queue();
+        output
+            .send(OutputMessage::Bytes(b" barrier".to_vec()))
+            .unwrap();
+        let mut reader_complete = false;
+        drain_output_barrier(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+        );
+        assert_eq!(snapshots.borrow().revision, detached_revision);
+        assert!(
+            terminal
+                .output(TerminalOutputSource::Visible, 5, false)
+                .unwrap()
+                .text
+                .contains("barrier")
+        );
+
+        terminal.vt_write(b"\x1b[?2026h final");
+        assert!(process_output_message(
+            OutputMessage::ReaderEof,
+            &mut terminal,
+            &publishers,
+        ));
+        assert_eq!(snapshots.borrow().revision, detached_revision);
+        assert!(terminal.snapshot_after_feed().unwrap().is_some());
     }
 
     #[test]
@@ -2242,11 +2391,13 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
         let (output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -2368,11 +2519,13 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
         let (output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -2439,11 +2592,13 @@ mod tests {
         let (events, mut event_receiver) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
         let (_output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -2478,6 +2633,57 @@ mod tests {
         publish_activity(&terminal, &activity);
         assert!(changes.has_changed().unwrap());
         assert_eq!(changes.borrow_and_update().bell_count, 1);
+    }
+
+    #[test]
+    fn bounded_status_batches_apply_backpressure_without_losing_operations() {
+        let (status_updates, mut statuses) = async_mpsc::channel(2);
+        let producer = thread::spawn(move || {
+            let mut terminal = test_terminal(Box::new(std::io::sink()));
+            let mut status_producer = RuntimeStatusProducer::new(&status_updates, None);
+            for id in 0..40 {
+                terminal.vt_write(format!("\x1b]7501;state=done:id=batch{id}\x07").as_bytes());
+                status_producer.receive(&terminal);
+            }
+        });
+
+        let mut received = Vec::new();
+        while received.len() < 40 {
+            let batch = statuses.blocking_recv().expect("producer closed early");
+            assert_eq!(batch.foreground_pid, None);
+            received.extend(batch.updates);
+        }
+        producer.join().unwrap();
+        assert_eq!(received.len(), 40);
+        for (id, update) in received.iter().enumerate() {
+            assert!(matches!(
+                update,
+                StatusUpdate::Report(report) if report.id == format!("batch{id}")
+            ));
+        }
+    }
+
+    #[test]
+    fn status_pid_is_sampled_once_only_for_nonempty_vt_receipts() {
+        use std::cell::Cell;
+
+        let (status_updates, _statuses) = async_mpsc::channel(2);
+        let mut producer = RuntimeStatusProducer::new(&status_updates, None);
+        let samples = Cell::new(0);
+        producer.receive_updates(Vec::new(), || {
+            samples.set(samples.get() + 1);
+            Some(41)
+        });
+        assert_eq!(samples.get(), 0);
+
+        producer.receive_updates(
+            vec![StatusUpdate::Clear { id: None }, StatusUpdate::PromptStart],
+            || {
+                samples.set(samples.get() + 1);
+                Some(41)
+            },
+        );
+        assert_eq!(samples.get(), 1);
     }
 
     #[tokio::test]
@@ -2721,6 +2927,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_discards_an_unclaimed_saturated_status_stream() {
+        let handle = spawn_terminal(shell(
+            "while :; do printf '\\033]7501;state=working\\007\\033]7501;state=done\\007'; done",
+            HashMap::new(),
+        ))
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let queued = handle
+                    .status_updates
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .len();
+                if queued == STATUS_BATCH_CAPACITY {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the unclaimed stream never filled");
+
+        tokio::time::timeout(Duration::from_secs(5), handle.close())
+            .await
+            .expect("closing waited on the unclaimed status stream")
+            .unwrap();
+        assert!(handle.take_status_updates().is_none());
+    }
+
+    #[tokio::test]
     async fn close_waits_for_process_death_and_is_repeatable() {
         let handle = spawn_terminal(shell("sleep 60", HashMap::new())).unwrap();
         let pid = handle.child_pid();
@@ -2793,11 +3031,13 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
         let (output, mut queued_output) = output_queue();
         for _ in 0..OUTPUT_QUEUE_CAPACITY {
@@ -2828,6 +3068,131 @@ mod tests {
         producer.join().unwrap();
         assert_eq!(status.exit_code(), 0);
         assert!(queued_output.consumed > 0);
+    }
+
+    #[test]
+    fn post_reap_drain_waits_for_delayed_output_before_process_exit() {
+        let mut terminal = test_terminal(Box::new(std::io::sink()));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, _) = watch::channel(initial);
+        let (events, _) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, mut status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+            activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
+        };
+        let (output, mut queued_output) = output_queue();
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            output
+                .send(OutputMessage::Bytes(vec![b'x'; 512 * 1024]))
+                .unwrap();
+            output
+                .send(OutputMessage::Bytes(
+                    b"\x1b]7501;state=done:id=final\x07".to_vec(),
+                ))
+                .unwrap();
+            output.send(OutputMessage::ReaderEof).unwrap();
+        });
+        let mut reader_complete = false;
+
+        assert!(drain_output_until_reader_complete(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            Duration::from_secs(1),
+        ));
+        producer.join().unwrap();
+        publish_process_exit(&terminal, &publishers);
+
+        let mut updates = Vec::new();
+        while let Ok(batch) = status_receiver.try_recv() {
+            updates.extend(batch.updates);
+        }
+        let final_report = updates
+            .iter()
+            .position(
+                |update| matches!(update, StatusUpdate::Report(report) if report.id == "final"),
+            )
+            .expect("delayed final status was not delivered");
+        let process_exits = updates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, update)| (*update == StatusUpdate::ProcessExit).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(process_exits.len(), 1);
+        assert!(final_report < process_exits[0]);
+    }
+
+    #[test]
+    fn post_reap_timeout_preserves_late_output_until_reader_eof() {
+        let mut terminal = test_terminal(Box::new(std::io::sink()));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, _) = watch::channel(initial);
+        let (events, _) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, mut statuses) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+            activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
+        };
+        let (output, mut queued_output) = output_queue();
+        let mut reader_complete = false;
+        // Keep the producer alive without EOF. A background shell job is not
+        // a portable way to arrange this: close also kills its process group,
+        // and PTY revocation rules differ between kernels.
+        let started = Instant::now();
+        assert!(!drain_output_until_reader_complete(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            Duration::from_millis(25),
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        assert_eq!(*lifecycle.borrow(), TerminalLifecycle::Running);
+        assert!(matches!(
+            statuses.try_recv(),
+            Err(async_mpsc::error::TryRecvError::Empty)
+        ));
+
+        output
+            .send(OutputMessage::Bytes(
+                b"\x1b]7501;state=done:id=late\x07".to_vec(),
+            ))
+            .unwrap();
+        output.send(OutputMessage::ReaderEof).unwrap();
+        assert!(drain_output_until_reader_complete(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            Duration::from_secs(1),
+        ));
+        publish_process_exit(&terminal, &publishers);
+        publish_exit(&lifecycle, Some(0));
+        let mut updates = Vec::new();
+        while let Ok(batch) = statuses.try_recv() {
+            updates.extend(batch.updates);
+        }
+        assert!(
+            matches!(updates.as_slice(), [StatusUpdate::Report(report), StatusUpdate::ProcessExit]
+            if report.id == "late" && report.state == crate::domain::StatusState::Done)
+        );
+        assert_eq!(
+            *lifecycle.borrow(),
+            TerminalLifecycle::Exited { exit_code: Some(0) }
+        );
     }
 
     #[tokio::test]
@@ -2878,6 +3243,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_snapshot_subscriber_can_refresh_an_exited_detached_terminal() {
+        let handle =
+            spawn_terminal(shell("printf FUT_LATE_FINAL; exit 0", HashMap::new())).unwrap();
+        let mut lifecycle = handle.subscribe_lifecycle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
+                lifecycle.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut snapshots = handle.subscribe_snapshots();
+        let initial_revision = snapshots.borrow().revision;
+        handle.refresh_snapshot().await.unwrap();
+        wait_for_text(&mut snapshots, "FUT_LATE_FINAL").await;
+        assert!(snapshots.borrow().revision > initial_revision);
+        assert_eq!(
+            handle.lifecycle(),
+            TerminalLifecycle::Exited { exit_code: Some(0) }
+        );
+    }
+
+    #[tokio::test]
     async fn copy_cleanup_is_idempotent_after_the_runtime_has_exited() {
         let handle = spawn_terminal(shell("exit 0", HashMap::new())).unwrap();
         let mut lifecycle = handle.subscribe_lifecycle();
@@ -2896,11 +3285,13 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_exit_follows_all_queued_pty_output() {
         let handle = spawn_terminal(shell(
-            "head -c 8192 /dev/zero | tr '\\000' x; printf '\\r\\nFUT_FINAL_MARKER\\007'",
+            "IFS= read -r _; head -c 8192 /dev/zero | tr '\\000' x; printf '\\r\\nFUT_FINAL_MARKER\\007'",
             HashMap::new(),
         ))
         .unwrap();
+        let snapshots = handle.subscribe_snapshots();
         let mut lifecycle = handle.subscribe_lifecycle();
+        handle.input(b"start\n".to_vec()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
                 lifecycle.changed().await.unwrap();
@@ -2909,14 +3300,14 @@ mod tests {
         .await
         .unwrap();
 
-        let snapshot = handle.subscribe_snapshots().borrow().clone();
+        let snapshot = snapshots.borrow().clone();
         let contents = snapshot
             .cells
             .iter()
             .map(|cell| cell.contents.as_str())
             .collect::<String>();
         assert!(contents.contains("FUT_FINAL_MARKER"), "{contents:?}");
-        let activity = handle.subscribe_activity().borrow().clone();
+        let activity = *handle.subscribe_activity().borrow();
         assert_eq!(
             activity.bell_count, 1,
             "final BEL must precede lifecycle exit"
@@ -2924,13 +3315,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_forces_an_unclosed_synchronized_frame() {
+    async fn detached_status_updates_flush_progress_and_exit_in_order() {
         let handle = spawn_terminal(shell(
-            "printf '\\033[?2026hFINAL_SYNC_FRAME'",
+            "printf '\\033]7501;state=working:id=build:progress=1\\007'; printf '\\033]7501;state=working:id=build:progress=99\\007'; sleep 0.25; printf '\\033]133;A\\007'; exit 0",
             HashMap::new(),
         ))
         .unwrap();
+        let mut statuses = handle.take_status_updates().unwrap();
+        assert!(handle.take_status_updates().is_none());
+        let updates = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut updates = Vec::new();
+            while !matches!(updates.last(), Some(StatusUpdate::ProcessExit)) {
+                updates.extend(
+                    statuses
+                        .recv()
+                        .await
+                        .expect("status stream closed before exit")
+                        .updates,
+                );
+            }
+            updates
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            updates.first(),
+            Some(StatusUpdate::Report(crate::domain::StatusReport {
+                state: crate::domain::StatusState::Working,
+                ..
+            }))
+        ));
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            StatusUpdate::Report(crate::domain::StatusReport {
+                progress: Some(99),
+                ..
+            })
+        )));
+        let prompt = updates
+            .iter()
+            .position(|update| update == &StatusUpdate::PromptStart)
+            .expect("prompt barrier was not delivered");
+        let final_progress = updates
+            .iter()
+            .position(|update| matches!(update, StatusUpdate::Report(report) if report.progress == Some(99)))
+            .expect("quiet trailing progress was not delivered");
+        assert!(final_progress < prompt);
+        assert_eq!(updates.last(), Some(&StatusUpdate::ProcessExit));
+    }
+
+    #[tokio::test]
+    async fn status_transport_preserves_urgent_bursts_larger_than_record_capacity() {
+        let handle = spawn_terminal(shell(
+            "printf '\\033c'; printf '\\033]7501;state=working:id=turn\\007'; i=0; while [ $i -lt 300 ]; do printf '\\033]7501;state=done:id=r%s\\007' \"$i\"; i=$((i+1)); done; printf '\\033]7501;state=done:id=turn\\007'; printf '\\033]133;A\\007'",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut statuses = handle.take_status_updates().unwrap();
+        let updates = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut updates = Vec::new();
+            while !matches!(updates.last(), Some(StatusUpdate::ProcessExit)) {
+                updates.extend(
+                    statuses
+                        .recv()
+                        .await
+                        .expect("status stream closed before exit")
+                        .updates,
+                );
+            }
+            updates
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(updates.len(), 305);
+        assert_eq!(updates.first(), Some(&StatusUpdate::Clear { id: None }));
+        assert!(matches!(
+            &updates[1],
+            StatusUpdate::Report(report)
+                if report.id == "turn" && report.state == crate::domain::StatusState::Working
+        ));
+        assert!(matches!(
+            &updates[302],
+            StatusUpdate::Report(report)
+                if report.id == "turn" && report.state == crate::domain::StatusState::Done
+        ));
+        assert_eq!(updates[303], StatusUpdate::PromptStart);
+        assert_eq!(updates[304], StatusUpdate::ProcessExit);
+    }
+
+    #[tokio::test]
+    async fn exit_forces_an_unclosed_synchronized_frame() {
+        let handle = spawn_terminal(shell(
+            "IFS= read -r _; printf '\\033[?2026hFINAL_SYNC_FRAME'",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let snapshots = handle.subscribe_snapshots();
         let mut lifecycle = handle.subscribe_lifecycle();
+        handle.input(b"start\n".to_vec()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
                 lifecycle.changed().await.unwrap();
@@ -2939,8 +3423,7 @@ mod tests {
         .await
         .unwrap();
 
-        let contents = handle
-            .subscribe_snapshots()
+        let contents = snapshots
             .borrow()
             .cells
             .iter()
@@ -3175,11 +3658,13 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
         let (activity, _) = watch::channel(TerminalActivity::default());
+        let (status_updates, _status_receiver) = async_mpsc::channel(STATUS_BATCH_CAPACITY);
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
             activity: &activity,
+            status: RefCell::new(RuntimeStatusProducer::new(&status_updates, None)),
         };
         let (output, mut queued_output) = output_queue();
         let mut reader_complete = false;

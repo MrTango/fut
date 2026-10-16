@@ -266,13 +266,24 @@ impl AgentsDialog {
                     },
                     styles.apply(SemanticStyle::Normal, Style::default()),
                 );
+                let activity_style = styles.apply(row.activity_style(), style);
                 let status_style = styles.apply(row.status_style(), style);
                 let y = body.y + line as u16;
                 fill_row(Rect::new(body.x, y, body.width, 1), style, buffer);
                 buffer.set_line(
                     body.x,
                     y,
-                    &row.line(elapsed_ms, spinner, " › ", style, style, status_style),
+                    &row.line(
+                        elapsed_ms,
+                        spinner,
+                        " › ",
+                        agents::LineStyles {
+                            title: style,
+                            detail: style,
+                            activity: activity_style,
+                            status: status_style,
+                        },
+                    ),
                     body.width,
                 );
             }
@@ -348,7 +359,7 @@ mod tests {
     use super::*;
     use crate::{
         client::notifications::ActivityIndicator,
-        domain::{PaneId, TerminalId},
+        domain::{PaneId, StatusState, TerminalId},
     };
 
     #[test]
@@ -364,7 +375,12 @@ mod tests {
                 session: "fut".into(),
                 workspace: "agents-popup".into(),
                 tab: "node".into(),
-                source: "codex".into(),
+                app: "codex".into(),
+                title: Some("Checking code".into()),
+                message: Some("Running focused tests".into()),
+                blocked_kind: None,
+                state: StatusState::Working,
+                progress: Some(42),
                 current: false,
                 indicator: Some(ActivityIndicator::Working),
             }],
@@ -384,10 +400,14 @@ mod tests {
             &mut buffer,
         );
 
-        let source = &buffer[(4, 2)];
-        let status = &buffer[(10, 2)];
-        assert_eq!(source.bg, Color::DarkGray);
-        assert_eq!(status.bg, source.bg);
+        let app = &buffer[(8, 2)];
+        let status = &buffer[(14, 2)];
+        assert_eq!(app.bg, Color::DarkGray);
+        assert_eq!(status.bg, app.bg);
         assert_eq!(status.fg, Color::LightCyan);
+        let rendered = (0..80)
+            .map(|column| buffer[(column, 2)].symbol())
+            .collect::<String>();
+        assert!(rendered.contains("⠋ 42% codex working"), "{rendered:?}");
     }
 }

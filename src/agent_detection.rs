@@ -1,4 +1,4 @@
-use crate::domain::AgentState;
+use crate::domain::StatusState;
 
 pub const IDLE_CONFIRMATIONS: u8 = 3;
 
@@ -11,7 +11,7 @@ pub enum CodexProbe {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodexDetection {
-    pub state: AgentState,
+    pub state: StatusState,
     pub rule: &'static str,
 }
 
@@ -39,22 +39,22 @@ pub fn detect_codex(screen: &str) -> CodexDetection {
         || live.contains("enter to submit all")
         || live.contains("allow command?")
     {
-        return detection(AgentState::Blocked, "live_blocker");
+        return detection(StatusState::Blocked, "live_blocker");
     }
     if lower.contains("do you trust the contents of this directory?")
         || lower.contains("[y/n]")
         || lower.contains("yes (y)")
     {
-        return detection(AgentState::Blocked, "confirmation_prompt");
+        return detection(StatusState::Blocked, "confirmation_prompt");
     }
     if has_live_working_indicator(screen) {
-        return detection(AgentState::Working, "working_indicator");
+        return detection(StatusState::Working, "working_indicator");
     }
 
-    detection(AgentState::Idle, "idle_fallback")
+    detection(StatusState::Idle, "idle_fallback")
 }
 
-fn detection(state: AgentState, rule: &'static str) -> CodexDetection {
+fn detection(state: StatusState, rule: &'static str) -> CodexDetection {
     CodexDetection { state, rule }
 }
 
@@ -98,13 +98,13 @@ fn bottom_non_empty_lines(text: &str, count: usize) -> Vec<&str> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexStabilizer {
-    published: Option<AgentState>,
+    published: Option<StatusState>,
     idle_confirmations: u8,
 }
 
 impl CodexStabilizer {
-    pub fn observe(&mut self, detected: AgentState) -> Option<AgentState> {
-        if self.published == Some(AgentState::Working) && detected == AgentState::Idle {
+    pub fn observe(&mut self, detected: StatusState) -> Option<StatusState> {
+        if self.published == Some(StatusState::Working) && detected == StatusState::Idle {
             self.idle_confirmations += 1;
             if self.idle_confirmations < IDLE_CONFIRMATIONS {
                 return None;
@@ -143,53 +143,56 @@ mod tests {
     fn classifies_representative_codex_screens() {
         assert_eq!(
             detect_codex("› Build it\n\n• Working (3s • esc to interrupt)").state,
-            AgentState::Working
+            StatusState::Working
         );
         assert_eq!(
             detect_codex("› Run command?\nAllow command?\npress enter to confirm or esc to cancel")
                 .state,
-            AgentState::Blocked
+            StatusState::Blocked
         );
         assert_eq!(
             detect_codex("Do you trust the contents of this directory?\n[y/n]").state,
-            AgentState::Blocked
+            StatusState::Blocked
         );
-        assert_eq!(detect_codex("Done.\n\n› ").state, AgentState::Idle);
+        assert_eq!(detect_codex("Done.\n\n› ").state, StatusState::Idle);
     }
 
     #[test]
     fn blocker_in_old_transcript_does_not_override_live_prompt() {
         assert_eq!(
             detect_codex("Allow command?\n› new prompt").state,
-            AgentState::Idle
+            StatusState::Idle
         );
     }
 
     #[test]
     fn completed_block_after_working_indicator_is_idle() {
         let screen = "◦ Working (3s • esc to interrupt)\n\n• Implemented the change.\n\n› ";
-        assert_eq!(detect_codex(screen).state, AgentState::Idle);
+        assert_eq!(detect_codex(screen).state, StatusState::Idle);
 
         let interrupted = "◦ Working (3s • esc to interrupt)\n■ Conversation interrupted\n› ";
-        assert_eq!(detect_codex(interrupted).state, AgentState::Idle);
+        assert_eq!(detect_codex(interrupted).state, StatusState::Idle);
     }
 
     #[test]
     fn prompt_footer_does_not_hide_live_working_indicator() {
         let screen =
             "◦ Working (3s • esc to interrupt)\n\n› Use /skills to list skills\nmodel · /work";
-        assert_eq!(detect_codex(screen).state, AgentState::Working);
+        assert_eq!(detect_codex(screen).state, StatusState::Working);
     }
 
     #[test]
     fn working_to_idle_requires_three_observations() {
         let mut stabilizer = CodexStabilizer::default();
         assert_eq!(
-            stabilizer.observe(AgentState::Working),
-            Some(AgentState::Working)
+            stabilizer.observe(StatusState::Working),
+            Some(StatusState::Working)
         );
-        assert_eq!(stabilizer.observe(AgentState::Idle), None);
-        assert_eq!(stabilizer.observe(AgentState::Idle), None);
-        assert_eq!(stabilizer.observe(AgentState::Idle), Some(AgentState::Idle));
+        assert_eq!(stabilizer.observe(StatusState::Idle), None);
+        assert_eq!(stabilizer.observe(StatusState::Idle), None);
+        assert_eq!(
+            stabilizer.observe(StatusState::Idle),
+            Some(StatusState::Idle)
+        );
     }
 }

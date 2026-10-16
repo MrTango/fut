@@ -168,6 +168,7 @@ struct WorkspaceItem {
     tokens: MaterializedTokenMap,
     destination: Option<PaneId>,
     activity: Option<ActivityIndicator>,
+    progress: Option<u8>,
 }
 
 impl WorkspaceItem {
@@ -235,6 +236,8 @@ impl WorkspaceModel {
                 .map(|(index, workspace)| {
                     let closing = session.closing || workspace.closing;
                     let tree_prefix = session.workspace_tree_prefix(workspace.id);
+                    let rollup = notifications
+                        .rollup(workspace.tabs.iter().flat_map(|tab| tab.panes.iter()));
                     WorkspaceItem {
                         id: workspace.id,
                         name: workspace.name.clone(),
@@ -253,14 +256,8 @@ impl WorkspaceModel {
                         destination: (!closing)
                             .then(|| history.workspace_destination(workspace))
                             .flatten(),
-                        activity: notifications.indicator(
-                            &workspace
-                                .tabs
-                                .iter()
-                                .flat_map(|tab| &tab.panes)
-                                .cloned()
-                                .collect::<Vec<_>>(),
-                        ),
+                        activity: rollup.indicator,
+                        progress: rollup.progress,
                     }
                 })
                 .collect(),
@@ -1478,6 +1475,7 @@ fn render_agent_row(
         },
         normal,
     );
+    let activity_style = ui.styles.apply(item.activity_style(), detail_style);
     let status_style = ui.styles.apply(item.status_style(), detail_style);
     buffer.set_line(
         area.x,
@@ -1486,9 +1484,12 @@ fn render_agent_row(
             spinner_frame,
             &ui.spinner,
             "/",
-            title_style,
-            detail_style,
-            status_style,
+            agents::LineStyles {
+                title: title_style,
+                detail: detail_style,
+                activity: activity_style,
+                status: status_style,
+            },
         ),
         area.width,
     );
@@ -1516,14 +1517,16 @@ fn agent_row_lines(
         attention: false,
     };
     let resolve = |token: &str| match token {
-        "agent.source" => TokenValue::plain(item.source.clone()),
+        // Keep the established token name while sourcing it from the
+        // canonical ProgramStatus label (app, report source, then tab name).
+        "agent.source" => TokenValue::plain(item.app.clone()),
         "agent.status" => TokenValue::styled(item.status(), item.status_style()),
         "agent.activity" => item.indicator.map_or_else(
             || TokenValue::plain(""),
             |indicator| {
                 TokenValue::styled(
                     indicator.marker(context.spinner_frame, &ui.spinner),
-                    item.status_style(),
+                    item.activity_style(),
                 )
             },
         ),
@@ -1607,7 +1610,7 @@ fn render_minimized_agent_row(
     let activity = item.indicator.map_or(" ", |indicator| {
         indicator.marker(spinner_frame, &ui.spinner)
     });
-    let activity_style = ui.styles.apply(item.status_style(), base);
+    let activity_style = ui.styles.apply(item.activity_style(), base);
     buffer.set_line(
         area.x,
         area.y,
@@ -2047,7 +2050,13 @@ fn render_minimized_workspace_row(
     }
     let attention = matches!(
         item.activity,
-        Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
+        Some(
+            ActivityIndicator::UnreadBlocked
+                | ActivityIndicator::UnreadError
+                | ActivityIndicator::Blocked
+                | ActivityIndicator::Error
+                | ActivityIndicator::Completed
+        )
     );
     let state = ItemState {
         current: false,
@@ -2075,9 +2084,11 @@ fn render_minimized_workspace_row(
     } else if let Some(activity) = item.activity {
         let role = match activity {
             ActivityIndicator::Working => SemanticStyle::Activity,
-            ActivityIndicator::Blocked | ActivityIndicator::Completed | ActivityIndicator::Bell => {
-                SemanticStyle::Attention
-            }
+            ActivityIndicator::Error | ActivityIndicator::UnreadError => SemanticStyle::Error,
+            ActivityIndicator::UnreadBlocked
+            | ActivityIndicator::Blocked
+            | ActivityIndicator::Completed
+            | ActivityIndicator::Bell => SemanticStyle::Attention,
         };
         (
             activity.marker(spinner_frame, &ui.spinner).into(),
@@ -2159,6 +2170,7 @@ fn render_model(
             closing: false,
             destination: None,
             activity: None,
+            progress: None,
         };
         render_workspace_row(
             &item,
@@ -2496,12 +2508,20 @@ fn workspace_row_lines(
             |activity| {
                 let style = match activity {
                     ActivityIndicator::Working => SemanticStyle::Activity,
-                    ActivityIndicator::Blocked
+                    ActivityIndicator::Error | ActivityIndicator::UnreadError => {
+                        SemanticStyle::Error
+                    }
+                    ActivityIndicator::UnreadBlocked
+                    | ActivityIndicator::Blocked
                     | ActivityIndicator::Completed
                     | ActivityIndicator::Bell => SemanticStyle::Attention,
                 };
                 TokenValue::styled(activity.marker(spinner_frame, &ui.spinner), style)
             },
+        ),
+        "workspace.progress" => item.progress.map_or_else(
+            || TokenValue::plain(""),
+            |progress| TokenValue::plain(format!("{progress}%")),
         ),
         _ => materialized_extension_token_value(
             ui,
@@ -2749,8 +2769,8 @@ mod tests {
     use crate::{
         client::config::SidebarRowConfig,
         domain::{
-            AgentActivity, AgentDetection, AgentEvent, AgentIntegration, AgentReport, AgentState,
-            PaneId, SessionId, TabId, TerminalId,
+            PaneId, ProgramStatus, SessionId, StatusRecord, StatusSource, StatusState, TabId,
+            TerminalId,
         },
         extensions,
         resources::{
@@ -2871,18 +2891,28 @@ mod tests {
         )
     }
 
-    fn integrate(pane: &mut PaneSnapshot, source: &str, state: AgentState) {
-        pane.activity = AgentActivity {
-            integration: Some(AgentIntegration {
+    fn integrate(pane: &mut PaneSnapshot, source: &str, state: StatusState) {
+        pane.activity = ProgramStatus {
+            records: vec![StatusRecord {
+                id: String::new(),
+                state,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                message: None,
+                revision: 1,
+                updated_at_ms: 1,
+                attention_revision: 0,
+            }],
+            source: Some(StatusSource::Report {
                 source: Some(source.into()),
-                ..AgentIntegration::default()
+                agent_session_id: None,
             }),
-            detection: None,
-            state,
             revision: 1,
-            updated_at_ms: 1,
-            last_event: None,
+            attention_revision: 0,
             read_revision: 0,
+            working_revision: u64::from(state == StatusState::Working),
         };
     }
 
@@ -3574,6 +3604,15 @@ mod tests {
     }
 
     fn agent_item(session: &str, current: bool, indicator: Option<ActivityIndicator>) -> AgentItem {
+        let state = match indicator {
+            Some(ActivityIndicator::Working) => StatusState::Working,
+            Some(ActivityIndicator::UnreadBlocked | ActivityIndicator::Blocked) => {
+                StatusState::Blocked
+            }
+            Some(ActivityIndicator::UnreadError | ActivityIndicator::Error) => StatusState::Error,
+            Some(ActivityIndicator::Completed) => StatusState::Done,
+            Some(ActivityIndicator::Bell) | None => StatusState::Idle,
+        };
         AgentItem {
             machine: crate::client::federation::MachineId::Local,
             generation: crate::client::federation::Generation::default(),
@@ -3584,7 +3623,12 @@ mod tests {
             session: session.into(),
             workspace: "workspace".into(),
             tab: "tab".into(),
-            source: "codex".into(),
+            app: "codex".into(),
+            title: None,
+            message: None,
+            blocked_kind: None,
+            state,
+            progress: None,
             current,
             indicator,
         }
@@ -3763,6 +3807,38 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
     }
 
     #[test]
+    fn workspace_progress_token_is_a_percentage_or_empty() {
+        let (snapshot, focused) = fixture(&["main"], 0);
+        let mut model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        model.items[0].activity = Some(ActivityIndicator::Working);
+        model.items[0].progress = Some(42);
+        let mut ui = UiConfig::default();
+        let SidebarComponentConfig::Workspaces { row, .. } = &mut ui.sidebar.left.components[0]
+        else {
+            panic!("default left sidebar should contain workspaces");
+        };
+        row.right = vec![super::super::config::SegmentConfig::Token {
+            token: "workspace.progress".into(),
+            style: None,
+            prefix: String::new(),
+            suffix: String::new(),
+            max_width: None,
+            visual: super::super::config::TokenVisual::Plain,
+        }];
+
+        let progress = workspace_row_lines(&model.items[0], false, 0, SidebarSide::Left, &ui);
+        assert_eq!(progress.right.to_string(), "42%");
+        model.items[0].progress = None;
+        let indeterminate = workspace_row_lines(&model.items[0], false, 0, SidebarSide::Left, &ui);
+        assert_eq!(indeterminate.right.to_string(), "");
+    }
+
+    #[test]
     fn current_agent_styles_only_its_source_and_keeps_status_color() {
         let item = AgentItem {
             machine: crate::client::federation::MachineId::Local,
@@ -3774,7 +3850,12 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
             session: "session".into(),
             workspace: "workspace".into(),
             tab: "tab".into(),
-            source: "codex".into(),
+            app: "codex".into(),
+            title: None,
+            message: None,
+            blocked_kind: None,
+            state: StatusState::Working,
+            progress: None,
             current: true,
             indicator: Some(ActivityIndicator::Working),
         };
@@ -3969,7 +4050,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
     fn agents_are_session_scoped_and_exclude_every_closing_ancestor() {
         let (mut snapshot, focused) = fixture(&["one", "two"], 0);
         for workspace in &mut snapshot.sessions[0].workspaces {
-            integrate(&mut workspace.tabs[0].panes[0], "codex", AgentState::Idle);
+            integrate(&mut workspace.tabs[0].panes[0], "codex", StatusState::Idle);
         }
         let mut other_session = snapshot.sessions[0].clone();
         other_session.id = SessionId::new();
@@ -4013,13 +4094,29 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
     }
 
     #[test]
-    fn interactive_agent_projections_require_an_active_integration() {
+    fn agent_projections_include_reporting_programs_but_not_detection_only_status() {
         let (mut snapshot, focused) = fixture(&["main"], 0);
         let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
-        pane.activity.detection = Some(AgentDetection {
-            agent: "codex".into(),
-            rule: "idle_fallback".into(),
-        });
+        pane.activity = ProgramStatus {
+            records: vec![StatusRecord {
+                id: String::new(),
+                state: StatusState::Idle,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                message: None,
+                revision: 1,
+                updated_at_ms: 1,
+                attention_revision: 0,
+            }],
+            source: Some(StatusSource::Detection {
+                agent: "codex".into(),
+                rule: "idle_fallback".into(),
+            }),
+            revision: 1,
+            ..ProgramStatus::default()
+        };
 
         let agents = AgentsComponent::open(
             &snapshot,
@@ -4029,20 +4126,16 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
             None,
         );
 
-        assert!(
-            agents.items.is_empty(),
-            "screen detection alone is excluded"
-        );
+        assert!(agents.items.is_empty(), "detection-only status is excluded");
         assert!(
             !agents::has_items(&snapshot, &focused, AgentScope::Global),
-            "screen detection alone does not make an automatic sidebar relevant"
+            "detection-only status does not make an automatic sidebar relevant"
         );
 
         let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
-        pane.activity.integration = Some(AgentIntegration {
-            active: false,
+        pane.activity.source = Some(StatusSource::Report {
             source: Some("codex".into()),
-            ..AgentIntegration::default()
+            agent_session_id: None,
         });
         let agents = AgentsComponent::open(
             &snapshot,
@@ -4051,16 +4144,16 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
             AgentScope::Global,
             None,
         );
-        assert!(
-            agents.items.is_empty(),
-            "an exited integration is not reactivated by screen detection"
+        assert_eq!(
+            agents.items.len(),
+            1,
+            "any explicit status record qualifies"
         );
 
-        integrate(
-            &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
-            "codex",
-            AgentState::Idle,
-        );
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .records
+            .clear();
         let agents = AgentsComponent::open(
             &snapshot,
             &focused,
@@ -4069,8 +4162,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
             None,
         );
 
-        assert_eq!(agents.items.len(), 1);
-        assert_eq!(agents.items[0].source, "codex");
+        assert!(agents.items.is_empty(), "an empty program is not reporting");
     }
 
     #[test]
@@ -4079,19 +4171,19 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
 
         let mut workspace_tab = snapshot.sessions[0].workspaces[0].tabs[0].clone();
         workspace_tab.id = TabId::new();
         workspace_tab.panes[0].id = PaneId::new();
         workspace_tab.panes[0].terminal_id = TerminalId::new();
-        integrate(&mut workspace_tab.panes[0], "claude", AgentState::Working);
+        integrate(&mut workspace_tab.panes[0], "claude", StatusState::Working);
         snapshot.sessions[0].workspaces[0].tabs.push(workspace_tab);
         integrate(
             &mut snapshot.sessions[0].workspaces[1].tabs[0].panes[0],
             "codex",
-            AgentState::Blocked,
+            StatusState::Blocked,
         );
 
         let mut other_session = snapshot.sessions[0].clone();
@@ -4153,13 +4245,13 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
     fn agent_scopes_fall_back_to_selected_ids_and_global_needs_no_focus_anchor() {
         let (mut snapshot, mut focused) = fixture(&["current", "peer", "third"], 0);
         let tab = &mut snapshot.sessions[0].workspaces[0].tabs[0];
-        integrate(&mut tab.panes[0], "closing", AgentState::Idle);
+        integrate(&mut tab.panes[0], "closing", StatusState::Idle);
         tab.panes[0].closing = true;
         let mut live = tab.panes[0].clone();
         live.id = PaneId::new();
         live.terminal_id = TerminalId::new();
         live.closing = false;
-        integrate(&mut live, "live", AgentState::Working);
+        integrate(&mut live, "live", StatusState::Working);
         tab.panes.push(live);
 
         for scope in [
@@ -4176,7 +4268,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
                 None,
             );
             assert_eq!(agents.items.len(), 1, "{scope:?}");
-            assert_eq!(agents.items[0].source, "live");
+            assert_eq!(agents.items[0].app, "live");
         }
 
         focused.session_id = SessionId::new();
@@ -4218,7 +4310,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
     fn right_sidebar_frame_and_agent_hits_use_the_inner_left_divider() {
         let (mut snapshot, focused) = fixture(&["current"], 0);
         let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
-        integrate(pane, "codex", AgentState::Idle);
+        integrate(pane, "codex", StatusState::Idle);
         let pane_id = pane.id;
         let agents = AgentsComponent::open(
             &snapshot,
@@ -4260,12 +4352,12 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
         integrate(
             &mut snapshot.sessions[0].workspaces[1].tabs[0].panes[0],
             "claude",
-            AgentState::Working,
+            StatusState::Working,
         );
         let working_pane = snapshot.sessions[0].workspaces[1].tabs[0].panes[0].id;
         let agents = AgentsComponent::open(
@@ -4312,22 +4404,20 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
     fn agents_reuse_activity_and_shared_unread_completion_indicators() {
         let (mut snapshot, focused) = fixture(&["idle", "working", "blocked", "done"], 0);
         let states = [
-            AgentState::Idle,
-            AgentState::Working,
-            AgentState::Blocked,
-            AgentState::Idle,
+            StatusState::Idle,
+            StatusState::Working,
+            StatusState::Blocked,
+            StatusState::Done,
         ];
         for (workspace, state) in snapshot.sessions[0].workspaces.iter_mut().zip(states) {
             integrate(&mut workspace.tabs[0].panes[0], "codex", state);
         }
         let completed = &mut snapshot.sessions[0].workspaces[3].tabs[0].panes[0];
-        completed.activity.revision = 7;
-        completed.activity.last_event = Some(AgentEvent {
-            revision: 7,
-            kind: AgentReport::Completed,
-            occurred_at_ms: 10,
-            turn_id: None,
-        });
+        completed.activity.revision = 9;
+        completed.activity.attention_revision = 7;
+        completed.activity.records[0].revision = 9;
+        completed.activity.records[0].updated_at_ms = 10;
+        completed.activity.records[0].attention_revision = 7;
         let notifications = NotificationState::default();
         let agents = AgentsComponent::open(
             &snapshot,
@@ -4359,13 +4449,15 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
             None,
         );
         assert_eq!(agents.items[3].indicator, None);
+        assert_eq!(agents.items[3].state, StatusState::Done);
+        assert_eq!(agents.items[3].status(), "done");
     }
 
     #[test]
     fn agent_selection_keeps_terminal_identity_and_navigates_with_fresh_pane_identity() {
         let (mut snapshot, focused) = fixture(&["one", "two"], 0);
         for workspace in &mut snapshot.sessions[0].workspaces {
-            integrate(&mut workspace.tabs[0].panes[0], "codex", AgentState::Idle);
+            integrate(&mut workspace.tabs[0].panes[0], "codex", StatusState::Idle);
         }
         let mut agents = AgentsComponent::open(
             &snapshot,
@@ -4408,7 +4500,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[1].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
         let mut ui = UiConfig::default();
         ui.sidebar
@@ -4466,7 +4558,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
         let ui: UiConfig = toml::from_str(
             "[sidebar.left]\ncomponents = [{ component = 'agents', size = 1 }, { component = 'workspaces', size = 1 }]\n",
@@ -4496,7 +4588,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
         let mut workspaces = SidebarState::open(
             &snapshot,
@@ -4538,7 +4630,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
         let destination = snapshot.sessions[0].workspaces[2].tabs[0].panes[0].id;
         let ui: UiConfig = toml::from_str(
@@ -4620,7 +4712,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
         let ui: UiConfig = toml::from_str(
             "[styles.normal]\nbackground = 'blue'\n[sidebar.left]\ncomponents = [{ component = 'agents', size = 2 }]\n",
@@ -4695,7 +4787,7 @@ detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location"
         integrate(
             &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
             "codex",
-            AgentState::Idle,
+            StatusState::Idle,
         );
         let ui: UiConfig = toml::from_str(
             "[sidebar.left]\ncomponents = [{ component = 'agents', size = 3 }, { component = 'workspaces', size = 'fill' }]\n",

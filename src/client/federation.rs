@@ -490,6 +490,10 @@ impl State {
             catalog_error: None,
         }
     }
+
+    pub(crate) fn fixture_metadata_mut(&mut self, machine: MachineId) -> &mut Metadata {
+        &mut self.registry.endpoints.get_mut(&machine).unwrap().metadata
+    }
 }
 
 /// Owns the continuously driven supervisor while today's single-endpoint UI is

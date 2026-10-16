@@ -477,7 +477,7 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
                     }
                     if matches!(operation, Operation::Agent)
                         && pane_live
-                        && pane.activity.has_active_integration()
+                        && pane.activity.is_reporting()
                     {
                         push(
                             &mut result,
@@ -508,7 +508,10 @@ fn clean(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+        domain::{
+            PaneId, SessionId, StatusReport, StatusSource, StatusState, StatusUpdate, TabId,
+            TerminalId, WorkspaceId,
+        },
         resources::{
             InitialPath, PaneSnapshot, Project, ProjectIdentity, ResourceTree, SessionSelector,
             SessionSnapshot, TabPath, TabSnapshot, TargetSelector, WorkspacePath,
@@ -637,7 +640,20 @@ mod tests {
     fn agent_completion_includes_only_live_integrated_terminals() {
         let mut snapshot = fixture();
         let integrated = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
-        integrated.activity.integration = Some(Default::default());
+        integrated.activity.apply_updates(
+            vec![StatusUpdate::Report(StatusReport {
+                id: String::new(),
+                state: StatusState::Idle,
+                kind: None,
+                progress: None,
+                app: Some("demo".into()),
+                title: None,
+                message: None,
+            })],
+            StatusSource::Osc,
+            1,
+            1,
+        );
         let integrated_id = integrated.terminal_id.to_string();
         let values = candidates(&snapshot, Operation::Agent)
             .into_iter()

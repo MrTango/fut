@@ -21,6 +21,11 @@ The adapter reports idle, working, blocked, completed, and exited activity. It
 does not control prompts, permissions, tools, terminal layout, or worktrees,
 and it remains inactive when Claude Code is running outside Fut.
 
+The adapter uses Fut's CLI fallback: completed stores an OSC-model done record,
+and exited clears its records. Programs with native OSC 7501 support need no
+plugin. Transient records are also cleaned up automatically when the reporting
+process exits; done and error results survive automatic exit cleanup.
+
 The `fut` binary must be on `PATH`. Managed Claude Code policy can disable
 plugin hooks; use `/hooks` or the plugin manager's Errors view if activity does
 not appear.

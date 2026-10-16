@@ -228,6 +228,10 @@ impl TemporaryCommandSurface {
             size,
         })
         .with_context(|| format!("start {}", command.title))?;
+        // Popup commands do not contribute native status to daemon resources.
+        // Explicitly end that subscription so its bounded producer cannot
+        // backpressure the terminal runtime while the popup remains open.
+        drop(handle.take_status_updates());
         let snapshots = handle.subscribe_snapshots();
         let screen = snapshots.borrow().clone();
         let events = handle.subscribe_events();
@@ -1175,6 +1179,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(event, Some(0));
+    }
+
+    #[tokio::test]
+    async fn urgent_status_bursts_do_not_block_popup_commands() {
+        let script = r#"
+            stty -echo
+            i=0
+            while [ "$i" -lt 40 ]; do
+                IFS= read -r line || exit
+                printf '\033]133;A\007BATCH_%02d\n' "$i"
+                i=$((i + 1))
+            done
+            IFS= read -r line || exit
+            printf INPUT_ACCEPTED
+            IFS= read -r line
+        "#;
+        let mut surface = TemporaryCommandSurface::spawn(
+            Default::default(),
+            &command("/bin/sh", &["-c", script]),
+            std::process::id(),
+            TerminalSize {
+                columns: 40,
+                rows: 10,
+            },
+            Path::new("/tmp/fut-test.sock"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for batch in 0..40 {
+            surface.input(b"next\n".to_vec()).await.unwrap();
+            let marker = format!("BATCH_{batch:02}");
+            wait_for_screen(&mut surface, |screen| {
+                screen
+                    .cells
+                    .iter()
+                    .map(|cell| cell.contents.as_str())
+                    .collect::<String>()
+                    .contains(&marker)
+            })
+            .await;
+        }
+
+        let resized = TerminalSize {
+            columns: 50,
+            rows: 12,
+        };
+        surface.resize(resized).await.unwrap();
+        surface.input(b"finish\n".to_vec()).await.unwrap();
+        wait_for_screen(&mut surface, |screen| {
+            screen.size == resized
+                && screen
+                    .cells
+                    .iter()
+                    .map(|cell| cell.contents.as_str())
+                    .collect::<String>()
+                    .contains("INPUT_ACCEPTED")
+        })
+        .await;
     }
 
     #[tokio::test]

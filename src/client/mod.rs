@@ -58,6 +58,7 @@ use agent_dialog::{AgentsAction, AgentsDialog};
 use anyhow::{Context, bail};
 use attachment::{Attachment, Locality};
 use bytes::Bytes;
+pub(crate) use chrome::sanitize as sanitize_display_text;
 use chrome::{
     ClientLayout, MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar,
     sanitize, sidebar_drawer,

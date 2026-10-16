@@ -31,6 +31,7 @@ class LiveAdapterTests(unittest.TestCase):
         self.environment = os.environ.copy()
         self.environment.update(
             HOME=str(root / "home"),
+            XDG_CONFIG_HOME=str(root / "config"),
             FUT_RUNTIME_DIR=str(root / "runtime"),
             TERM="xterm-256color",
             FUT_BIN=FUT,
@@ -163,6 +164,121 @@ class LiveAdapterTests(unittest.TestCase):
     def agent(self) -> dict[str, object]:
         return self.cli("agent", "get", self.terminal_id)["result"]["agent"]
 
+    def resource_activity(self, terminal_id=None) -> dict[str, object]:
+        terminal_id = terminal_id or self.terminal_id
+        resources = self.cli("list")["result"]
+        for session in resources["sessions"]:
+            for workspace in session["workspaces"]:
+                for tab in workspace["tabs"]:
+                    for pane in tab["panes"]:
+                        if pane["terminal_id"] == terminal_id:
+                            return pane["activity"]
+        self.fail(f"terminal {terminal_id} was absent from the resource tree")
+
+    def assert_no_turn_metadata(self, value) -> None:
+        if isinstance(value, dict):
+            self.assertNotIn("turn_id", value)
+            self.assertNotIn("turn-id", value)
+            for child in value.values():
+                self.assert_no_turn_metadata(child)
+        elif isinstance(value, list):
+            for child in value:
+                self.assert_no_turn_metadata(child)
+
+    def assert_activity(
+        self,
+        activity,
+        state,
+        *,
+        source="codex",
+        agent_session_id="codex-session-1",
+    ):
+        self.assertLessEqual(
+            set(activity),
+            {
+                "records",
+                "source",
+                "revision",
+                "working_revision",
+                "attention_revision",
+                "read_revision",
+            },
+        )
+        self.assertGreater(activity["revision"], 0)
+        expected_source = {"type": "report", "source": source}
+        if agent_session_id is not None:
+            expected_source["agent_session_id"] = agent_session_id
+        self.assertEqual(activity["source"], expected_source)
+        self.assertEqual(len(activity["records"]), 1)
+        record = activity["records"][0]
+        self.assertNotIn("id", record, "the empty root ID is omitted from JSON")
+        self.assertEqual(record["state"], state)
+        self.assertEqual(record["revision"], activity["revision"])
+        if state == "working":
+            self.assertEqual(activity["working_revision"], record["revision"])
+        if state in {"done", "blocked", "error"}:
+            self.assertEqual(activity["attention_revision"], record["attention_revision"])
+        self.assert_no_turn_metadata(activity)
+        return record
+
+    def assert_agent(
+        self,
+        agent,
+        state,
+        *,
+        available,
+        unread,
+        source="codex",
+        agent_session_id="codex-session-1",
+    ):
+        self.assertEqual(
+            set(agent),
+            {
+                "activity",
+                "app",
+                "available",
+                "pane_id",
+                "record",
+                "session",
+                "tab",
+                "terminal_id",
+                "unread",
+                "workspace",
+            },
+        )
+        record = self.assert_activity(
+            agent["activity"],
+            state,
+            source=source,
+            agent_session_id=agent_session_id,
+        )
+        self.assertEqual(agent["record"], record)
+        self.assertEqual(agent["app"], source)
+        self.assertEqual(agent["available"], available)
+        self.assertEqual(agent["unread"], unread)
+        self.assertEqual(agent["activity"], self.resource_activity(agent["terminal_id"]))
+        return record
+
+    def start_fake_codex(self, reports) -> Path:
+        codex = Path(self.temporary.name) / "codex"
+        source = codex.with_suffix(".c")
+        ready = Path(self.temporary.name) / "codex-ready"
+        source.write_text(
+            '#include <stdlib.h>\nint main(int argc, char **argv) { return system(argv[1]); }\n'
+        )
+        subprocess.run(["cc", str(source), "-o", str(codex)], check=True)
+        script = " && ".join(
+            shlex.join([FUT, "agent", "report", *report]) for report in reports
+        )
+        script += f" && touch {shlex.quote(str(ready))} && sleep 2"
+        self.cli("terminal", "run", self.terminal_id, shlex.join([str(codex), script]))
+
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "fake Codex process did not report")
+        return ready
+
     def test_detached_desktop_cannot_claim_or_complete_terminal_agent(self) -> None:
         before = self.cli("list")["result"]
         self.hook("UserPromptSubmit", attached=False)
@@ -182,13 +298,32 @@ class LiveAdapterTests(unittest.TestCase):
 
         self.hook("UserPromptSubmit")
         self.notify_complete(attached=False)
-        self.assertEqual(self.agent()["activity"]["state"], "working")
+        self.assert_agent(self.agent(), "working", available=False, unread=False)
         self.notify_complete()
-        self.assertEqual(self.agent()["activity"]["state"], "idle")
+        self.assert_agent(self.agent(), "done", available=True, unread=True)
 
         # Explicit targets remain available to external controllers.
-        self.cli("agent", "report", "blocked", "--terminal-id", self.terminal_id)
-        self.assertEqual(self.agent()["activity"]["state"], "blocked")
+        reported = self.cli(
+            "agent", "report", "blocked",
+            "--terminal-id", self.terminal_id,
+            "--source", "codex",
+            "--turn-id", "accepted-but-ignored",
+        )["result"]
+        self.assertNotIn("id", reported["report"]["value"])
+        self.assertEqual(reported["source"], {"type": "report", "source": "codex"})
+        self.assert_no_turn_metadata(reported)
+        self.assert_agent(
+            self.agent(), "blocked", available=True, unread=True,
+            agent_session_id=None,
+        )
+
+        # Exited is an explicit full clear, so the terminal is no longer an agent.
+        self.cli("agent", "report", "exited", "--terminal-id", self.terminal_id)
+        agents = self.cli("agent", "list")["result"]["agents"]
+        self.assertTrue(all(agent["terminal_id"] != self.terminal_id for agent in agents))
+        activity = self.resource_activity()
+        self.assertEqual(activity["records"], [])
+        self.assertNotIn("source", activity)
 
     def test_sibling_fut_pane_cannot_report_for_another_pane(self) -> None:
         pane = self.cli("get", self.terminal_id)["result"]["target"]["pane"]["id"]
@@ -199,6 +334,14 @@ class LiveAdapterTests(unittest.TestCase):
         panes = self.cli("list")["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"]
         sibling = next(p["terminal_id"] for p in panes if p["terminal_id"] != self.terminal_id)
         self.hook("UserPromptSubmit")
+        # Transfer the same root report to explicit ownership so the short-lived
+        # hook fixture's PID cleanup cannot race these cross-pane assertions.
+        self.cli(
+            "agent", "report", "working",
+            "--terminal-id", self.terminal_id,
+            "--source", "codex",
+            "--agent-session-id", "codex-session-1",
+        )
         original = self.agent()["activity"]
 
         wrong_target = self.run_report(
@@ -227,8 +370,11 @@ class LiveAdapterTests(unittest.TestCase):
             terminal_id=sibling,
         )
         self.assertEqual(own_target.returncode, 0, own_target.stderr)
-        sibling_activity = self.cli("agent", "get", sibling)["result"]["agent"]["activity"]
-        self.assertEqual(sibling_activity["state"], "working")
+        sibling_agent = self.cli("agent", "get", sibling)["result"]["agent"]
+        self.assert_agent(
+            sibling_agent, "working", available=False, unread=False,
+            agent_session_id=None,
+        )
         self.assertEqual(self.agent()["activity"], original)
 
     def test_reparented_process_with_real_inherited_context_cannot_report(self) -> None:
@@ -246,22 +392,13 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(self.agent()["activity"], original)
 
     def test_agent_integration_exits_with_its_reporting_codex_process(self) -> None:
-        codex = Path(self.temporary.name) / "codex"
-        source = codex.with_suffix(".c")
-        ready = Path(self.temporary.name) / "codex-ready"
-        source.write_text(
-            '#include <stdlib.h>\nint main(int argc, char **argv) { return system(argv[1]); }\n'
+        self.start_fake_codex([("working", "--source", "codex")])
+        working = self.agent()
+        self.assert_agent(
+            working, "working", available=False, unread=False,
+            agent_session_id=None,
         )
-        subprocess.run(["cc", str(source), "-o", str(codex)], check=True)
-        script = shlex.join([FUT, "agent", "report", "working", "--source", "codex"])
-        script += f" && touch {shlex.quote(str(ready))} && sleep 2"
-        self.cli("terminal", "run", self.terminal_id, shlex.join([str(codex), script]))
-
-        deadline = time.monotonic() + 3
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(ready.exists(), "fake Codex process did not report")
-        self.assertEqual(self.agent()["activity"]["state"], "working")
+        working_revision = working["activity"]["revision"]
 
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -271,22 +408,70 @@ class LiveAdapterTests(unittest.TestCase):
             time.sleep(0.05)
         else:
             self.fail("exited Codex process remained an active agent")
+        activity = self.resource_activity()
+        self.assertEqual(activity["records"], [])
+        self.assertNotIn("source", activity)
+        self.assertGreater(activity["revision"], working_revision)
+
+    def test_automatic_pid_cleanup_is_scoped_and_preserves_results(self) -> None:
+        self.start_fake_codex(
+            [
+                ("working", "--source", "codex"),
+                ("working", "--id", "automatic", "--source", "codex"),
+                ("done", "--id", "result", "--source", "codex"),
+                ("error", "--id", "failure", "--source", "codex"),
+            ]
+        )
+        self.cli(
+            "agent", "report", "working",
+            "--terminal-id", self.terminal_id,
+            "--id", "external",
+            "--source", "controller",
+        )
+
+        deadline = time.monotonic() + 5
+        activity = self.resource_activity()
+        while time.monotonic() < deadline:
+            records = {record.get("id", ""): record for record in activity["records"]}
+            if "" not in records and "automatic" not in records:
+                break
+            time.sleep(0.05)
+            activity = self.resource_activity()
+        else:
+            self.fail("exited automatic reporter retained transient records")
+
+        self.assertEqual(set(records), {"result", "failure", "external"})
+        self.assertEqual(records["result"]["state"], "done")
+        self.assertEqual(records["failure"]["state"], "error")
+        self.assertEqual(records["external"]["state"], "working")
+        agent = self.agent()
+        self.assertEqual(agent["record"], records["failure"])
+        self.assertEqual(agent["app"], "controller")
+        self.assertFalse(agent["available"])
+        self.assertTrue(agent["unread"])
+
+        self.cli("agent", "report", "exited", "--terminal-id", self.terminal_id)
+        agents = self.cli("agent", "list")["result"]["agents"]
+        self.assertTrue(all(agent["terminal_id"] != self.terminal_id for agent in agents))
+        cleared = self.resource_activity()
+        self.assertEqual(cleared["records"], [])
+        self.assertNotIn("source", cleared)
 
     def test_real_report_get_and_wait_surface_observes_native_transitions(self) -> None:
         self.hook("SessionStart", turn_id=None)
         agent = self.agent()
-        self.assertEqual(agent["activity"]["state"], "idle")
-        self.assertEqual(agent["activity"]["integration"]["source"], "codex")
-        self.assertEqual(
-            agent["activity"]["integration"]["agent_session_id"],
-            "codex-session-1",
-        )
+        self.assert_agent(agent, "idle", available=True, unread=False)
+        self.assertNotIn("working_revision", agent["activity"])
+        self.assertNotIn("attention_revision", agent["activity"])
+        self.assertNotIn("read_revision", agent["activity"])
 
         self.hook("UserPromptSubmit")
         agent = self.agent()
-        self.assertEqual(agent["activity"]["state"], "working")
-        self.assertEqual(agent["activity"]["last_event"]["turn_id"], "turn-1")
-        self.assertFalse(agent["available"])
+        self.assert_agent(agent, "working", available=False, unread=False)
+        self.assertEqual(
+            agent["activity"]["working_revision"],
+            agent["record"]["revision"],
+        )
 
         waiter = subprocess.Popen(
             [
@@ -308,10 +493,14 @@ class LiveAdapterTests(unittest.TestCase):
         self.notify_complete()
         stdout, stderr = waiter.communicate(timeout=4)
         self.assertEqual(waiter.returncode, 0, stderr)
-        settled = json.loads(stdout)["result"]["activity"]
-        self.assertEqual(settled["state"], "idle")
-        self.assertEqual(settled["last_event"]["kind"], "completed")
-        self.assertEqual(settled["last_event"]["turn_id"], "turn-1")
+        settled = json.loads(stdout)["result"]
+        settled_record = self.assert_activity(settled["activity"], "done")
+        self.assertEqual(settled["activity"], self.resource_activity())
+        self.assertEqual(
+            settled["working_revision"], settled["activity"]["working_revision"]
+        )
+        self.assertLessEqual(settled["working_revision"], settled["barrier_revision"])
+        self.assertLess(settled["barrier_revision"], settled_record["revision"])
 
         prompted = subprocess.Popen(
             [
@@ -348,17 +537,26 @@ class LiveAdapterTests(unittest.TestCase):
         prompt_result = json.loads(stdout)["result"]
         self.assertTrue(prompt_result["submitted"])
         self.assertIsNotNone(prompt_result["working_revision"])
+        prompt_record = self.assert_activity(prompt_result["activity"], "done")
         self.assertEqual(
-            prompt_result["activity"]["last_event"]["turn_id"], "turn-prompt"
+            prompt_result["working_revision"],
+            prompt_result["activity"]["working_revision"],
         )
+        self.assertLess(prompt_result["barrier_revision"], prompt_result["working_revision"])
+        self.assertLess(prompt_result["working_revision"], prompt_record["revision"])
+        self.assertEqual(prompt_result["activity"], self.resource_activity())
 
         self.hook("UserPromptSubmit", turn_id="turn-2")
         self.hook("PermissionRequest", turn_id="turn-2")
-        blocked = self.cli(
+        blocked_result = self.cli(
             "agent", "wait", self.terminal_id, "--timeout", "1s"
-        )["result"]["activity"]
-        self.assertEqual(blocked["state"], "blocked")
-        self.assertEqual(blocked["last_event"]["turn_id"], "turn-2")
+        )["result"]
+        blocked = blocked_result["activity"]
+        blocked_record = self.assert_activity(blocked, "blocked")
+        self.assertEqual(blocked, self.resource_activity())
+        self.assertIsNone(blocked_result["working_revision"])
+        self.assertLess(blocked["working_revision"], blocked_record["revision"])
+        self.assert_agent(self.agent(), "blocked", available=True, unread=True)
 
 
 if __name__ == "__main__":

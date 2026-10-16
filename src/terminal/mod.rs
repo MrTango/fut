@@ -1,8 +1,8 @@
 //! PTY process ownership and the isolated Ghostty virtual-terminal adapter.
 
 mod ghostty;
-mod program_status;
 mod runtime;
+mod status;
 
 #[cfg(test)]
 pub(crate) use ghostty::KITTY_SNAPSHOT_BYTES;
@@ -33,12 +33,12 @@ const DEFAULT_CELL_PIXEL_HEIGHT: u16 = 18;
 pub(crate) use ghostty::{
     CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
 };
-pub use program_status::{ProgramState, ProgramStatus};
 pub(crate) use runtime::AttachmentConfiguration;
 pub use runtime::{
     CommandError, SpawnSpec, TerminalActivity, TerminalEvent, TerminalHandle, TerminalLifecycle,
     spawn_terminal,
 };
+pub(crate) use status::NativeStatusBatch;
 
 /// Benchmark-only access to the VT feed → snapshot path. Not part of the API.
 #[doc(hidden)]

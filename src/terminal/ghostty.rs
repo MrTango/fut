@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io::Write,
     sync::{
         Arc, Mutex,
@@ -21,23 +21,24 @@ use libghostty_vt::{
     screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
     selection::{FormatOptions, Selection},
     style::{StyleColor, Underline},
-    terminal::{Mode, Point, PointCoordinate, PointSpace, ScrollViewport},
+    terminal::{
+        Mode, Point, PointCoordinate, PointSpace, ProgramStatusKind, ProgramStatusReport,
+        ProgramStatusState, ScrollViewport, SemanticPromptKind,
+    },
 };
 use uuid::Uuid;
 
-use super::{
-    DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH,
-    program_status::{self, ProgramState, ProgramStatus},
-};
+use super::{DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH};
 use crate::domain::{
-    Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
-    CursorShape, KittyGraphics, KittyImage, KittyPlacement, MAX_COPY_BYTES, MAX_COPY_CELLS,
-    MAX_HYPERLINK_URI_BYTES, MAX_KITTY_PLACEMENTS, MAX_SCREEN_HYPERLINK_BYTES,
-    MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES,
-    MAX_TERMINAL_OUTPUT_BYTES, MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton,
-    MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot,
-    SearchDirection, TerminalKeyAction, TerminalKeyCode, TerminalKeyEvent, TerminalOutputSource,
-    TerminalSize,
+    BlockedKind, Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError,
+    CopyModeMovement, Cursor, CursorShape, KittyGraphics, KittyImage, KittyPlacement,
+    MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_HYPERLINK_URI_BYTES, MAX_KITTY_PLACEMENTS,
+    MAX_SCREEN_HYPERLINK_BYTES, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
+    MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
+    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection, StatusReport,
+    StatusState, StatusUpdate, TerminalKeyAction, TerminalKeyCode, TerminalKeyEvent,
+    TerminalOutputSource, TerminalSize,
 };
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -57,6 +58,34 @@ pub(crate) enum MouseForwarding {
     Withheld,
     /// Only Fut's own scrollback may react, as for an unfocused pane.
     Denied,
+}
+
+fn status_update(report: ProgramStatusReport) -> StatusUpdate {
+    if report.state == ProgramStatusState::Clear {
+        return StatusUpdate::Clear {
+            id: (!report.id.is_empty()).then_some(report.id),
+        };
+    }
+    StatusUpdate::Report(StatusReport {
+        id: report.id,
+        state: match report.state {
+            ProgramStatusState::Idle => StatusState::Idle,
+            ProgramStatusState::Working => StatusState::Working,
+            ProgramStatusState::Done => StatusState::Done,
+            ProgramStatusState::Blocked => StatusState::Blocked,
+            ProgramStatusState::Error => StatusState::Error,
+            ProgramStatusState::Clear => unreachable!("clear handled above"),
+        },
+        kind: report.kind.map(|kind| match kind {
+            ProgramStatusKind::Permission => BlockedKind::Permission,
+            ProgramStatusKind::Question => BlockedKind::Question,
+            ProgramStatusKind::Auth => BlockedKind::Auth,
+        }),
+        progress: report.progress,
+        app: (!report.app.is_empty()).then_some(report.app),
+        title: (!report.title.is_empty()).then_some(report.title),
+        message: (!report.message.is_empty()).then_some(report.message),
+    })
 }
 
 pub(crate) enum MouseInputOutcome {
@@ -162,9 +191,6 @@ enum SearchBoundary {
     Before(PointCoordinate),
 }
 
-/// Root-record reports retained between activity publications.
-pub(super) const RECENT_PROGRAM_STATUSES: usize = 16;
-
 /// The complete libghostty boundary. This value must never leave its runtime thread.
 pub(super) struct GhosttyTerminal {
     terminal: Terminal<'static, 'static>,
@@ -175,14 +201,11 @@ pub(super) struct GhosttyTerminal {
     key_event: key::Event<'static>,
     mouse_encoder: mouse::Encoder<'static>,
     mouse_event: mouse::Event<'static>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     kitty_placements: PlacementIterator<'static>,
     kitty_png_cache: HashMap<u64, Arc<[u8]>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     bell_count: Arc<AtomicU64>,
-    program_status_scanner: program_status::Scanner,
-    /// Counts root-record reports so repeated identical reports stay visible.
-    program_status_count: u64,
-    recent_program_statuses: VecDeque<ProgramStatus>,
+    status_updates: Arc<Mutex<Vec<StatusUpdate>>>,
     size: TerminalSize,
     revision: u64,
     synchronized_output_started: Option<Instant>,
@@ -237,6 +260,21 @@ impl GhosttyTerminal {
         terminal.on_bell(move |_| {
             callback_bell_count.fetch_add(1, Ordering::Relaxed);
         })?;
+        let status_updates = Arc::new(Mutex::new(Vec::new()));
+        let callback_statuses = Arc::clone(&status_updates);
+        terminal.on_program_status(move |_, report| {
+            if let Ok(mut updates) = callback_statuses.lock() {
+                updates.push(status_update(report));
+            }
+        })?;
+        let callback_statuses = Arc::clone(&status_updates);
+        terminal.on_semantic_prompt(move |_, kind| {
+            if kind == SemanticPromptKind::PromptStart
+                && let Ok(mut updates) = callback_statuses.lock()
+            {
+                updates.push(StatusUpdate::PromptStart);
+            }
+        })?;
 
         Ok(Self {
             terminal,
@@ -247,13 +285,11 @@ impl GhosttyTerminal {
             key_event: key::Event::new()?,
             mouse_encoder: mouse::Encoder::new()?,
             mouse_event: mouse::Event::new()?,
+            writer,
             kitty_placements: PlacementIterator::new()?,
             kitty_png_cache: HashMap::new(),
-            writer,
             bell_count,
-            program_status_scanner: program_status::Scanner::default(),
-            program_status_count: 0,
-            recent_program_statuses: VecDeque::new(),
+            status_updates,
             size,
             revision: 0,
             synchronized_output_started: None,
@@ -308,85 +344,73 @@ impl GhosttyTerminal {
     /// Parse-only half of `feed`, so a caller can push several PTY chunks
     /// through the parser and pay for one snapshot at the end of the batch.
     pub(super) fn vt_write(&mut self, bytes: &[u8]) {
-        let mut written = 0;
-        for (end, observation) in self.program_status_scanner.scan(bytes) {
-            match observation {
-                program_status::Observation::Report(status) => self.record_program_status(status),
-                program_status::Observation::FullReset => {
-                    self.record_program_status(ProgramStatus {
-                        state: ProgramState::Clear,
-                        app: None,
-                    });
-                }
-                program_status::Observation::Query { bel } => {
-                    // Reply before parsing what follows, so a program probing
-                    // with a trailing primary device attributes request sees
-                    // this answer first.
-                    self.terminal.vt_write(&bytes[written..end]);
-                    written = end;
-                    let reply: &[u8] = if bel {
-                        b"\x1b]7501;?\x07"
-                    } else {
-                        b"\x1b]7501;?\x1b\\"
-                    };
-                    if let Ok(mut writer) = self.writer.lock() {
-                        let _ = writer.write_all(reply);
-                        let _ = writer.flush();
-                    }
-                }
-            }
-        }
-        self.terminal.vt_write(&bytes[written..]);
-    }
-
-    fn record_program_status(&mut self, status: ProgramStatus) {
-        self.program_status_count += 1;
-        if self.recent_program_statuses.len() == RECENT_PROGRAM_STATUSES {
-            self.recent_program_statuses.pop_front();
-        }
-        self.recent_program_statuses.push_back(status);
+        self.terminal.vt_write(bytes);
     }
 
     pub(super) fn bell_count(&self) -> u64 {
         self.bell_count.load(Ordering::Relaxed)
     }
 
-    /// The total root-record report count and the most recent reports, so a
-    /// reader that falls behind one parse batch still sees each transition.
-    pub(super) fn program_statuses(&self) -> (u64, &VecDeque<ProgramStatus>) {
-        (self.program_status_count, &self.recent_program_statuses)
+    pub(super) fn take_status_updates(&self) -> Vec<StatusUpdate> {
+        self.status_updates
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut updates| std::mem::take(&mut *updates))
     }
 
     /// Snapshot half of `feed`. Respects synchronized-output suppression the
     /// same way `feed` always has, whether called once per chunk or once per
     /// drained batch of chunks.
     pub(super) fn snapshot_after_feed(&mut self) -> Result<Option<ScreenSnapshot>> {
+        self.snapshot_after_feed_if(true)
+    }
+
+    pub(super) fn snapshot_after_feed_if(
+        &mut self,
+        capture_screen: bool,
+    ) -> Result<Option<ScreenSnapshot>> {
         if self.holds_synchronized_output()? {
             return Ok(None);
         }
-        self.snapshot().map(Some)
+        capture_screen.then(|| self.snapshot()).transpose()
     }
 
     /// Publish an idle terminal only when an unterminated synchronized-output
     /// frame has expired. A quiet terminal must not manufacture revisions:
     /// every published snapshot wakes every attached client.
+    #[cfg(test)]
     pub(super) fn flush_synchronized_output(&mut self) -> Result<Option<ScreenSnapshot>> {
+        self.flush_synchronized_output_if(true)
+    }
+
+    pub(super) fn flush_synchronized_output_if(
+        &mut self,
+        capture_screen: bool,
+    ) -> Result<Option<ScreenSnapshot>> {
         if self.synchronized_output_started.is_none() || self.holds_synchronized_output()? {
             return Ok(None);
         }
-        self.snapshot().map(Some)
+        capture_screen.then(|| self.snapshot()).transpose()
     }
 
-    pub(super) fn finish_synchronized_output(&mut self) -> Result<Option<ScreenSnapshot>> {
+    pub(super) fn finish_synchronized_output_if(
+        &mut self,
+        capture_screen: bool,
+    ) -> Result<Option<ScreenSnapshot>> {
         if self.synchronized_output_started.is_none() && !self.terminal.mode(Mode::SYNC_OUTPUT)? {
             return Ok(None);
         }
         self.terminal.set_mode(Mode::SYNC_OUTPUT, false)?;
         self.synchronized_output_started = None;
-        self.snapshot().map(Some)
+        capture_screen.then(|| self.snapshot()).transpose()
     }
 
+    #[cfg(test)]
     pub(super) fn resize(&mut self, size: TerminalSize) -> Result<ScreenSnapshot> {
+        self.resize_state(size)?;
+        self.snapshot()
+    }
+
+    pub(super) fn resize_state(&mut self, size: TerminalSize) -> Result<()> {
         validate_size(size)?;
         if self.terminal.mode(Mode::SYNC_OUTPUT)? {
             self.terminal.set_mode(Mode::SYNC_OUTPUT, false)?;
@@ -401,7 +425,7 @@ impl GhosttyTerminal {
             .context("resizing Ghostty terminal")?;
         self.size = size;
         self.synchronized_output_started = None;
-        self.snapshot()
+        Ok(())
     }
 
     pub(super) fn output(
@@ -2456,35 +2480,11 @@ mod tests {
         let (mut terminal, output) = recording_terminal(10, 4);
         terminal.vt_write(b"\x1b]7501;?\x1b\\\x1b[c");
         let output = take_output(&output);
-        assert!(output.starts_with(b"\x1b]7501;?\x1b\\\x1b[?"), "{output:?}");
-    }
-
-    #[test]
-    fn records_program_status_without_rendering_it() {
-        let mut terminal = terminal(10, 1);
-        let snapshot = terminal
-            .feed(b"a\x1b]7501;state=working:app=cargo\x07b")
-            .unwrap()
-            .unwrap();
-        assert_eq!(&text(&snapshot)[..2], "ab");
-        let (count, statuses) = terminal.program_statuses();
-        assert_eq!(count, 1);
-        assert_eq!(
-            statuses.back(),
-            Some(&ProgramStatus {
-                state: ProgramState::Working,
-                app: Some("cargo".into()),
-            })
-        );
-        terminal.vt_write(b"\x1bc");
-        assert_eq!(terminal.program_statuses().0, 2);
-        assert_eq!(
-            terminal
-                .program_statuses()
-                .1
-                .back()
-                .map(|status| status.state),
-            Some(ProgramState::Clear)
+        assert!(
+            output.starts_with(
+                b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\\x1b[?"
+            ),
+            "{output:?}"
         );
     }
 
@@ -2535,6 +2535,130 @@ mod tests {
         let snapshot = snapshot.unwrap();
         assert!(snapshot.cells[0].style.faint());
         assert!(!snapshot.cells[1].style.faint());
+    }
+
+    #[test]
+    fn program_status_callbacks_preserve_transitions_prompt_and_ris_order() {
+        let mut terminal = terminal(20, 2);
+        terminal.vt_write(
+            b"\x1b]7501;state=working:id=task:progress=10\x07\
+              \x1b]7501;state=done:id=task:title=RmluaXNoZWQ=\x07\
+              \x1b]133;A\x07\
+              \x1bc",
+        );
+
+        let updates = terminal.take_status_updates();
+        assert_eq!(updates.len(), 4);
+        assert!(matches!(
+            &updates[0],
+            StatusUpdate::Report(StatusReport {
+                id,
+                state: StatusState::Working,
+                progress: Some(10),
+                ..
+            }) if id == "task"
+        ));
+        assert!(matches!(
+            &updates[1],
+            StatusUpdate::Report(StatusReport {
+                state: StatusState::Done,
+                title: Some(title),
+                ..
+            }) if title == "Finished"
+        ));
+        assert_eq!(updates[2], StatusUpdate::PromptStart);
+        assert_eq!(updates[3], StatusUpdate::Clear { id: None });
+    }
+
+    #[test]
+    fn program_status_callbacks_return_every_raw_progress_receipt() {
+        let mut terminal = terminal(20, 2);
+        terminal.vt_write(b"\x1b]7501;state=working:id=task:progress=0\x07");
+        for progress in 1..=100 {
+            terminal.vt_write(
+                format!("\x1b]7501;state=working:id=task:progress={progress}\x07").as_bytes(),
+            );
+        }
+        let updates = terminal.take_status_updates();
+        assert_eq!(updates.len(), 101);
+        assert!(matches!(
+            updates.last(),
+            Some(StatusUpdate::Report(StatusReport {
+                progress: Some(100),
+                ..
+            }))
+        ));
+
+        // The callback collector is a receipt queue, not authoritative state:
+        // exact redelivery remains observable after the prior queue was taken.
+        terminal.vt_write(b"\x1b]7501;state=working:id=task:progress=100\x07");
+        assert_eq!(
+            terminal.take_status_updates(),
+            vec![StatusUpdate::Report(StatusReport {
+                id: "task".into(),
+                state: StatusState::Working,
+                kind: None,
+                progress: Some(100),
+                app: None,
+                title: None,
+                message: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn interleaved_progress_callbacks_preserve_parser_order() {
+        let mut terminal = terminal(20, 2);
+        terminal.vt_write(
+            b"\x1b]7501;state=working:id=a:progress=10\x07\
+              \x1b]7501;state=working:id=b:progress=10\x07\
+              \x1b]7501;state=working:id=a:progress=20\x07",
+        );
+
+        let updates = terminal.take_status_updates();
+        let progress = updates
+            .iter()
+            .map(|update| match update {
+                StatusUpdate::Report(report) => (report.id.as_str(), report.progress),
+                _ => panic!("progress stream contained a barrier"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            progress,
+            vec![("a", Some(10)), ("b", Some(10)), ("a", Some(20))]
+        );
+    }
+
+    #[test]
+    fn raw_status_callback_bursts_are_lossless_and_ordered() {
+        let mut terminal = terminal(20, 2);
+        terminal.vt_write(b"\x1bc");
+        for id in 0..300 {
+            terminal.vt_write(format!("\x1b]7501;state=done:id=t{id}\x07").as_bytes());
+        }
+        let updates = terminal.take_status_updates();
+        assert_eq!(updates.len(), 301);
+        assert_eq!(updates.first(), Some(&StatusUpdate::Clear { id: None }));
+        assert!(matches!(
+            updates.last(),
+            Some(StatusUpdate::Report(StatusReport { id, .. })) if id == "t299"
+        ));
+
+        terminal.vt_write(b"\x1b]7501;state=working:id=turn\x07");
+        for id in 0..255 {
+            terminal.vt_write(format!("\x1b]7501;state=done:id=r{id}\x07").as_bytes());
+        }
+        terminal.vt_write(b"\x1b]7501;state=done:id=turn\x07");
+        let updates = terminal.take_status_updates();
+        assert_eq!(updates.len(), 257);
+        assert!(matches!(
+            updates.first(),
+            Some(StatusUpdate::Report(StatusReport { state: StatusState::Working, id, .. })) if id == "turn"
+        ));
+        assert!(matches!(
+            updates.last(),
+            Some(StatusUpdate::Report(StatusReport { state: StatusState::Done, id, .. })) if id == "turn"
+        ));
     }
 
     #[test]

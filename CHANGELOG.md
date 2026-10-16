@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Unify OSC 7501 program status, progress, and actionable results throughout Fut, with agent reports and screen detection feeding the same terminal-owned records.
 - Paste clipboard images into local or remote terminals by uploading them and inserting their file paths.
 - Drop a PNG into a remote terminal to upload it automatically and insert its remote path.
 - Render faint text from terminal programs dimmed instead of at full brightness.

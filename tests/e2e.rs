@@ -21,10 +21,10 @@ use std::{
 use bytes::Bytes;
 use fut::{
     domain::{
-        AgentReport, AgentState, CopyModeAction, CopyModeError, CopyModeMovement,
-        MAX_SEARCH_QUERY_BYTES, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
-        MouseModifiers, MouseWheelDirection, PaneId, ScreenSnapshot, SearchDirection, SessionId,
-        TabId, TerminalId, TerminalSize, WorkspaceId,
+        CopyModeAction, CopyModeError, CopyModeMovement, MAX_SEARCH_QUERY_BYTES, MouseButton,
+        MouseButtons, MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection, PaneId,
+        ScreenSnapshot, SearchDirection, SessionId, StatusReport, StatusSource, StatusState,
+        StatusUpdate, TabId, TerminalId, TerminalSize, WorkspaceId,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PresentationTokenPublishAction,
@@ -48,6 +48,25 @@ const SIZE: TerminalSize = TerminalSize {
     columns: 80,
     rows: 24,
 };
+
+fn status_report(state: StatusState) -> StatusUpdate {
+    StatusUpdate::Report(StatusReport {
+        id: String::new(),
+        state,
+        kind: None,
+        progress: None,
+        app: None,
+        title: None,
+        message: None,
+    })
+}
+
+fn report_source() -> StatusSource {
+    StatusSource::Report {
+        source: None,
+        agent_session_id: None,
+    }
+}
 
 /// Arguments accepted by the host's `script(1)` for running a command in a
 /// pseudoterminal without retaining a transcript.
@@ -992,8 +1011,8 @@ async fn agent_reports_validate_inherited_context_and_allow_explicit_external_ta
     assert_eq!(
         snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
             .activity
-            .state,
-        AgentState::Working
+            .summary_state(),
+        StatusState::Working
     );
 
     let completed = harness
@@ -1012,8 +1031,788 @@ async fn agent_reports_validate_inherited_context_and_allow_explicit_external_ta
     let activity = snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
         .activity
         .clone();
-    assert_eq!(activity.state, AgentState::Idle);
-    assert_eq!(activity.last_event.unwrap().kind, AgentReport::Completed);
+    assert_eq!(activity.summary_state(), StatusState::Done);
+    assert_eq!(activity.attention().unwrap().state, StatusState::Done);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn osc_7501_drives_detached_cli_status_progress_attention_prompt_clear_and_exit() {
+    let script = r#"
+printf '\033]7501;state=working:app=demo:progress=40\033\\'
+while IFS= read -r line; do
+  case "$line" in
+    settle)
+      printf '\033]7501;state=idle:app=demo\007'
+      ;;
+    fast)
+      printf '\033]7501;state=working:app=demo:progress=80\007'
+      printf '\033]7501;state=done:app=demo:title=RmluaXNoZWQ=\033\\'
+      ;;
+    exit) exit 0 ;;
+  esac
+done
+"#;
+    let harness = Harness::start(script).await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+
+    let working = time::timeout(DEADLINE, async {
+        loop {
+            let output = harness
+                .cli()
+                .args(["--json", "agent", "get", &terminal])
+                .output()
+                .unwrap();
+            if output.status.success() {
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                if value["result"]["agent"]["record"]["state"] == "working" {
+                    break value;
+                }
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("OSC working status was not visible through agent get");
+    assert_eq!(working["result"]["agent"]["app"], "demo");
+    assert_eq!(working["result"]["agent"]["record"]["progress"], 40);
+    assert_eq!(
+        working["result"]["agent"]["activity"]["source"]["type"],
+        "osc"
+    );
+    assert_eq!(working["result"]["agent"]["available"], false);
+
+    let settle = harness
+        .cli()
+        .args(["terminal", "run", &terminal, "settle"])
+        .output()
+        .unwrap();
+    assert!(settle.status.success());
+    time::timeout(DEADLINE, async {
+        loop {
+            let status = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0]
+                .activity
+                .summary_state();
+            if status == StatusState::Idle {
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("OSC idle status was not applied");
+
+    let settled = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "prompt",
+            &terminal,
+            "fast",
+            "--wait",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        settled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    let settled: Value = serde_json::from_slice(&settled.stdout).unwrap();
+    assert_eq!(settled["result"]["activity"]["records"][0]["state"], "done");
+    let working_revision = settled["result"]["working_revision"].as_u64().unwrap();
+    assert!(settled["result"]["barrier_revision"].as_u64().unwrap() < working_revision);
+    assert!(working_revision <= settled["result"]["activity"]["revision"].as_u64().unwrap());
+
+    let done = harness
+        .cli()
+        .args(["--json", "agent", "get", &terminal])
+        .output()
+        .unwrap();
+    assert!(done.status.success());
+    let done: Value = serde_json::from_slice(&done.stdout).unwrap();
+    assert_eq!(done["result"]["agent"]["record"]["title"], "Finished");
+    assert_eq!(done["result"]["agent"]["unread"], true);
+
+    let cleared = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "report",
+            "exited",
+            "--terminal-id",
+            &terminal,
+        ])
+        .output()
+        .unwrap();
+    assert!(cleared.status.success());
+    let missing = harness
+        .cli()
+        .args(["--json", "agent", "get", &terminal])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let missing: Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(missing["error"]["code"], "not_an_agent");
+
+    let invalid = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "report",
+            "working",
+            "--terminal-id",
+            &terminal,
+            "--app",
+            "not valid",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    let invalid: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    assert_eq!(invalid["error"]["code"], "invalid_agent_report");
+
+    let explicit = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "report",
+            "working",
+            "--terminal-id",
+            &terminal,
+            "--id",
+            "build/test",
+            "--app",
+            "driver",
+            "--title",
+            "Building",
+            "--message",
+            "Compiling",
+            "--progress",
+            "75",
+            "--source",
+            "e2e",
+            "--agent-session-id",
+            "session-1",
+            "--turn-id",
+            "ignored",
+        ])
+        .output()
+        .unwrap();
+    assert!(explicit.status.success());
+    let explicit: Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(explicit["result"]["report"]["value"]["id"], "build/test");
+    assert_eq!(explicit["result"]["report"]["value"]["progress"], 75);
+
+    let clear = harness
+        .cli()
+        .args([
+            "agent",
+            "report",
+            "clear",
+            "--terminal-id",
+            &terminal,
+            "--id",
+            "build",
+        ])
+        .output()
+        .unwrap();
+    assert!(clear.status.success());
+    let cleared = harness
+        .cli()
+        .args(["--json", "agent", "get", &terminal])
+        .output()
+        .unwrap();
+    assert!(
+        !cleared.status.success(),
+        "subtree clear left a status record"
+    );
+
+    let transient = harness
+        .cli()
+        .args([
+            "agent",
+            "report",
+            "working",
+            "--terminal-id",
+            &terminal,
+            "--id",
+            "exit-test",
+        ])
+        .output()
+        .unwrap();
+    assert!(transient.status.success());
+
+    let keepalive_cwd = harness.root.path().join("keepalive");
+    fs::create_dir(&keepalive_cwd).unwrap();
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::OpenLocation {
+                project: None,
+                name: Some("keepalive".into()),
+                parent_workspace_id: None,
+                cwd: keepalive_cwd,
+                program: Some("/bin/sh".into()),
+                argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+            })
+            .await,
+        ServerMessage::LocationOpened { .. }
+    ));
+    let exited = harness
+        .cli()
+        .args(["terminal", "run", &terminal, "exit"])
+        .output()
+        .unwrap();
+    assert!(exited.status.success());
+    time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            let status = snapshot
+                .pane_paths()
+                .find(|path| path.pane.terminal_id == terminal_id)
+                .map(|path| &path.pane.activity);
+            if status.is_none_or(|status| !status.is_reporting()) {
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("process exit did not clear transient status");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn osc_7501_capability_queries_reply_over_the_real_pty_with_bel_and_st() {
+    let bel =
+        b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x07";
+    let st =
+        b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
+    let script = format!(
+        "stty raw -echo; printf '\\033]7501;?\\007'; dd bs=1 count={} of=query-bel 2>/dev/null; printf '\\033]7501;?\\033\\\\'; dd bs=1 count={} of=query-st 2>/dev/null; sleep 30",
+        bel.len(),
+        st.len(),
+    );
+    let harness = Harness::start(&script).await;
+    let cwd = harness.root.path().join("cwd");
+    wait_for(DEADLINE, || {
+        fs::metadata(cwd.join("query-bel")).is_ok_and(|metadata| metadata.len() == bel.len() as u64)
+            && fs::metadata(cwd.join("query-st"))
+                .is_ok_and(|metadata| metadata.len() == st.len() as u64)
+    })
+    .await;
+    assert_eq!(fs::read(cwd.join("query-bel")).unwrap(), bel);
+    assert_eq!(fs::read(cwd.join("query-st")).unwrap(), st);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_waiters_follow_fresh_work_despite_old_error_and_reject_concurrent_prompt() {
+    let binary = env!("CARGO_BIN_EXE_fut");
+    let script = format!(
+        r#"'{binary}' agent report error --id old --source lifecycle --message old-failure
+printf 'LIFECYCLE_READY\r\n'
+while IFS= read -r line; do
+  case "$line" in
+    complete)
+      '{binary}' agent report working --source lifecycle --progress 10
+      '{binary}' agent report working --id child --source lifecycle --progress 20
+      '{binary}' agent report done --id child --source lifecycle
+      '{binary}' agent report done --source lifecycle
+      ;;
+    hold)
+      '{binary}' agent report working --id child --source lifecycle
+      while [ ! -e release-hold ]; do sleep 0.02; done
+      '{binary}' agent report done --id child --source lifecycle
+      ;;
+    fresh)
+      '{binary}' agent report working --id child --source lifecycle
+      sleep 0.05
+      '{binary}' agent report done --id child --source lifecycle
+      ;;
+    exit) exit 7 ;;
+  esac
+done"#
+    );
+    let harness = Harness::start(&script).await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+    let ready = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            &terminal,
+            "--literal",
+            "LIFECYCLE_READY",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        ready.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+
+    let completed = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "prompt",
+            &terminal,
+            "complete",
+            "--wait",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "old Error masked fresh root/child work: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let completed: Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert!(
+        completed["result"]["barrier_revision"].as_u64().unwrap()
+            < completed["result"]["working_revision"].as_u64().unwrap()
+    );
+    let records = completed["result"]["activity"]["records"]
+        .as_array()
+        .unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.get("id").is_none() && record["state"] == "done")
+    );
+    let after_completion = harness
+        .cli()
+        .args(["--json", "agent", "get", &terminal])
+        .output()
+        .unwrap();
+    assert!(after_completion.status.success());
+    let after_completion: Value = serde_json::from_slice(&after_completion.stdout).unwrap();
+    let after_records = after_completion["result"]["agent"]["activity"]["records"]
+        .as_array()
+        .unwrap();
+    assert!(
+        after_records
+            .iter()
+            .any(|record| record["id"] == "old" && record["state"] == "error"),
+        "the unrelated persistent Error must survive the fresh root/child turn"
+    );
+    assert!(
+        after_records
+            .iter()
+            .any(|record| record["id"] == "child" && record["state"] == "done")
+    );
+
+    let held = harness
+        .cli()
+        .args(["terminal", "run", &terminal, "hold"])
+        .output()
+        .unwrap();
+    assert!(held.status.success());
+    wait_for(DEADLINE, || {
+        let output = harness
+            .cli()
+            .args(["--json", "agent", "get", &terminal])
+            .output()
+            .unwrap();
+        output.status.success()
+            && serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"]["agent"]
+                ["available"]
+                == false
+    })
+    .await;
+    let busy = harness
+        .cli()
+        .args(["--json", "agent", "prompt", &terminal, "concurrent"])
+        .output()
+        .unwrap();
+    assert!(!busy.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&busy.stderr).unwrap()["error"]["code"],
+        "agent_busy"
+    );
+    fs::write(harness.root.path().join("cwd/release-hold"), b"").unwrap();
+    wait_for(DEADLINE, || {
+        let output = harness
+            .cli()
+            .args(["--json", "agent", "get", &terminal])
+            .output()
+            .unwrap();
+        output.status.success()
+            && serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"]["agent"]
+                ["available"]
+                == true
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn standalone_agent_wait_returns_settled_error_then_follows_active_work() {
+    let binary = env!("CARGO_BIN_EXE_fut");
+    let script = format!(
+        r#"'{binary}' agent report error --id old --source lifecycle
+printf 'STANDALONE_WAIT_READY\r\n'
+while IFS= read -r line; do
+  if [ "$line" = finish ]; then
+    '{binary}' agent report done --id child --source lifecycle
+  fi
+done"#
+    );
+    let harness = Harness::start(&script).await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+    let ready = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            &terminal,
+            "--literal",
+            "STANDALONE_WAIT_READY",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(ready.status.success());
+
+    // Standalone wait may inspect an already settled result immediately; only
+    // prompt --wait establishes a barrier requiring a fresh Working transition.
+    let settled = harness
+        .cli()
+        .args(["--json", "agent", "wait", &terminal, "--timeout", "2s"])
+        .output()
+        .unwrap();
+    assert!(settled.status.success());
+    let settled: Value = serde_json::from_slice(&settled.stdout).unwrap();
+    assert!(
+        settled["result"]["activity"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["id"] == "old" && record["state"] == "error")
+    );
+    assert!(
+        harness
+            .cli()
+            .args([
+                "agent",
+                "report",
+                "working",
+                "--terminal-id",
+                &terminal,
+                "--id",
+                "child",
+                "--source",
+                "lifecycle",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let mut standalone = harness
+        .cli()
+        .args(["--json", "agent", "wait", &terminal, "--timeout", "2s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        standalone.try_wait().unwrap().is_none(),
+        "standalone wait settled from the old persistent Error"
+    );
+    assert!(
+        harness
+            .cli()
+            .args(["terminal", "run", &terminal, "finish"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let standalone = standalone.wait_with_output().unwrap();
+    assert!(
+        standalone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&standalone.stderr)
+    );
+    let standalone: Value = serde_json::from_slice(&standalone.stdout).unwrap();
+    assert!(
+        standalone["result"]["working_revision"].as_u64().unwrap()
+            <= standalone["result"]["barrier_revision"].as_u64().unwrap()
+    );
+    assert!(
+        standalone["result"]["activity"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["id"] == "child" && record["state"] == "done")
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_reported_exit_returns_agent_exited_then_not_an_agent() {
+    let harness =
+        Harness::start("while IFS= read -r line; do [ \"$line\" = exit ] && exit 7; done").await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+    assert!(
+        harness
+            .cli()
+            .args([
+                "agent",
+                "report",
+                "working",
+                "--terminal-id",
+                &terminal,
+                "--source",
+                "lifecycle",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let mut waiter = harness
+        .cli()
+        .args(["--json", "agent", "wait", &terminal, "--timeout", "2s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    time::sleep(Duration::from_millis(100)).await;
+    assert!(waiter.try_wait().unwrap().is_none());
+    let reported_exit = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "report",
+            "exited",
+            "--terminal-id",
+            &terminal,
+        ])
+        .output()
+        .unwrap();
+    assert!(reported_exit.status.success());
+    let exited = waiter.wait_with_output().unwrap();
+    let missing = harness
+        .cli()
+        .args(["--json", "agent", "get", &terminal])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&missing.stderr).unwrap()["error"]["code"],
+        "not_an_agent"
+    );
+    assert!(!exited.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&exited.stderr).unwrap()["error"]["code"],
+        "agent_exited"
+    );
+    let after_clear = harness
+        .cli()
+        .args(["--json", "agent", "wait", &terminal, "--timeout", "1s"])
+        .output()
+        .unwrap();
+    assert!(!after_clear.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&after_clear.stderr).unwrap()["error"]["code"],
+        "not_an_agent"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_wait_reports_actual_terminal_exit() {
+    let harness =
+        Harness::start("while IFS= read -r line; do [ \"$line\" = exit ] && exit 7; done").await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+
+    let keepalive_cwd = harness.root.path().join("lifecycle-keepalive");
+    fs::create_dir(&keepalive_cwd).unwrap();
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::OpenLocation {
+                project: None,
+                name: Some("lifecycle-keepalive".into()),
+                parent_workspace_id: None,
+                cwd: keepalive_cwd,
+                program: Some("/bin/sh".into()),
+                argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+            })
+            .await,
+        ServerMessage::LocationOpened { .. }
+    ));
+    assert!(
+        harness
+            .cli()
+            .args([
+                "agent",
+                "report",
+                "idle",
+                "--terminal-id",
+                &terminal,
+                "--source",
+                "lifecycle",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let exited = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "prompt",
+            &terminal,
+            "exit",
+            "--wait",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(!exited.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&exited.stderr).unwrap()["error"]["code"],
+        "terminal_exited"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_status_reappears_after_cli_clear_replacement_and_front_clear_burst() {
+    let script = r#"
+native() { printf '\033]7501;state=working:app=native:progress=40\007'; }
+native
+while IFS= read -r line; do
+  case "$line" in
+    restore) native ;;
+    burst)
+      printf '\033]7501;state=clear\007'
+      native
+      ;;
+  esac
+done
+"#;
+    let harness = Harness::start(script).await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+    let native_is_visible = || {
+        let output = harness
+            .cli()
+            .args(["--json", "agent", "get", &terminal])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            return false;
+        }
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["result"]["agent"]["record"]["state"] == "working"
+            && value["result"]["agent"]["record"]["progress"] == 40
+            && value["result"]["agent"]["app"] == "native"
+            && value["result"]["agent"]["activity"]["source"]["type"] == "osc"
+    };
+    wait_for(DEADLINE, &native_is_visible).await;
+
+    assert!(
+        harness
+            .cli()
+            .args(["agent", "report", "clear", "--terminal-id", &terminal])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        harness
+            .cli()
+            .args(["terminal", "run", &terminal, "restore"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait_for(DEADLINE, &native_is_visible).await;
+
+    assert!(
+        harness
+            .cli()
+            .args([
+                "agent",
+                "report",
+                "idle",
+                "--terminal-id",
+                &terminal,
+                "--app",
+                "cli",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        harness
+            .cli()
+            .args(["terminal", "run", &terminal, "restore"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait_for(DEADLINE, &native_is_visible).await;
+
+    assert!(
+        harness
+            .cli()
+            .args(["terminal", "run", &terminal, "burst"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait_for(DEADLINE, native_is_visible).await;
 
     harness.shutdown().await;
 }
@@ -1047,17 +1846,17 @@ exec ./node ./codex
     })
     .await;
 
-    fn activity(snapshot: &fut::resources::ResourceSnapshot) -> &fut::domain::AgentActivity {
+    fn activity(snapshot: &fut::resources::ResourceSnapshot) -> &fut::domain::ProgramStatus {
         &snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity
     }
     time::timeout(DEADLINE, async {
         loop {
             let snapshot = harness.resources().await;
-            if activity(&snapshot).state == AgentState::Working {
-                assert_eq!(
-                    activity(&snapshot).detection.as_ref().unwrap().agent,
-                    "codex"
-                );
+            if activity(&snapshot).summary_state() == StatusState::Working {
+                assert!(matches!(
+                    activity(&snapshot).source.as_ref(),
+                    Some(StatusSource::Detection { agent, .. }) if agent == "codex"
+                ));
                 break;
             }
             time::sleep(POLL_INTERVAL).await;
@@ -1071,15 +1870,15 @@ exec ./node ./codex
     time::timeout(DEADLINE, async {
         loop {
             let snapshot = harness.resources().await;
-            if activity(&snapshot).state == AgentState::Idle
-                && activity(&snapshot)
-                    .detection
-                    .as_ref()
-                    .is_some_and(|detection| detection.rule == "idle_fallback")
+            if activity(&snapshot).summary_state() == StatusState::Done
+                && matches!(
+                    activity(&snapshot).source.as_ref(),
+                    Some(StatusSource::Detection { rule, .. }) if rule == "idle_fallback"
+                )
             {
                 assert_eq!(
-                    activity(&snapshot).last_event.as_ref().unwrap().kind,
-                    AgentReport::Completed
+                    activity(&snapshot).attention().unwrap().state,
+                    StatusState::Done
                 );
                 break;
             }
@@ -1107,51 +1906,51 @@ exec sleep 30
 "#;
     let harness = Harness::start(script).await;
 
-    fn activity(snapshot: &fut::resources::ResourceSnapshot) -> &fut::domain::AgentActivity {
+    fn activity(snapshot: &fut::resources::ResourceSnapshot) -> &fut::domain::ProgramStatus {
         &snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity
     }
-    async fn await_report(harness: &Harness, report: AgentReport, revision: u64) -> u64 {
+    async fn await_report(harness: &Harness, state: StatusState, revision: u64) -> u64 {
         time::timeout(DEADLINE, async {
             loop {
                 let snapshot = harness.resources().await;
-                let activity = activity(&snapshot);
-                if let Some(event) = &activity.last_event
-                    && event.kind == report
-                    && event.revision > revision
+                if let Some(record) = activity(&snapshot).root()
+                    && record.state == state
+                    && record.revision > revision
                 {
-                    if report != AgentReport::Exited {
-                        let integration = activity.integration.as_ref().unwrap();
-                        assert_eq!(integration.source.as_deref(), Some("deploy"));
-                    }
-                    return event.revision;
+                    assert_eq!(record.app.as_deref(), Some("deploy"));
+                    return record.revision;
                 }
                 time::sleep(POLL_INTERVAL).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("no {report:?} report: {}", harness.logs()))
+        .unwrap_or_else(|_| panic!("no {state:?} report: {}", harness.logs()))
     }
 
     let cwd = harness.root.path().join("cwd");
-    let revision = await_report(&harness, AgentReport::Working, 0).await;
+    let revision = await_report(&harness, StatusState::Working, 0).await;
     fs::write(cwd.join("step1"), b"").unwrap();
-    let revision = await_report(&harness, AgentReport::Blocked, revision).await;
+    let revision = await_report(&harness, StatusState::Blocked, revision).await;
     fs::write(cwd.join("step2"), b"").unwrap();
-    let revision = await_report(&harness, AgentReport::Completed, revision).await;
+    let revision = await_report(&harness, StatusState::Done, revision).await;
     // The completed program exits, but its result remains to be seen.
     time::sleep(Duration::from_millis(1200)).await;
     let snapshot = harness.resources().await;
-    assert_eq!(
-        activity(&snapshot).last_event.as_ref().unwrap().kind,
-        AgentReport::Completed
-    );
+    assert_eq!(activity(&snapshot).root().unwrap().state, StatusState::Done);
     fs::write(cwd.join("step3"), b"").unwrap();
-    let revision = await_report(&harness, AgentReport::Working, revision).await;
+    await_report(&harness, StatusState::Working, revision).await;
     fs::write(cwd.join("step4"), b"").unwrap();
     // A program that exits while working must not leave the pane working.
-    await_report(&harness, AgentReport::Exited, revision).await;
-    let snapshot = harness.resources().await;
-    assert_eq!(activity(&snapshot).state, AgentState::Idle);
+    time::timeout(DEADLINE, async {
+        loop {
+            if activity(&harness.resources().await).records.is_empty() {
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("exited program left a status record: {}", harness.logs()));
 
     harness.shutdown().await;
 }
@@ -1941,10 +2740,15 @@ done"#
         String::from_utf8_lossy(&completed.stderr)
     );
     let completed: Value = serde_json::from_slice(&completed.stdout).unwrap();
-    assert_eq!(completed["result"]["activity"]["state"], "idle");
     assert_eq!(
-        completed["result"]["activity"]["last_event"]["kind"],
-        "completed"
+        completed["result"]["activity"]["records"][0]["state"],
+        "done"
+    );
+    assert!(
+        completed["result"]["activity"]["records"][0]["attention_revision"]
+            .as_u64()
+            .unwrap()
+            > 0
     );
     assert!(
         completed["result"]["barrier_revision"].as_u64().unwrap()
@@ -1978,9 +2782,8 @@ done"#
         String::from_utf8_lossy(&blocked.stderr)
     );
     let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
-    assert_eq!(blocked["result"]["activity"]["state"], "blocked");
     assert_eq!(
-        blocked["result"]["activity"]["last_event"]["kind"],
+        blocked["result"]["activity"]["records"][0]["state"],
         "blocked"
     );
     assert!(
@@ -2016,7 +2819,7 @@ done"#
     let output = result["result"]["output"]["text"].as_str().unwrap();
     assert!(output.contains("COMPLETED_RESULT:complete revised request"));
     assert!(output.contains("BLOCKED_RESULT:blocked revised request"));
-    assert_eq!(result["result"]["agent"]["activity"]["state"], "blocked");
+    assert_eq!(result["result"]["agent"]["record"]["state"], "blocked");
 
     let closed = harness
         .cli()
@@ -2118,7 +2921,7 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
     assert!(got.status.success());
     let got: Value = serde_json::from_slice(&got.stdout).unwrap();
     assert_eq!(
-        got["result"]["agent"]["activity"]["integration"]["source"],
+        got["result"]["agent"]["activity"]["source"]["source"],
         "e2e"
     );
 
@@ -2156,8 +2959,8 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
     );
     let prompted: Value = serde_json::from_slice(&prompted.stdout).unwrap();
     assert_eq!(
-        prompted["result"]["activity"]["last_event"]["kind"],
-        "completed"
+        prompted["result"]["activity"]["records"][0]["state"],
+        "done"
     );
     let barrier = prompted["result"]["barrier_revision"].as_u64().unwrap();
     let working = prompted["result"]["working_revision"].as_u64().unwrap();
@@ -2187,8 +2990,8 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id,
-                report: AgentReport::Working,
-                metadata: Default::default(),
+                report: status_report(StatusState::Working),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -2214,8 +3017,8 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id,
-                report: AgentReport::Blocked,
-                metadata: Default::default(),
+                report: status_report(StatusState::Blocked),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -2227,7 +3030,39 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
         .unwrap();
     assert!(blocked.status.success());
     let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
-    assert_eq!(blocked["result"]["activity"]["state"], "blocked");
+    assert_eq!(
+        blocked["result"]["activity"]["records"][0]["state"],
+        "blocked"
+    );
+
+    let error_report = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "report",
+            "error",
+            "--terminal-id",
+            &terminal,
+            "--app",
+            "e2e",
+            "--message",
+            "failed",
+        ])
+        .output()
+        .unwrap();
+    assert!(error_report.status.success());
+    let errored = harness
+        .cli()
+        .args(["--json", "agent", "wait", &terminal, "--timeout", "1s"])
+        .output()
+        .unwrap();
+    assert!(errored.status.success());
+    let errored: Value = serde_json::from_slice(&errored.stdout).unwrap();
+    assert_eq!(
+        errored["result"]["activity"]["records"][0]["state"],
+        "error"
+    );
 
     let exit_cwd = harness.root.path().join("exiting-agent");
     fs::create_dir(&exit_cwd).unwrap();
@@ -2250,8 +3085,8 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: exiting.terminal_id,
-                report: AgentReport::Idle,
-                metadata: Default::default(),
+                report: status_report(StatusState::Idle),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -8060,16 +8895,16 @@ async fn public_events_stream_emits_versioned_json_snapshots_on_change() {
     assert!(last["result"]["revision"].as_u64().unwrap() > first_revision);
     assert_eq!(last["result"]["sessions"][0]["name"], "watched λ");
 
-    // Agent activity reports stream too.
+    // Program status reports stream too.
     let pane = &last["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0];
-    assert_eq!(pane["activity"]["state"], "idle");
+    assert!(pane["activity"]["records"].as_array().unwrap().is_empty());
     let terminal_id: TerminalId = pane["terminal_id"].as_str().unwrap().parse().unwrap();
     assert_eq!(
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id,
-                report: AgentReport::Blocked,
-                metadata: Default::default(),
+                report: status_report(StatusState::Blocked),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted {
@@ -8079,12 +8914,13 @@ async fn public_events_stream_emits_versioned_json_snapshots_on_change() {
     let last = events
         .wait_for_json_line(|value| {
             value["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]
-                ["activity"]["state"]
+                ["activity"]["records"][0]["state"]
                 == "blocked"
         })
         .await;
     assert_eq!(
-        last["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]["activity"]["state"],
+        last["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]["activity"]["records"]
+            [0]["state"],
         "blocked"
     );
 
@@ -9617,7 +10453,7 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
 }
 
 #[tokio::test]
-async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unread() {
+async fn public_program_status_spins_lists_waiting_terminals_and_navigates_unread() {
     let harness =
         Harness::start("printf 'AGENT_A_READY\r\n'; while IFS= read -r line; do :; done").await;
     let resources = harness.resources().await;
@@ -9663,8 +10499,8 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: a.terminal_id,
-                report: AgentReport::Working,
-                metadata: Default::default(),
+                report: status_report(StatusState::Working),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted {
@@ -9677,8 +10513,8 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: b.terminal_id,
-                report: AgentReport::Completed,
-                metadata: Default::default(),
+                report: status_report(StatusState::Done),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -9704,8 +10540,8 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     let cleared = agent_list();
     assert_eq!(cleared["result"]["unread_count"], 0);
     assert_eq!(
-        cleared["result"]["agents"][1]["activity"]["state"],
-        unread["result"]["agents"][1]["activity"]["state"],
+        cleared["result"]["agents"][1]["record"]["state"],
+        unread["result"]["agents"][1]["record"]["state"],
         "clearing attention must not change agent lifecycle state"
     );
     client.send(b"q");
@@ -9716,8 +10552,18 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: b.terminal_id,
-                report: AgentReport::Completed,
-                metadata: Default::default(),
+                report: status_report(StatusState::Working),
+                source: report_source(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: b.terminal_id,
+                report: status_report(StatusState::Done),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -9740,8 +10586,18 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: b.terminal_id,
-                report: AgentReport::Completed,
-                metadata: Default::default(),
+                report: status_report(StatusState::Working),
+                source: report_source(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: b.terminal_id,
+                report: status_report(StatusState::Done),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -9758,8 +10614,8 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: a.terminal_id,
-                report: AgentReport::Completed,
-                metadata: Default::default(),
+                report: status_report(StatusState::Done),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -12573,8 +13429,8 @@ async fn extension_command_keeps_covered_agent_attention_unread() {
         harness
             .control_command(ClientMessage::ReportAgent {
                 terminal_id,
-                report: AgentReport::Completed,
-                metadata: Default::default(),
+                report: status_report(StatusState::Done),
+                source: report_source(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -15933,10 +16789,7 @@ async fn context_resolves_fresh_ancestry_from_terminal_identity_and_get_resolves
     assert_eq!(explicit["version"], 1);
     assert_eq!(explicit["command"], "get");
     assert_eq!(explicit["result"]["target"]["kind"], "terminal");
-    assert_eq!(
-        explicit["result"]["target"]["pane"]["activity"]["state"],
-        "working"
-    );
+    assert_eq!(explicit["result"]["target"]["pane"]["state"], "working");
     for (id, kind) in [
         (session.id.to_string(), "session"),
         (workspace.id.to_string(), "workspace"),

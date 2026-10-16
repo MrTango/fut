@@ -39,9 +39,12 @@ These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 | `session.name` | Current session name |
 | `workspace.name` | Current workspace name; unnamed workspaces present their live location |
 | `workspace.icon` | Workspace icon from the selected preset |
+| `workspace.progress` | Determinate program progress in the current workspace as `NN%`; empty when indeterminate or idle |
 | `tab.name` | Current tab name |
 | `tab.index` | One-based current tab index |
 | `tab.pane_count` | Number of panes in the current tab |
+| `tab.activity` | Rolled-up program/terminal attention in the current tab |
+| `tab.progress` | Determinate program progress in the current tab as `NN%`; empty when indeterminate or idle |
 | `client.zoom` | Configured zoom icon while zoomed; otherwise empty |
 | `client.help` | Contextual create/rename/close help while the tab bar is keyboard-active |
 | `client.waiting` | Configured `ui.icons.notification` and this client's count of unread agent notifications and terminal bells across Fut; empty when zero |
@@ -53,7 +56,8 @@ The special `{ component = "tabs" }` segment renders the focus-aware repeated ta
 
 ## Tab-item tokens
 
-These may appear only under `ui.tab_bar.item.segments`.
+Use these under `ui.tab_bar.item.segments`. Tokens also listed above work in
+tab-bar groups for the current tab.
 
 <div class="wide-table" markdown="1">
 
@@ -66,7 +70,8 @@ These may appear only under `ui.tab_bar.item.segments`.
 | `tab.closing` | Closing icon while closing; otherwise empty |
 | `tab.pane_count` | Number of panes in the tab |
 | `tab.icon` | Tab icon from the selected preset |
-| `tab.activity` | Rolled-up agent/terminal attention: spinner for working, `!` for blocked or BEL, or `•` for completion; empty when inactive |
+| `tab.activity` | Rolled-up program/terminal attention: spinner for working, `!` for blocked or BEL, `×` for error, or `•` for unread done; empty when inactive |
+| `tab.progress` | Determinate rolled-up program progress as `NN%`; empty when indeterminate or idle |
 
 </div>
 
@@ -74,7 +79,7 @@ Current, closing, and keyboard-selected styles are composed over every item segm
 
 ## Workspace-row tokens
 
-These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `component = "workspaces"` entry under either `ui.sidebar.left.components` or `ui.sidebar.right.components`.
+Use these in the `row.left`, `body`, `right`, or `detail` fields of a `component = "workspaces"` entry under either `ui.sidebar.left.components` or `ui.sidebar.right.components`. Tokens also listed above work in tab-bar groups for the current workspace.
 
 <div class="wide-table" markdown="1">
 
@@ -88,7 +93,8 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 | `workspace.closing` | Closing icon while closing; otherwise empty |
 | `workspace.tab_count` | Number of tabs in the workspace |
 | `workspace.icon` | Workspace icon from the selected preset |
-| `workspace.activity` | Rolled-up agent/terminal attention: spinner for working, `!` for blocked or BEL, or `•` for completion; empty when inactive |
+| `workspace.activity` | Rolled-up program/terminal attention: spinner for working, `!` for blocked or BEL, `×` for error, or `•` for unread done; empty when inactive |
+| `workspace.progress` | Determinate rolled-up program progress as `NN%`; empty when indeterminate or idle |
 | `workspace.git_branch` | Current branch at the live workspace location; `multiple` when panes disagree, empty outside a Git work tree or until resolved |
 | `workspace.git_added` | `+N` inserted lines against `HEAD`, styled `added`; empty when none |
 | `workspace.git_deleted` | `-N` deleted lines against `HEAD`, styled `deleted`; empty when none |
@@ -96,6 +102,11 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 </div>
 
 Current, closing, and keyboard-selected styles compose over each workspace row.
+
+Status glyphs roll up in this order: unread blocked, bell, unread error,
+unread done, blocked, error, working, then idle. Progress is a separate token;
+existing activity tokens remain glyph-only. Reading done attention quiets its
+bullet without changing the stored done record.
 
 The daemon resolves Git tokens with bounded background `git` processes and refreshes each workspace at most every five seconds. Each Git command has a two-second timeout. Branch, insertion, and deletion values enter the authoritative resource snapshot together in at most one revision and only when changed, so every attached client sees the same status. They never block rendering and all three stay empty for non-Git roots, errors, timeouts, or a repository that disappears.
 
@@ -107,9 +118,9 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 
 | Token | Value |
 | --- | --- |
-| `agent.source` | Integration that reported the agent, such as `claude-code` |
-| `agent.status` | `idle`, `working`, `blocked`, or `completed`, styled `muted`, `activity`, `error`, or `added` |
-| `agent.activity` | Spinner while working, `!` when blocked, or `•` for an unread completion, in the status style; empty when idle |
+| `agent.source` | Program app or reporting source, such as `codex` or `claude-code`; falls back to the tab name |
+| `agent.status` | `idle`, `working`, `blocked`, `done`, or `error`, styled `muted`, `activity`, `error`, or `added` |
+| `agent.activity` | Activity glyph: spinner while working, `!` when blocked, `×` for error, or `•` for unread done; empty when idle or done is read |
 | `agent.location` | Workspace name, prefixed by the session when a `global` list spans several sessions |
 | `agent.session` | Session name |
 | `agent.workspace` | Workspace name |

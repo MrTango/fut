@@ -45,11 +45,11 @@ use crate::{
     alerts::AlertStore,
     client::config as global_config,
     domain::{
-        AgentActivity, AgentDetection, AgentReport, AgentState, ClientId, CopyModeAction,
-        CopyModeError, DeltaRow, MAX_AGENT_PROMPT_BYTES, MAX_TERMINAL_OUTPUT_PATTERN_BYTES,
-        MAX_TERMINAL_OUTPUT_ROWS, PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId,
-        TerminalId, TerminalOutput, TerminalOutputMatcher, TerminalOutputSource, TerminalSize,
-        WorkspaceId,
+        BlockedKind, ClientId, CopyModeAction, CopyModeError, DeltaRow, MAX_AGENT_PROMPT_BYTES,
+        MAX_TERMINAL_OUTPUT_PATTERN_BYTES, MAX_TERMINAL_OUTPUT_ROWS, PaneId, ProgramStatus,
+        ScreenDelta, ScreenSnapshot, SessionId, SplitId, StatusReport, StatusSource, StatusState,
+        StatusUpdate, TabId, TerminalId, TerminalOutput, TerminalOutputMatcher,
+        TerminalOutputSource, TerminalSize, WorkspaceId,
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
@@ -67,9 +67,9 @@ use crate::{
     },
     splits::{SplitDirection, SplitRatio, SplitTree},
     terminal::{
-        CommandError, CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError,
-        ProgramState, ProgramStatus, SpawnSpec, TerminalActivity, TerminalEvent, TerminalHandle,
-        TerminalLifecycle, spawn_terminal,
+        CommandError, CopyModeOutcome, MouseInputOutcome, NativeStatusBatch, OutputCapture,
+        OutputCaptureError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle,
+        spawn_terminal,
     },
 };
 
@@ -143,16 +143,13 @@ struct SharedState {
     attachment_store: Arc<crate::attachments::Store>,
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
-    automatic_agent_owners: HashMap<TerminalId, u32>,
-    /// Terminals whose current activity came from an OSC 7501 report.
-    program_status_terminals: HashSet<TerminalId>,
     presence: ClientPresence,
     expected_finalizations: HashSet<TerminalId>,
     exited_terminals: VecDeque<(TerminalId, Option<i32>)>,
     resource_changes: watch::Sender<u64>,
     alerts: AlertStore,
     alert_changes: watch::Sender<u64>,
-    agent_events: broadcast::Sender<AgentLifecycleUpdate>,
+    agent_events: broadcast::Sender<StatusLifecycleUpdate>,
     child_env: HashMap<OsString, OsString>,
     terminal_config: crate::terminal::TerminalConfig,
     default_shell: PathBuf,
@@ -188,9 +185,148 @@ fn now_ms() -> u64 {
 }
 
 #[derive(Clone, Debug)]
-struct AgentLifecycleUpdate {
+struct StatusLifecycleUpdate {
     terminal_id: TerminalId,
-    activity: AgentActivity,
+    status: ProgramStatus,
+    transitions: Vec<StatusRecordLifecycle>,
+    terminal_process_exit: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StatusRecordLifecycle {
+    Working(String),
+    Settled(String),
+    Removed(String),
+}
+
+fn status_lifecycle_transitions(
+    before: &ProgramStatus,
+    updates: &[StatusUpdate],
+    source: &StatusSource,
+    after: &ProgramStatus,
+) -> Vec<StatusRecordLifecycle> {
+    let detection = matches!(source, StatusSource::Detection { .. });
+    let mut states = before
+        .records
+        .iter()
+        .map(|record| (record.id.clone(), record.state))
+        .collect::<HashMap<_, _>>();
+    let mut transitions = Vec::new();
+
+    for update in updates {
+        match update {
+            StatusUpdate::Report(report) => {
+                let previous = states.get(&report.id).copied();
+                let next = if detection && report.state == StatusState::Idle {
+                    match previous {
+                        Some(StatusState::Working) => StatusState::Done,
+                        Some(StatusState::Done | StatusState::Error) => continue,
+                        Some(StatusState::Idle | StatusState::Blocked) | None => StatusState::Idle,
+                    }
+                } else {
+                    report.state
+                };
+                if previous == Some(next) {
+                    continue;
+                }
+                if previous == Some(StatusState::Working) {
+                    transitions.push(StatusRecordLifecycle::Settled(report.id.clone()));
+                }
+                if next == StatusState::Working {
+                    transitions.push(StatusRecordLifecycle::Working(report.id.clone()));
+                }
+                states.insert(report.id.clone(), next);
+            }
+            StatusUpdate::Clear { id } => {
+                let removed = states
+                    .keys()
+                    .filter(|record_id| status_clear_matches(id.as_deref(), record_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for record_id in removed {
+                    states.remove(&record_id);
+                    transitions.push(StatusRecordLifecycle::Removed(record_id));
+                }
+            }
+            StatusUpdate::PromptStart | StatusUpdate::ProcessExit => {
+                let removed = states
+                    .iter()
+                    .filter(|(_, state)| !matches!(state, StatusState::Done | StatusState::Error))
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                for record_id in removed {
+                    states.remove(&record_id);
+                    transitions.push(StatusRecordLifecycle::Removed(record_id));
+                }
+            }
+        }
+    }
+
+    // The operation stream preserves otherwise invisible Working -> Done
+    // evidence, but it cannot model private provenance or LRU eviction. Make
+    // that evidence agree with the authoritative post-apply record set. This
+    // also records the disappearance of a selected pre-existing record and of
+    // fresh work that was created and evicted within this batch.
+    let after_states = after
+        .records
+        .iter()
+        .map(|record| (record.id.as_str(), record.state))
+        .collect::<HashMap<_, _>>();
+    let tracked = before
+        .records
+        .iter()
+        .map(|record| record.id.clone())
+        .chain(
+            transitions
+                .iter()
+                .filter_map(|transition| match transition {
+                    StatusRecordLifecycle::Working(id) => Some(id.clone()),
+                    StatusRecordLifecycle::Settled(_) | StatusRecordLifecycle::Removed(_) => None,
+                }),
+        )
+        .collect::<HashSet<_>>();
+
+    for id in tracked {
+        match after_states.get(id.as_str()).copied() {
+            Some(actual) if states.get(&id).copied() != Some(actual) => {
+                transitions.retain(|transition| match transition {
+                    StatusRecordLifecycle::Working(record_id)
+                    | StatusRecordLifecycle::Settled(record_id)
+                    | StatusRecordLifecycle::Removed(record_id) => record_id != &id,
+                });
+                let previous = before
+                    .records
+                    .iter()
+                    .find(|record| record.id == id)
+                    .map(|record| record.state);
+                if previous == Some(StatusState::Working) && actual != StatusState::Working {
+                    transitions.push(StatusRecordLifecycle::Settled(id.clone()));
+                }
+                if previous != Some(StatusState::Working) && actual == StatusState::Working {
+                    transitions.push(StatusRecordLifecycle::Working(id));
+                }
+            }
+            None
+                if !transitions.iter().any(|transition| {
+                    matches!(transition, StatusRecordLifecycle::Removed(record_id) if record_id == &id)
+                }) =>
+            {
+                transitions.push(StatusRecordLifecycle::Removed(id));
+            }
+            Some(_) | None => {}
+        }
+    }
+    transitions
+}
+
+fn status_clear_matches(clear_id: Option<&str>, record_id: &str) -> bool {
+    let Some(clear_id) = clear_id.filter(|id| !id.is_empty()) else {
+        return true;
+    };
+    record_id == clear_id
+        || record_id
+            .strip_prefix(clear_id)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -236,7 +372,7 @@ impl From<ResourceError> for DaemonError {
             ResourceError::InvalidWorkspaceParent(_) => "invalid_workspace_parent",
             ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
             ResourceError::EmptyName => "invalid_name",
-            ResourceError::InvalidAgentReport(_) => "invalid_agent_report",
+            ResourceError::InvalidStatusReport(_) => "invalid_agent_report",
             ResourceError::TooManyMaterializedTokens => "token_limit",
             _ => "resource_error",
         };
@@ -492,113 +628,144 @@ impl SharedState {
         })
     }
 
-    fn report_agent(
+    fn apply_status_updates(
         &mut self,
         terminal_id: TerminalId,
-        report: AgentReport,
-        metadata: crate::domain::AgentReportMetadata,
+        updates: Vec<StatusUpdate>,
+        source: StatusSource,
     ) -> Result<(), DaemonError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        let revision =
-            self.resources
-                .report_agent_with_metadata(terminal_id, report, metadata, now_ms)?;
-        self.program_status_terminals.remove(&terminal_id);
-        let activity = self.resources.agent_activity(terminal_id)?.clone();
-        self.publish_resource_change(revision);
-        let _ = self.agent_events.send(AgentLifecycleUpdate {
+        self.apply_status_updates_internal(terminal_id, updates, source, false, None)
+    }
+
+    fn apply_terminal_status_updates(
+        &mut self,
+        terminal_id: TerminalId,
+        batch: NativeStatusBatch,
+    ) -> Result<(), DaemonError> {
+        let automatic_pid = self
+            .runtimes
+            .get(&terminal_id)
+            .and_then(|runtime| batch.owner_pid(runtime.handle.child_pid()));
+        self.apply_status_updates_internal(
             terminal_id,
-            activity,
-        });
+            batch.updates,
+            StatusSource::Osc,
+            true,
+            automatic_pid,
+        )
+    }
+
+    fn apply_status_updates_internal(
+        &mut self,
+        terminal_id: TerminalId,
+        updates: Vec<StatusUpdate>,
+        source: StatusSource,
+        terminal_delivery: bool,
+        automatic_pid: Option<u32>,
+    ) -> Result<(), DaemonError> {
+        let terminal_process_exit =
+            terminal_delivery && updates.contains(&StatusUpdate::ProcessExit);
+        let before_status = self.resources.program_status(terminal_id)?.clone();
+        let before = before_status.revision;
+        let revision = if let Some(automatic_pid) = automatic_pid {
+            self.resources.apply_automatic_status_updates(
+                terminal_id,
+                updates.clone(),
+                source.clone(),
+                automatic_pid,
+                now_ms(),
+            )?
+        } else {
+            self.resources.apply_status_updates(
+                terminal_id,
+                updates.clone(),
+                source.clone(),
+                now_ms(),
+            )?
+        };
+        let status = self.resources.program_status(terminal_id)?.clone();
+        let changed = status.revision != before;
+        if changed {
+            let transitions =
+                status_lifecycle_transitions(&before_status, &updates, &source, &status);
+            self.publish_resource_change(revision);
+            let _ = self.agent_events.send(StatusLifecycleUpdate {
+                terminal_id,
+                status,
+                transitions,
+                terminal_process_exit,
+            });
+        }
         Ok(())
     }
 
     fn report_automatic_agent(
         &mut self,
         terminal_id: TerminalId,
-        report: AgentReport,
-        metadata: crate::domain::AgentReportMetadata,
+        report: StatusUpdate,
+        source: StatusSource,
         agent_pid: u32,
     ) -> Result<(), DaemonError> {
-        self.report_agent(terminal_id, report, metadata)?;
-        if report == AgentReport::Exited {
-            self.automatic_agent_owners.remove(&terminal_id);
-        } else {
-            self.automatic_agent_owners.insert(terminal_id, agent_pid);
-        }
-        Ok(())
+        Self::validate_agent_report(&report, &source)?;
+        self.apply_status_updates_internal(
+            terminal_id,
+            vec![report],
+            source,
+            false,
+            Some(agent_pid),
+        )
     }
 
     fn report_external_agent(
         &mut self,
         terminal_id: TerminalId,
-        report: AgentReport,
-        metadata: crate::domain::AgentReportMetadata,
+        report: StatusUpdate,
+        source: StatusSource,
     ) -> Result<(), DaemonError> {
-        self.report_agent(terminal_id, report, metadata)?;
-        self.automatic_agent_owners.remove(&terminal_id);
+        Self::validate_agent_report(&report, &source)?;
+        self.apply_status_updates(terminal_id, vec![report], source)
+    }
+
+    fn validate_agent_report(
+        report: &StatusUpdate,
+        source: &StatusSource,
+    ) -> Result<(), DaemonError> {
+        if !matches!(report, StatusUpdate::Report(_) | StatusUpdate::Clear { .. }) {
+            return Err(ResourceError::InvalidStatusReport(
+                "lifecycle updates are reserved for the terminal runtime",
+            )
+            .into());
+        }
+        if !matches!(source, StatusSource::Report { .. }) {
+            return Err(ResourceError::InvalidStatusReport(
+                "external reports require report provenance",
+            )
+            .into());
+        }
         Ok(())
     }
 
-    /// Apply an OSC 7501 root-record report. Working, blocked and idle
-    /// records belong to the foreground program and end when it exits; done
-    /// and error survive exit so the result stays visible.
-    fn report_program_status(
+    fn release_automatic_agent_owner(
         &mut self,
         terminal_id: TerminalId,
-        status: &ProgramStatus,
-        foreground_pid: Option<u32>,
+        agent_pid: u32,
     ) -> Result<(), DaemonError> {
-        let owned = self.program_status_terminals.contains(&terminal_id);
-        let report = match status.state {
-            ProgramState::Idle => AgentReport::Idle,
-            ProgramState::Working => AgentReport::Working,
-            ProgramState::Blocked => AgentReport::Blocked,
-            ProgramState::Done | ProgramState::Error => AgentReport::Completed,
-            ProgramState::Clear if owned => AgentReport::Exited,
-            // Never let a reset end activity some other integration reported.
-            ProgramState::Clear => return Ok(()),
-        };
-        // Progress updates repeat the same state; only transitions matter.
-        if owned
-            && self
-                .resources
-                .agent_activity(terminal_id)?
-                .last_event
-                .as_ref()
-                .is_some_and(|event| event.kind == report)
-        {
-            return Ok(());
-        }
-        let metadata = crate::domain::AgentReportMetadata {
-            source: status.app.clone(),
-            ..Default::default()
-        };
-        // The foreground process group leader is the job the shell started.
-        // When it is the terminal's own process, its exit ends the terminal.
-        let owner = foreground_pid
-            .zip(self.runtimes.get(&terminal_id))
-            .and_then(|(pid, runtime)| {
-                let root = runtime.handle.child_pid();
-                (pid != root && process::is_descendant(pid, root)).then_some(pid)
+        let before_status = self.resources.program_status(terminal_id)?.clone();
+        let before = before_status.revision;
+        let revision = self
+            .resources
+            .release_automatic_status_owner(terminal_id, agent_pid)?;
+        let status = self.resources.program_status(terminal_id)?.clone();
+        if status.revision != before {
+            let transitions =
+                status_lifecycle_transitions(&before_status, &[], &StatusSource::Osc, &status);
+            self.publish_resource_change(revision);
+            let _ = self.agent_events.send(StatusLifecycleUpdate {
+                terminal_id,
+                status,
+                transitions,
+                terminal_process_exit: false,
             });
-        match owner {
-            Some(owner)
-                if matches!(
-                    report,
-                    AgentReport::Idle | AgentReport::Working | AgentReport::Blocked
-                ) =>
-            {
-                self.report_automatic_agent(terminal_id, report, metadata, owner)?;
-            }
-            _ => self.report_external_agent(terminal_id, report, metadata)?,
-        }
-        if report != AgentReport::Exited {
-            self.program_status_terminals.insert(terminal_id);
         }
         Ok(())
     }
@@ -787,8 +954,6 @@ impl SharedState {
         };
         let mutation = self.resources.terminal_exited(terminal_id)?;
         self.runtimes.remove(&terminal_id);
-        self.automatic_agent_owners.remove(&terminal_id);
-        self.program_status_terminals.remove(&terminal_id);
         self.alerts.remove_terminal(terminal_id);
         self.publish_alert_change();
         self.exited_terminals.push_back((terminal_id, exit_code));
@@ -1830,8 +1995,6 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         attachment_store: Default::default(),
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
-        automatic_agent_owners: HashMap::new(),
-        program_status_terminals: HashSet::new(),
         presence: ClientPresence::default(),
         expected_finalizations: HashSet::new(),
         exited_terminals: VecDeque::new(),
@@ -2011,7 +2174,11 @@ fn watch_process_names(shared: Shared, mut shutdown: watch::Receiver<bool>) -> J
                         return;
                     }
                 }
-                _ = interval.tick() => refresh_process_names(&shared, &mut codex, &mut worktrees).await,
+                _ = interval.tick() => refresh_process_names(
+                    &shared,
+                    &mut codex,
+                    &mut worktrees,
+                ).await,
             }
         }
     })
@@ -2098,34 +2265,24 @@ async fn refresh_process_names(
     worktrees.retain(|cwd, _| live_cwds.contains(cwd));
 
     let mut state = shared.lock().await;
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
     let live = observations
         .iter()
         .map(|observation| observation.terminal_id)
         .collect::<HashSet<_>>();
     codex.retain(|terminal_id, _| live.contains(terminal_id));
     let exited_automatic_agents = state
-        .automatic_agent_owners
-        .iter()
-        .filter_map(|(terminal_id, owner_pid)| {
+        .resources
+        .automatic_status_owners()
+        .into_iter()
+        .filter(|(terminal_id, owner_pid)| {
             let owner_is_live = state.runtimes.get(terminal_id).is_some_and(|runtime| {
                 process::is_descendant(*owner_pid, runtime.handle.child_pid())
             });
-            (!owner_is_live).then_some(*terminal_id)
+            !owner_is_live
         })
         .collect::<Vec<_>>();
-    for terminal_id in exited_automatic_agents {
-        state.automatic_agent_owners.remove(&terminal_id);
-        let _ = state.report_agent(
-            terminal_id,
-            AgentReport::Exited,
-            crate::domain::AgentReportMetadata::default(),
-        );
+    for (terminal_id, owner_pid) in exited_automatic_agents {
+        let _ = state.release_automatic_agent_owner(terminal_id, owner_pid);
     }
     for observation in observations {
         let ProcessObservation {
@@ -2149,15 +2306,7 @@ async fn refresh_process_names(
         {
             state.publish_resource_change(revision);
         }
-        let integrated = state
-            .resources
-            .agent_activity(terminal_id)
-            .is_ok_and(crate::domain::AgentActivity::has_active_integration);
-        if integrated {
-            codex.remove(&terminal_id);
-            continue;
-        }
-        let (detection, detected_state) = match codex_probe {
+        let detection = match codex_probe {
             CodexProbe::Screen(screen) => {
                 let detected = detect_codex(&screen);
                 if std::env::var_os("FUT_AGENT_DETECTION_LOG").is_some() {
@@ -2170,26 +2319,45 @@ async fn refresh_process_names(
                 let Some(stable_state) = stabilizer.observe(detected.state) else {
                     continue;
                 };
-                (
-                    Some(AgentDetection {
+                Some((
+                    StatusReport {
+                        id: String::new(),
+                        state: stable_state,
+                        kind: (stable_state == StatusState::Blocked)
+                            .then_some(BlockedKind::Question),
+                        progress: None,
+                        app: Some("codex".into()),
+                        title: None,
+                        message: None,
+                    },
+                    StatusSource::Detection {
                         agent: "codex".into(),
                         rule: detected.rule.into(),
-                    }),
-                    stable_state,
-                )
+                    },
+                ))
             }
             CodexProbe::NotRunning => {
                 codex.remove(&terminal_id);
-                (None, AgentState::Idle)
+                None
             }
             CodexProbe::Unavailable => continue,
         };
-        if let Ok(revision) =
-            state
-                .resources
-                .update_agent_detection(terminal_id, detection, detected_state, now_ms)
+        if let Some((report, source)) = detection {
+            let _ =
+                state.apply_status_updates(terminal_id, vec![StatusUpdate::Report(report)], source);
+        } else if state
+            .resources
+            .has_detection_status(terminal_id)
+            .unwrap_or(false)
         {
-            state.publish_resource_change(revision);
+            let _ = state.apply_status_updates(
+                terminal_id,
+                vec![StatusUpdate::ProcessExit],
+                StatusSource::Detection {
+                    agent: "codex".into(),
+                    rule: "process_exit".into(),
+                },
+            );
         }
     }
 }
@@ -2298,35 +2466,55 @@ fn watch_terminal(
     shared: Shared,
     exited: mpsc::UnboundedSender<TerminalId>,
 ) {
+    // Close may have discarded the unclaimed stream after registration but
+    // before this watcher starts. Still observe the process until it exits.
+    let mut statuses = terminal.take_status_updates();
     tokio::spawn(async move {
         let mut lifecycle = terminal.subscribe_lifecycle();
         let mut activity = terminal.subscribe_activity();
-        let initial = activity.borrow_and_update().clone();
+        let initial = *activity.borrow_and_update();
         if initial.bell_count > 0 {
             record_terminal_bells(&shared, terminal.id(), initial.bell_count).await;
         }
-        let mut program_status_count = 0;
-        record_program_status(&terminal, &shared, &mut program_status_count, initial).await;
         loop {
+            let process_exited = matches!(
+                *lifecycle.borrow_and_update(),
+                TerminalLifecycle::Exited { .. }
+            );
+            if process_exited {
+                if let Some(statuses) = statuses.as_mut() {
+                    while let Ok(batch) = statuses.try_recv() {
+                        record_terminal_status_updates(&shared, terminal.id(), batch).await;
+                    }
+                }
+                if activity.has_changed().unwrap_or(false) {
+                    let update = *activity.borrow_and_update();
+                    record_terminal_bells(&shared, terminal.id(), update.bell_count).await;
+                }
+                break;
+            }
             tokio::select! {
                 biased;
+                batch = async {
+                    match statuses.as_mut() {
+                        Some(statuses) => statuses.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(batch) = batch else {
+                        break;
+                    };
+                    record_terminal_status_updates(&shared, terminal.id(), batch).await;
+                }
                 changed = activity.changed() => {
                     if changed.is_err() {
-                        return;
+                        break;
                     }
-                    let update = activity.borrow_and_update().clone();
+                    let update = *activity.borrow_and_update();
                     record_terminal_bells(&shared, terminal.id(), update.bell_count).await;
-                    record_program_status(&terminal, &shared, &mut program_status_count, update).await;
                 }
                 changed = lifecycle.changed() => {
                     if changed.is_err() {
-                        return;
-                    }
-                    if matches!(*lifecycle.borrow(), TerminalLifecycle::Exited { .. }) {
-                        if activity.has_changed().unwrap_or(false) {
-                            let update = activity.borrow_and_update().clone();
-                            record_terminal_bells(&shared, terminal.id(), update.bell_count).await;
-                        }
                         break;
                     }
                 }
@@ -2336,26 +2524,17 @@ fn watch_terminal(
     });
 }
 
-async fn record_program_status(
-    terminal: &TerminalHandle,
+async fn record_terminal_status_updates(
     shared: &Shared,
-    seen_count: &mut u64,
-    activity: TerminalActivity,
+    terminal_id: TerminalId,
+    batch: NativeStatusBatch,
 ) {
-    let unseen = usize::try_from(activity.program_status_count - *seen_count)
-        .unwrap_or(usize::MAX)
-        .min(activity.program_statuses.len());
-    *seen_count = activity.program_status_count;
-    if unseen == 0 {
-        return;
-    }
-    let unseen = &activity.program_statuses[activity.program_statuses.len() - unseen..];
-    let foreground_pid = terminal.foreground_process_id().await.ok();
+    // The runtime sampled the foreground PID before publishing this batch.
+    // Never query the terminal here: its bounded status send may be blocking
+    // the same runtime from servicing control RPCs until this receiver drains.
     let mut state = shared.lock().await;
-    for status in unseen {
-        if let Err(error) = state.report_program_status(terminal.id(), status, foreground_pid) {
-            tracing::debug!(message = %error.message, terminal_id = %terminal.id(), "apply program status");
-        }
+    if let Err(error) = state.apply_terminal_status_updates(terminal_id, batch) {
+        tracing::warn!(message = %error.message, %terminal_id, "apply terminal status updates");
     }
 }
 
@@ -3908,7 +4087,7 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
-                    ClientMessage::OpenProject { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportTerminalAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenProject { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportAutomaticAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -4668,19 +4847,19 @@ async fn control_loop(
             ClientMessage::ReportAgent {
                 terminal_id,
                 report,
-                metadata,
+                source,
             } => {
                 let result = shared.lock().await.report_external_agent(
                     terminal_id,
                     report,
-                    metadata,
+                    source,
                 );
                 send_agent_report_result(connection, envelope.request_id, result).await?;
             }
-            ClientMessage::ReportTerminalAgent {
+            ClientMessage::ReportAutomaticAgent {
                 terminal_id,
                 report,
-                metadata,
+                source,
             } => {
                 let agent_pid = shared
                     .lock()
@@ -4694,7 +4873,7 @@ async fn control_loop(
                 let result = shared
                     .lock()
                     .await
-                    .report_automatic_agent(terminal_id, report, metadata, agent_pid);
+                    .report_automatic_agent(terminal_id, report, source, agent_pid);
                 send_agent_report_result(connection, envelope.request_id, result).await?;
             }
             ClientMessage::AcknowledgeAgent {
@@ -4797,7 +4976,7 @@ async fn control_loop(
                 mode,
             } => match prompt_agent(&shared, terminal_id, text, mode).await {
                 Ok(result) => {
-                    let message = match result.activity {
+                    let message = match result.status {
                         Some(activity) => ServerMessage::AgentSettled {
                             terminal_id,
                             barrier_revision: result.barrier_revision,
@@ -4827,7 +5006,7 @@ async fn control_loop(
                             terminal_id,
                             barrier_revision: result.barrier_revision,
                             working_revision: result.working_revision,
-                            activity: result.activity.expect("agent wait always returns activity"),
+                            activity: result.status.expect("agent wait always returns status"),
                         },
                     )
                     .await?
@@ -6664,10 +6843,11 @@ async fn wait_terminal_output(
     }
 }
 
+#[derive(Debug)]
 struct AgentCommandResult {
     barrier_revision: u64,
     working_revision: Option<u64>,
-    activity: Option<AgentActivity>,
+    status: Option<ProgramStatus>,
 }
 
 fn validate_agent_timeout(timeout_ms: u64) -> Result<(), DaemonError> {
@@ -6723,14 +6903,18 @@ async fn prompt_agent(
         state
             .resources
             .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))?;
-        let activity = state.resources.agent_activity(terminal_id)?;
-        if !activity.has_active_integration() {
+        let status = state.resources.program_status(terminal_id)?;
+        if !status.is_reporting() {
             return Err(DaemonError::new(
                 "not_an_agent",
                 format!("terminal {terminal_id} has no agent integration"),
             ));
         }
-        if activity.state == crate::domain::AgentState::Working {
+        if status
+            .records
+            .iter()
+            .any(|record| record.state == StatusState::Working)
+        {
             return Err(DaemonError::new(
                 "agent_busy",
                 format!("agent {terminal_id} is currently working"),
@@ -6751,7 +6935,7 @@ async fn prompt_agent(
             Arc::clone(&runtime.handle),
             lifecycle,
             state.agent_events.subscribe(),
-            activity.revision,
+            status.revision,
         )
     };
 
@@ -6763,15 +6947,13 @@ async fn prompt_agent(
         return Ok(AgentCommandResult {
             barrier_revision,
             working_revision: None,
-            activity: None,
+            status: None,
         });
     };
     wait_for_agent_events(
         shared,
         terminal_id,
-        barrier_revision,
-        None,
-        true,
+        AgentWaitSelection::fresh(barrier_revision),
         timeout_ms,
         events,
         &mut lifecycle,
@@ -6785,13 +6967,13 @@ async fn wait_agent(
     timeout_ms: u64,
 ) -> Result<AgentCommandResult, DaemonError> {
     validate_agent_timeout(timeout_ms)?;
-    let (activity, events, mut lifecycle) = {
+    let (status, events, mut lifecycle) = {
         let state = shared.lock().await;
         state
             .resources
             .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))?;
-        let activity = state.resources.agent_activity(terminal_id)?.clone();
-        if !activity.has_active_integration() {
+        let status = state.resources.program_status(terminal_id)?.clone();
+        if !status.is_reporting() {
             return Err(DaemonError::new(
                 "not_an_agent",
                 format!("terminal {terminal_id} has no agent integration"),
@@ -6802,24 +6984,22 @@ async fn wait_agent(
             .get(&terminal_id)
             .ok_or_else(|| DaemonError::new("terminal_exited", "terminal is not running"))?;
         (
-            activity,
+            status,
             state.agent_events.subscribe(),
             runtime.handle.subscribe_lifecycle(),
         )
     };
-    if activity.state != crate::domain::AgentState::Working {
+    let Some(selection) = AgentWaitSelection::current(&status) else {
         return Ok(AgentCommandResult {
-            barrier_revision: activity.revision,
+            barrier_revision: status.revision,
             working_revision: None,
-            activity: Some(activity),
+            status: Some(status),
         });
-    }
+    };
     wait_for_agent_events(
         shared,
         terminal_id,
-        activity.revision,
-        Some(activity.revision),
-        false,
+        selection,
         timeout_ms,
         events,
         &mut lifecycle,
@@ -6827,89 +7007,263 @@ async fn wait_agent(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug)]
+struct AgentWaitSelection {
+    barrier_revision: u64,
+    selected: HashSet<String>,
+    settled: HashSet<String>,
+    working_revision: Option<u64>,
+}
+
+#[derive(Debug)]
+enum AgentWaitObservation {
+    Pending,
+    Settled(ProgramStatus),
+    Exited { terminal: bool },
+}
+
+impl AgentWaitSelection {
+    fn fresh(barrier_revision: u64) -> Self {
+        Self {
+            barrier_revision,
+            selected: HashSet::new(),
+            settled: HashSet::new(),
+            working_revision: None,
+        }
+    }
+
+    fn current(status: &ProgramStatus) -> Option<Self> {
+        let working = status
+            .records
+            .iter()
+            .filter(|record| record.state == StatusState::Working)
+            .collect::<Vec<_>>();
+        if working.is_empty() {
+            return None;
+        }
+        let selected = if working.iter().any(|record| record.id.is_empty()) {
+            HashSet::from([String::new()])
+        } else {
+            working.iter().map(|record| record.id.clone()).collect()
+        };
+        let working_revision = working
+            .iter()
+            .filter(|record| selected.contains(&record.id))
+            .map(|record| record.revision)
+            .max();
+        Some(Self {
+            barrier_revision: status.revision,
+            selected,
+            settled: HashSet::new(),
+            working_revision,
+        })
+    }
+
+    fn observe(&mut self, update: &StatusLifecycleUpdate) -> AgentWaitObservation {
+        if update.status.revision <= self.barrier_revision {
+            return AgentWaitObservation::Pending;
+        }
+
+        let started = update
+            .transitions
+            .iter()
+            .filter_map(|transition| match transition {
+                StatusRecordLifecycle::Working(id) => Some(id.clone()),
+                StatusRecordLifecycle::Settled(_) | StatusRecordLifecycle::Removed(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        if self.selected.is_empty() && !started.is_empty() {
+            self.selected = if started.contains("") {
+                HashSet::from([String::new()])
+            } else {
+                started
+            };
+        }
+        if !self.selected.is_empty()
+            && update.transitions.iter().any(|transition| {
+                matches!(transition, StatusRecordLifecycle::Working(id) if self.selected.contains(id))
+            })
+        {
+            self.working_revision = Some(
+                self.working_revision
+                    .map_or(update.status.revision, |revision| revision.max(update.status.revision)),
+            );
+        }
+
+        for transition in &update.transitions {
+            match transition {
+                StatusRecordLifecycle::Working(id) if self.selected.contains(id) => {
+                    self.settled.remove(id);
+                }
+                StatusRecordLifecycle::Settled(id) if self.selected.contains(id) => {
+                    self.settled.insert(id.clone());
+                }
+                StatusRecordLifecycle::Removed(id) if self.selected.contains(id) => {
+                    return AgentWaitObservation::Exited {
+                        terminal: update.terminal_process_exit,
+                    };
+                }
+                StatusRecordLifecycle::Working(_)
+                | StatusRecordLifecycle::Settled(_)
+                | StatusRecordLifecycle::Removed(_) => {}
+            }
+        }
+        self.settled_status(&update.status)
+            .map_or(AgentWaitObservation::Pending, AgentWaitObservation::Settled)
+    }
+
+    fn settled_status(&self, status: &ProgramStatus) -> Option<ProgramStatus> {
+        if self.selected.is_empty() || self.settled.len() != self.selected.len() {
+            return None;
+        }
+        if self.selected.iter().any(|id| {
+            status
+                .records
+                .iter()
+                .find(|record| record.id == *id)
+                .is_none_or(|record| record.state == StatusState::Working)
+        }) {
+            return None;
+        }
+        Some(self.result_status(status))
+    }
+
+    fn settled_status_at_terminal_exit(&self, status: &ProgramStatus) -> Option<ProgramStatus> {
+        let working_revision = self.working_revision?;
+        if self.selected.is_empty()
+            || self.selected.iter().any(|id| {
+                status
+                    .records
+                    .iter()
+                    .find(|record| record.id == *id)
+                    .is_none_or(|record| {
+                        record.state == StatusState::Working || record.revision < working_revision
+                    })
+            })
+        {
+            return None;
+        }
+        Some(self.result_status(status))
+    }
+
+    fn result_status(&self, status: &ProgramStatus) -> ProgramStatus {
+        let mut result = status.clone();
+        result
+            .records
+            .retain(|record| self.selected.contains(&record.id));
+        result
+    }
+}
+
 async fn wait_for_agent_events(
     shared: &Shared,
     terminal_id: TerminalId,
-    barrier_revision: u64,
-    mut working_revision: Option<u64>,
-    require_working: bool,
+    mut selection: AgentWaitSelection,
     timeout_ms: u64,
-    mut events: broadcast::Receiver<AgentLifecycleUpdate>,
+    mut events: broadcast::Receiver<StatusLifecycleUpdate>,
     lifecycle: &mut watch::Receiver<TerminalLifecycle>,
 ) -> Result<AgentCommandResult, DaemonError> {
+    let barrier_revision = selection.barrier_revision;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     loop {
+        let current_lifecycle = lifecycle.borrow().clone();
+        if let TerminalLifecycle::Exited { exit_code } = current_lifecycle {
+            loop {
+                match events.try_recv() {
+                    Ok(update) => {
+                        if update.terminal_id != terminal_id {
+                            continue;
+                        }
+                        match selection.observe(&update) {
+                            AgentWaitObservation::Pending => {}
+                            AgentWaitObservation::Settled(status) => {
+                                return Ok(AgentCommandResult {
+                                    barrier_revision,
+                                    working_revision: selection.working_revision,
+                                    status: Some(status),
+                                });
+                            }
+                            AgentWaitObservation::Exited { terminal: false } => {
+                                return Err(agent_exited_error(terminal_id));
+                            }
+                            AgentWaitObservation::Exited { terminal: true } => {
+                                return Err(terminal_agent_exit_error(terminal_id));
+                            }
+                        }
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                        return Err(DaemonError::new(
+                            "agent_events_lagged",
+                            format!(
+                                "agent status receiver lagged by {skipped} updates; retry from a fresh state"
+                            ),
+                        ));
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        return Err(DaemonError::new(
+                            "agent_events_closed",
+                            "agent status stream closed",
+                        ));
+                    }
+                }
+            }
+            let current = shared
+                .lock()
+                .await
+                .resources
+                .program_status(terminal_id)
+                .cloned();
+            if let Ok(status) = current
+                && let Some(status) = selection.settled_status_at_terminal_exit(&status)
+            {
+                return Ok(AgentCommandResult {
+                    barrier_revision,
+                    working_revision: selection.working_revision,
+                    status: Some(status),
+                });
+            }
+            return Err(DaemonError::new(
+                "terminal_exited",
+                format!("terminal exited with status {exit_code:?} before the agent settled"),
+            ));
+        }
         tokio::select! {
             biased;
             update = events.recv() => match update {
                 Ok(update) if update.terminal_id != terminal_id => {}
-                Ok(update) if update.activity.revision <= barrier_revision => {}
-                Ok(update) => {
-                    let Some(event) = update.activity.last_event.as_ref() else { continue };
-                    if event.kind == AgentReport::Exited {
-                        return Err(DaemonError::new(
-                            "agent_exited",
-                            format!("agent {terminal_id} exited before it settled"),
-                        ));
-                    }
-                    if event.kind == AgentReport::Working {
-                        working_revision = Some(event.revision);
-                        continue;
-                    }
-                    let settled = matches!(event.kind, AgentReport::Completed | AgentReport::Blocked | AgentReport::Idle);
-                    let after_working = working_revision.is_some_and(|revision| event.revision > revision);
-                    if settled && (!require_working || after_working) {
+                Ok(update) => match selection.observe(&update) {
+                    AgentWaitObservation::Pending => {}
+                    AgentWaitObservation::Settled(status) => {
                         return Ok(AgentCommandResult {
                             barrier_revision,
-                            working_revision,
-                            activity: Some(update.activity),
+                            working_revision: selection.working_revision,
+                            status: Some(status),
                         });
                     }
-                }
+                    AgentWaitObservation::Exited { terminal: false } => {
+                        return Err(agent_exited_error(terminal_id));
+                    }
+                    AgentWaitObservation::Exited { terminal: true } => {
+                        return Err(terminal_agent_exit_error(terminal_id));
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     return Err(DaemonError::new(
                         "agent_events_lagged",
-                        format!("agent lifecycle receiver lagged by {skipped} reports; retry from a fresh state"),
+                        format!("agent status receiver lagged by {skipped} updates; retry from a fresh state"),
                     ));
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    return Err(DaemonError::new("agent_events_closed", "agent lifecycle stream closed"));
+                    return Err(DaemonError::new("agent_events_closed", "agent status stream closed"));
                 }
             },
             changed = lifecycle.changed() => {
                 if changed.is_err() {
                     return Err(DaemonError::new("terminal_exited", "terminal lifecycle stream closed"));
                 }
-                let terminal_lifecycle = lifecycle.borrow().clone();
-                if let TerminalLifecycle::Exited { exit_code } = terminal_lifecycle {
-                    // A final report may have been published immediately before
-                    // exit; the biased event branch above gets first refusal.
-                    let current = shared.lock().await.resources.agent_activity(terminal_id).cloned();
-                    if let Ok(activity) = current
-                        && let Some(event) = activity.last_event.as_ref()
-                    {
-                        let after_working = working_revision
-                            .is_some_and(|revision| event.revision > revision);
-                        if event.revision > barrier_revision
-                            && matches!(
-                                event.kind,
-                                AgentReport::Completed | AgentReport::Blocked | AgentReport::Idle
-                            )
-                            && (!require_working || after_working)
-                        {
-                            return Ok(AgentCommandResult {
-                                barrier_revision,
-                                working_revision,
-                                activity: Some(activity),
-                            });
-                        }
-                    }
-                    return Err(DaemonError::new(
-                        "terminal_exited",
-                        format!("terminal exited with status {exit_code:?} before the agent settled"),
-                    ));
-                }
+                // The loop head inspects the current value. This also handles
+                // receivers first subscribed after the lifecycle reached Exited.
             }
             _ = tokio::time::sleep_until(deadline) => {
                 return Err(DaemonError::new(
@@ -6995,6 +7349,20 @@ async fn receive_attachment(
         _ => unreachable!("only attachment messages reach the upload handler"),
     }
     Ok(false)
+}
+
+fn agent_exited_error(terminal_id: TerminalId) -> DaemonError {
+    DaemonError::new(
+        "agent_exited",
+        format!("agent {terminal_id} stopped reporting before it settled"),
+    )
+}
+
+fn terminal_agent_exit_error(terminal_id: TerminalId) -> DaemonError {
+    DaemonError::new(
+        "terminal_exited",
+        format!("terminal {terminal_id} exited before the agent settled"),
+    )
 }
 
 async fn targeted_terminal_input(
@@ -8532,6 +8900,860 @@ mod tests {
         second_terminal.close().await.unwrap();
     }
 
+    fn status_report(id: &str, state: StatusState) -> StatusUpdate {
+        StatusUpdate::Report(StatusReport {
+            id: id.into(),
+            state,
+            kind: None,
+            progress: None,
+            app: Some("test".into()),
+            title: None,
+            message: None,
+        })
+    }
+
+    #[test]
+    fn old_error_does_not_mask_batched_fresh_working_done() {
+        let (mut state, path) = inconsistent_state();
+        let resource_changes = state.resource_changes.subscribe();
+        let mut status_events = state.agent_events.subscribe();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("old", StatusState::Error)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let barrier = state
+            .resources
+            .program_status(path.terminal_id)
+            .unwrap()
+            .revision;
+        let mut wait = AgentWaitSelection::fresh(barrier);
+        let _ = status_events.try_recv().unwrap();
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    status_report("fresh", StatusState::Working),
+                    status_report("fresh", StatusState::Done),
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert_eq!(status.summary_state(), StatusState::Error);
+        assert_eq!(status.working_revision, status.revision);
+        assert!(resource_changes.has_changed().unwrap());
+        let event = status_events.try_recv().unwrap();
+        assert_eq!(event.terminal_id, path.terminal_id);
+        assert_eq!(event.status, *status);
+        assert_eq!(
+            event.transitions,
+            vec![
+                StatusRecordLifecycle::Working("fresh".into()),
+                StatusRecordLifecycle::Settled("fresh".into()),
+            ]
+        );
+        let AgentWaitObservation::Settled(result) = wait.observe(&event) else {
+            panic!("fresh record should settle its own wait");
+        };
+        assert_eq!(result.summary_state(), StatusState::Done);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].id, "fresh");
+        assert!(matches!(
+            status_events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn unrelated_result_cannot_settle_selected_work() {
+        let (mut state, path) = inconsistent_state();
+        let source = StatusSource::Osc;
+        let mut events = state.agent_events.subscribe();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("old", StatusState::Done)],
+                source.clone(),
+            )
+            .unwrap();
+        let barrier = state.resources.revision();
+        let _ = events.try_recv().unwrap();
+        let mut wait = AgentWaitSelection::fresh(barrier);
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("live", StatusState::Working)],
+                source.clone(),
+            )
+            .unwrap();
+        assert!(matches!(
+            wait.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Pending
+        ));
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("other", StatusState::Done)],
+                source.clone(),
+            )
+            .unwrap();
+        assert!(matches!(
+            wait.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Pending
+        ));
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("live", StatusState::Done)],
+                source,
+            )
+            .unwrap();
+        let AgentWaitObservation::Settled(result) = wait.observe(&events.try_recv().unwrap())
+        else {
+            panic!("selected record should settle on its own result");
+        };
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].id, "live");
+    }
+
+    #[test]
+    fn later_root_work_does_not_replace_standalone_or_fresh_child_selection() {
+        let (mut state, path) = inconsistent_state();
+        let mut events = state.agent_events.subscribe();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("child", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let _ = events.try_recv().unwrap();
+        let mut standalone =
+            AgentWaitSelection::current(state.resources.program_status(path.terminal_id).unwrap())
+                .unwrap();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    status_report("", StatusState::Working),
+                    status_report("", StatusState::Done),
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            standalone.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Pending
+        ));
+        assert_eq!(standalone.selected, HashSet::from(["child".to_owned()]));
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("child", StatusState::Done)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            standalone.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Settled(_)
+        ));
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    StatusUpdate::Clear { id: None },
+                    status_report("old", StatusState::Error),
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let barrier = state.resources.revision();
+        let _ = events.try_recv().unwrap();
+        let mut fresh = AgentWaitSelection::fresh(barrier);
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("prompt", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            fresh.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Pending
+        ));
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    status_report("", StatusState::Working),
+                    status_report("", StatusState::Done),
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            fresh.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Pending
+        ));
+        assert_eq!(fresh.selected, HashSet::from(["prompt".to_owned()]));
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("prompt", StatusState::Done)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            fresh.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Settled(_)
+        ));
+    }
+
+    #[test]
+    fn selected_work_evicted_by_record_257_is_agent_exit() {
+        let (mut state, path) = inconsistent_state();
+        let mut initial = vec![status_report("selected", StatusState::Working)];
+        initial
+            .extend((0..255).map(|index| status_report(&format!("r{index}"), StatusState::Idle)));
+        state
+            .apply_status_updates(path.terminal_id, initial, StatusSource::Osc)
+            .unwrap();
+        let mut events = state.agent_events.subscribe();
+        let mut wait =
+            AgentWaitSelection::current(state.resources.program_status(path.terminal_id).unwrap())
+                .unwrap();
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("overflow", StatusState::Idle)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert!(
+            event
+                .transitions
+                .contains(&StatusRecordLifecycle::Removed("selected".into()))
+        );
+        assert!(matches!(
+            wait.observe(&event),
+            AgentWaitObservation::Exited { terminal: false }
+        ));
+    }
+
+    #[test]
+    fn wait_prefers_working_root_and_otherwise_tracks_all_active_records() {
+        let (mut state, path) = inconsistent_state();
+        let mut events = state.agent_events.subscribe();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    status_report("", StatusState::Working),
+                    status_report("child", StatusState::Working),
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let _ = events.try_recv().unwrap();
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        let mut wait = AgentWaitSelection::current(status).unwrap();
+        assert_eq!(wait.selected, HashSet::from([String::new()]));
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("", StatusState::Done)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let AgentWaitObservation::Settled(result) = wait.observe(&events.try_recv().unwrap())
+        else {
+            panic!("root result should settle without waiting for its child");
+        };
+        assert_eq!(result.records.len(), 1);
+        assert!(result.records[0].id.is_empty());
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    StatusUpdate::Clear { id: None },
+                    status_report("one", StatusState::Working),
+                    status_report("two", StatusState::Working),
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let _ = events.try_recv().unwrap();
+        let mut wait =
+            AgentWaitSelection::current(state.resources.program_status(path.terminal_id).unwrap())
+                .unwrap();
+        assert_eq!(
+            wait.selected,
+            HashSet::from(["one".to_owned(), "two".to_owned()])
+        );
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("one", StatusState::Done)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            wait.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Pending
+        ));
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("two", StatusState::Done)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let AgentWaitObservation::Settled(result) = wait.observe(&events.try_recv().unwrap())
+        else {
+            panic!("all selected records have settled");
+        };
+        assert_eq!(result.records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn watcher_survives_close_claiming_the_status_stream_before_registration() {
+        for exited_before_watch in [false, true] {
+            let (state, path) = inconsistent_state();
+            let cwd = tempfile::tempdir().unwrap();
+            let handle = Arc::new(
+                spawn_terminal(SpawnSpec {
+                    terminal: crate::terminal::TerminalConfig::default(),
+                    id: path.terminal_id,
+                    program: "/bin/sh".into(),
+                    argv: vec!["-c".into(), "sleep 60".into()],
+                    cwd: cwd.path().into(),
+                    env: HashMap::new(),
+                    size: TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                    },
+                })
+                .unwrap(),
+            );
+            drop(handle.take_status_updates());
+            if exited_before_watch {
+                handle.close().await.unwrap();
+            }
+            let (exited, mut received) = mpsc::unbounded_channel();
+            watch_terminal(Arc::clone(&handle), Arc::new(Mutex::new(state)), exited);
+            if !exited_before_watch {
+                tokio::task::yield_now().await;
+                assert!(matches!(
+                    received.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                handle.close().await.unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .expect("watcher did not report the closed terminal"),
+                Some(path.terminal_id)
+            );
+        }
+    }
+
+    #[test]
+    fn external_reports_cannot_spoof_provenance_or_terminal_lifecycle() {
+        let (mut state, path) = inconsistent_state();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("native", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let before = state
+            .resources
+            .program_status(path.terminal_id)
+            .unwrap()
+            .clone();
+        let revision = state.resources.revision();
+        let report_source = StatusSource::Report {
+            source: Some("test".into()),
+            agent_session_id: None,
+        };
+        let submissions = [
+            (StatusUpdate::PromptStart, report_source.clone()),
+            (StatusUpdate::ProcessExit, report_source),
+            (status_report("", StatusState::Working), StatusSource::Osc),
+            (
+                status_report("", StatusState::Working),
+                StatusSource::Detection {
+                    agent: "codex".into(),
+                    rule: "forged".into(),
+                },
+            ),
+        ];
+        for (update, source) in submissions {
+            assert_eq!(
+                state
+                    .report_external_agent(path.terminal_id, update.clone(), source.clone())
+                    .unwrap_err()
+                    .code,
+                "invalid_agent_report"
+            );
+            assert_eq!(
+                state
+                    .report_automatic_agent(path.terminal_id, update, source, 42)
+                    .unwrap_err()
+                    .code,
+                "invalid_agent_report"
+            );
+        }
+        assert_eq!(
+            state.resources.program_status(path.terminal_id).unwrap(),
+            &before
+        );
+        assert_eq!(state.resources.revision(), revision);
+        assert!(state.resources.automatic_status_owners().is_empty());
+    }
+
+    #[test]
+    fn reported_process_exit_is_agent_exit_not_an_unrelated_result() {
+        let (mut state, path) = inconsistent_state();
+        let mut events = state.agent_events.subscribe();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    status_report("old", StatusState::Done),
+                    status_report("live", StatusState::Working),
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let _ = events.try_recv().unwrap();
+        let mut wait =
+            AgentWaitSelection::current(state.resources.program_status(path.terminal_id).unwrap())
+                .unwrap();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![StatusUpdate::ProcessExit],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            wait.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Exited { terminal: false }
+        ));
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert_eq!(status.records.len(), 1);
+        assert_eq!(status.records[0].id, "old");
+    }
+
+    #[test]
+    fn automatic_pid_exit_removes_selected_old_record_without_exiting_terminal() {
+        let (mut state, path) = inconsistent_state();
+        let source = StatusSource::Report {
+            source: Some("cli".into()),
+            agent_session_id: None,
+        };
+        state
+            .report_automatic_agent(
+                path.terminal_id,
+                status_report("old", StatusState::Working),
+                source,
+                42,
+            )
+            .unwrap();
+        let mut events = state.agent_events.subscribe();
+        let mut wait =
+            AgentWaitSelection::current(state.resources.program_status(path.terminal_id).unwrap())
+                .unwrap();
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("new", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        assert!(matches!(
+            wait.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Pending
+        ));
+        state
+            .release_automatic_agent_owner(path.terminal_id, 42)
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert!(!event.terminal_process_exit);
+        assert!(
+            event
+                .transitions
+                .contains(&StatusRecordLifecycle::Removed("old".into()))
+        );
+        assert!(matches!(
+            wait.observe(&event),
+            AgentWaitObservation::Exited { terminal: false }
+        ));
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert_eq!(status.records.len(), 1);
+        assert_eq!(status.records[0].id, "new");
+        assert_eq!(status.records[0].state, StatusState::Working);
+    }
+
+    #[test]
+    fn terminal_process_exit_is_distinct_and_retained_result_still_settles() {
+        let (mut state, path) = inconsistent_state();
+        let mut events = state.agent_events.subscribe();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("live", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let _ = events.try_recv().unwrap();
+        let mut wait =
+            AgentWaitSelection::current(state.resources.program_status(path.terminal_id).unwrap())
+                .unwrap();
+        state
+            .apply_terminal_status_updates(
+                path.terminal_id,
+                NativeStatusBatch {
+                    updates: vec![StatusUpdate::ProcessExit],
+                    foreground_pid: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            wait.observe(&events.try_recv().unwrap()),
+            AgentWaitObservation::Exited { terminal: true }
+        ));
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("live", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let _ = events.try_recv().unwrap();
+        let mut wait =
+            AgentWaitSelection::current(state.resources.program_status(path.terminal_id).unwrap())
+                .unwrap();
+        state
+            .apply_terminal_status_updates(
+                path.terminal_id,
+                NativeStatusBatch {
+                    updates: vec![
+                        status_report("live", StatusState::Done),
+                        StatusUpdate::ProcessExit,
+                    ],
+                    foreground_pid: None,
+                },
+            )
+            .unwrap();
+        let AgentWaitObservation::Settled(result) = wait.observe(&events.try_recv().unwrap())
+        else {
+            panic!("a retained selected result should win over process exit");
+        };
+        assert_eq!(result.summary_state(), StatusState::Done);
+    }
+
+    #[test]
+    fn detection_waits_for_explicit_owner_exit_then_coexists_with_persistent_results() {
+        let (mut state, path) = inconsistent_state();
+        let report_source = StatusSource::Report {
+            source: Some("pi".into()),
+            agent_session_id: Some("session".into()),
+        };
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![StatusUpdate::Report(StatusReport {
+                    id: "result".into(),
+                    state: StatusState::Done,
+                    kind: None,
+                    progress: None,
+                    app: Some("pi".into()),
+                    title: Some("finished".into()),
+                    message: None,
+                })],
+                report_source.clone(),
+            )
+            .unwrap();
+        let explicit_revision = state.resources.revision();
+        let detection_source = StatusSource::Detection {
+            agent: "codex".into(),
+            rule: "working_indicator".into(),
+        };
+        let detected_working = StatusUpdate::Report(StatusReport {
+            id: String::new(),
+            state: StatusState::Working,
+            kind: None,
+            progress: None,
+            app: Some("codex".into()),
+            title: None,
+            message: None,
+        });
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![detected_working.clone()],
+                detection_source.clone(),
+            )
+            .unwrap();
+        assert_eq!(state.resources.revision(), explicit_revision);
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![StatusUpdate::ProcessExit],
+                report_source,
+            )
+            .unwrap();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![detected_working],
+                detection_source.clone(),
+            )
+            .unwrap();
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert_eq!(status.summary_state(), StatusState::Working);
+        assert!(
+            status
+                .records
+                .iter()
+                .any(|record| { record.id == "result" && record.state == StatusState::Done })
+        );
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![StatusUpdate::ProcessExit],
+                detection_source,
+            )
+            .unwrap();
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert_eq!(status.summary_state(), StatusState::Done);
+        assert_eq!(status.records.len(), 1);
+    }
+
+    #[test]
+    fn explicit_takeover_clears_inferred_done_eligibility() {
+        let (mut state, path) = inconsistent_state();
+        let detection = StatusSource::Detection {
+            agent: "codex".into(),
+            rule: "working_indicator".into(),
+        };
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("", StatusState::Working)],
+                detection.clone(),
+            )
+            .unwrap();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("", StatusState::Idle)],
+                detection,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .resources
+                .program_status(path.terminal_id)
+                .unwrap()
+                .summary_state(),
+            StatusState::Done
+        );
+
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("child", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![StatusUpdate::Clear {
+                    id: Some("child".into()),
+                }],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert!(status.records.is_empty());
+        assert!(!status.is_reporting());
+    }
+
+    #[tokio::test]
+    async fn terminal_watcher_applies_osc_status_while_screen_is_detached() {
+        let (mut state, path) = inconsistent_state();
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
+                id: path.terminal_id,
+                program: "/bin/sh".into(),
+                argv: vec![
+                    "-c".into(),
+                    "printf '\\033]7501;state=done:id=build:title=RmluaXNoZWQ=\\007'; sleep 60"
+                        .into(),
+                ],
+                cwd: "/".into(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .unwrap(),
+        );
+        state.runtimes.insert(
+            path.terminal_id,
+            RuntimeEntry {
+                handle: Arc::clone(&terminal),
+                lease: AttachmentLease::default(),
+            },
+        );
+        let shared = Arc::new(Mutex::new(state));
+        let (exited, _exits) = mpsc::unbounded_channel();
+        watch_terminal(Arc::clone(&terminal), Arc::clone(&shared), exited);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let reported = shared
+                    .lock()
+                    .await
+                    .resources
+                    .program_status(path.terminal_id)
+                    .is_ok_and(|status| status.summary_state() == StatusState::Done);
+                if reported {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let state = shared.lock().await;
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert_eq!(status.summary_record().unwrap().id, "build");
+        assert_eq!(
+            status.summary_record().unwrap().title.as_deref(),
+            Some("Finished")
+        );
+        drop(state);
+        terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_observes_terminal_that_already_exited() {
+        let (mut state, path) = inconsistent_state();
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                terminal: crate::terminal::TerminalConfig::default(),
+                id: path.terminal_id,
+                program: "/bin/sh".into(),
+                argv: vec!["-c".into(), "exit 0".into()],
+                cwd: "/".into(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .unwrap(),
+        );
+        state.runtimes.insert(
+            path.terminal_id,
+            RuntimeEntry {
+                handle: Arc::clone(&terminal),
+                lease: AttachmentLease::default(),
+            },
+        );
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![status_report("", StatusState::Working)],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let mut lifecycle = terminal.subscribe_lifecycle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
+                lifecycle.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let shared = Arc::new(Mutex::new(state));
+        let error = wait_agent(&shared, path.terminal_id, 5_000)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "terminal_exited");
+    }
+
+    #[tokio::test]
+    async fn exited_lifecycle_still_reports_lagged_and_closed_agent_streams() {
+        let (state, path) = inconsistent_state();
+        let shared = Arc::new(Mutex::new(state));
+        let (events, receiver) = broadcast::channel(1);
+        let update = StatusLifecycleUpdate {
+            terminal_id: path.terminal_id,
+            status: ProgramStatus {
+                revision: 1,
+                ..ProgramStatus::default()
+            },
+            transitions: Vec::new(),
+            terminal_process_exit: false,
+        };
+        events.send(update.clone()).unwrap();
+        events.send(update).unwrap();
+        let (_lifecycle_sender, mut lifecycle) =
+            watch::channel(TerminalLifecycle::Exited { exit_code: Some(0) });
+
+        let error = wait_for_agent_events(
+            &shared,
+            path.terminal_id,
+            AgentWaitSelection::fresh(0),
+            1_000,
+            receiver,
+            &mut lifecycle,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "agent_events_lagged");
+
+        let (events, receiver) = broadcast::channel(1);
+        drop(events);
+        let error = wait_for_agent_events(
+            &shared,
+            path.terminal_id,
+            AgentWaitSelection::fresh(0),
+            1_000,
+            receiver,
+            &mut lifecycle,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "agent_events_closed");
+    }
+
     fn inconsistent_state() -> (SharedState, InitialPath) {
         let resolved = ResolvedLocation {
             cwd: "/".into(),
@@ -8559,8 +9781,6 @@ mod tests {
                 attachment_store: Default::default(),
                 resources,
                 runtimes: HashMap::new(),
-                automatic_agent_owners: HashMap::new(),
-                program_status_terminals: HashSet::new(),
                 presence: ClientPresence::default(),
                 expected_finalizations: HashSet::new(),
                 exited_terminals: VecDeque::new(),
@@ -9365,8 +10585,6 @@ scope = "workspace"
             attachment_store: Default::default(),
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),
-            automatic_agent_owners: HashMap::new(),
-            program_status_terminals: HashSet::new(),
             presence: ClientPresence::default(),
             expected_finalizations: HashSet::new(),
             exited_terminals: VecDeque::new(),

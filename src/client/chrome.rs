@@ -232,7 +232,7 @@ impl ResourceState {
         }
         pane.activity
             .attention()
-            .map(|attention| attention.revision)
+            .map(|attention| attention.attention_revision)
     }
 
     pub fn has_working(&self) -> bool {
@@ -298,6 +298,7 @@ struct TabItem {
     pane_count: usize,
     tokens: MaterializedTokenMap,
     activity: Option<ActivityIndicator>,
+    progress: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,6 +309,7 @@ struct TabBarModel {
     workspace_id: WorkspaceId,
     workspace_name: String,
     workspace_tokens: MaterializedTokenMap,
+    workspace_progress: Option<u8>,
     pane_id: PaneId,
     pane_tokens: MaterializedTokenMap,
     tabs: Vec<TabItem>,
@@ -334,6 +336,8 @@ impl TabBarModel {
             .tabs
             .iter()
             .position(|tab| tab.id == focused.tab_id)?;
+        let workspace_rollup =
+            notifications.rollup(workspace.tabs.iter().flat_map(|tab| tab.panes.iter()));
         Some(Self {
             session_id: session.id,
             session_name: sanitize(&session.name),
@@ -341,6 +345,7 @@ impl TabBarModel {
             workspace_id: workspace.id,
             workspace_name: sanitize(&workspace.name),
             workspace_tokens: workspace.tokens.clone(),
+            workspace_progress: workspace_rollup.progress,
             pane_id: focused.pane_id,
             pane_tokens: workspace.tabs[active]
                 .panes
@@ -350,13 +355,17 @@ impl TabBarModel {
             tabs: workspace
                 .tabs
                 .iter()
-                .map(|tab| TabItem {
-                    id: tab.id,
-                    name: sanitize(&tab.name),
-                    closing: tab.closing,
-                    pane_count: tab.panes.len(),
-                    tokens: tab.tokens.clone(),
-                    activity: notifications.indicator(&tab.panes),
+                .map(|tab| {
+                    let rollup = notifications.rollup(tab.panes.iter());
+                    TabItem {
+                        id: tab.id,
+                        name: sanitize(&tab.name),
+                        closing: tab.closing,
+                        pane_count: tab.panes.len(),
+                        tokens: tab.tokens.clone(),
+                        activity: rollup.indicator,
+                        progress: rollup.progress,
+                    }
                 })
                 .collect(),
             active,
@@ -567,6 +576,7 @@ fn tab_bar_model(
             workspace_id: focused.workspace_id,
             workspace_name: "workspace".into(),
             workspace_tokens: MaterializedTokenMap::new(),
+            workspace_progress: None,
             pane_id: focused.pane_id,
             pane_tokens: MaterializedTokenMap::new(),
             tabs: vec![TabItem {
@@ -576,6 +586,7 @@ fn tab_bar_model(
                 pane_count: 1,
                 tokens: MaterializedTokenMap::new(),
                 activity: None,
+                progress: None,
             }],
             active: 0,
             client_waiting: 0,
@@ -756,6 +767,8 @@ fn render_bar_group(
                 || TokenValue::plain(""),
                 |activity| activity_token(activity, spinner_frame, ui),
             ),
+            "tab.progress" => progress_token(active.progress),
+            "workspace.progress" => workspace_progress_token(model),
             _ => materialized_extension_token_value(
                 ui,
                 token,
@@ -1060,7 +1073,13 @@ fn render_tab_item_content(
             closing: tab.closing,
             attention: matches!(
                 tab.activity,
-                Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
+                Some(
+                    ActivityIndicator::UnreadBlocked
+                        | ActivityIndicator::UnreadError
+                        | ActivityIndicator::Blocked
+                        | ActivityIndicator::Error
+                        | ActivityIndicator::Completed
+                )
             ),
         },
         &ui.styles,
@@ -1089,7 +1108,13 @@ fn tab_item_style(
             closing: tab.closing,
             attention: matches!(
                 tab.activity,
-                Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
+                Some(
+                    ActivityIndicator::UnreadBlocked
+                        | ActivityIndicator::UnreadError
+                        | ActivityIndicator::Blocked
+                        | ActivityIndicator::Error
+                        | ActivityIndicator::Completed
+                )
             ),
         },
         style,
@@ -1120,6 +1145,7 @@ fn tab_token(
             || TokenValue::plain(""),
             |activity| activity_token(activity, spinner_frame, ui),
         ),
+        "tab.progress" => progress_token(tab.progress),
         _ => materialized_extension_token_value(
             ui,
             token,
@@ -1134,11 +1160,24 @@ fn tab_token(
 fn activity_token(activity: ActivityIndicator, frame: usize, ui: &UiConfig) -> TokenValue {
     let style = match activity {
         ActivityIndicator::Working => SemanticStyle::Activity,
-        ActivityIndicator::Blocked | ActivityIndicator::Completed | ActivityIndicator::Bell => {
-            SemanticStyle::Attention
-        }
+        ActivityIndicator::Error | ActivityIndicator::UnreadError => SemanticStyle::Error,
+        ActivityIndicator::UnreadBlocked
+        | ActivityIndicator::Blocked
+        | ActivityIndicator::Completed
+        | ActivityIndicator::Bell => SemanticStyle::Attention,
     };
     TokenValue::styled(activity.marker(frame, &ui.spinner), style)
+}
+
+fn progress_token(progress: Option<u8>) -> TokenValue {
+    progress.map_or_else(
+        || TokenValue::plain(""),
+        |progress| TokenValue::plain(format!("{progress}%")),
+    )
+}
+
+fn workspace_progress_token(model: &TabBarModel) -> TokenValue {
+    progress_token(model.workspace_progress)
 }
 
 pub(super) fn truncate(value: &str, width: usize) -> String {
@@ -1166,7 +1205,7 @@ pub(super) fn truncate(value: &str, width: usize) -> String {
     truncated
 }
 
-pub(super) fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     value
         .chars()
         .map(|character| {
@@ -1203,7 +1242,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{AgentIntegration, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+        domain::{
+            PaneId, SessionId, StatusRecord, StatusSource, StatusState, TabId, TerminalId,
+            WorkspaceId,
+        },
         extensions,
         resources::{
             MaterializedTokenValue, PaneSnapshot, PresentationTokenAction, Project,
@@ -1421,6 +1463,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn progress_tokens_render_percentages_and_stay_empty_when_indeterminate_or_idle() {
+        let (mut snapshot, focused) = fixture(&["agent"], 0);
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .records
+            .push(StatusRecord {
+                id: String::new(),
+                state: StatusState::Working,
+                kind: None,
+                progress: Some(42),
+                app: Some("codex".into()),
+                title: None,
+                message: None,
+                revision: 1,
+                updated_at_ms: 1,
+                attention_revision: 0,
+            });
+        let model =
+            TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
+        let ui = UiConfig::default();
+        let icons = ui.icons.resolve();
+
+        assert_eq!(
+            tab_token(&model, 0, "tab.progress", 0, &ui, &icons).text,
+            "42%"
+        );
+        assert_eq!(workspace_progress_token(&model).text, "42%");
+        assert_eq!(
+            tab_token(&model, 0, "tab.activity", 0, &ui, &icons).text,
+            "⠋"
+        );
+
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .records[0]
+            .progress = None;
+        let indeterminate =
+            TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
+        assert_eq!(
+            tab_token(&indeterminate, 0, "tab.progress", 0, &ui, &icons).text,
+            ""
+        );
+        assert_eq!(workspace_progress_token(&indeterminate).text, "");
+
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .records[0]
+            .state = StatusState::Idle;
+        let idle =
+            TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
+        assert_eq!(tab_token(&idle, 0, "tab.progress", 0, &ui, &icons).text, "");
+        assert_eq!(workspace_progress_token(&idle).text, "");
+    }
+
+    #[test]
+    fn tab_and_workspace_progress_do_not_follow_the_winning_activity_glyph() {
+        let (mut snapshot, focused) = fixture(&["agent"], 0);
+        let tab = &mut snapshot.sessions[0].workspaces[0].tabs[0];
+        tab.panes[0].activity.records.push(StatusRecord {
+            id: String::new(),
+            state: StatusState::Working,
+            kind: None,
+            progress: Some(40),
+            app: Some("worker".into()),
+            title: None,
+            message: None,
+            revision: 1,
+            updated_at_ms: 1,
+            attention_revision: 0,
+        });
+        let mut completed = tab.panes[0].clone();
+        completed.id = PaneId::new();
+        completed.terminal_id = TerminalId::new();
+        completed.activity.records[0] = StatusRecord {
+            id: String::new(),
+            state: StatusState::Done,
+            kind: None,
+            progress: None,
+            app: Some("worker".into()),
+            title: None,
+            message: None,
+            revision: 2,
+            updated_at_ms: 2,
+            attention_revision: 2,
+        };
+        tab.panes.push(completed);
+
+        let notifications = NotificationState::default();
+        let model = TabBarModel::from_snapshot(&snapshot, &focused, &notifications).unwrap();
+        assert_eq!(model.tabs[0].activity, Some(ActivityIndicator::Completed));
+        assert_eq!(model.tabs[0].progress, Some(40));
+        assert_eq!(model.workspace_progress, Some(40));
+
+        let worker_terminal = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+        let mut notifications = NotificationState::default();
+        notifications.accept_alerts(crate::alerts::ClientAlertSnapshot {
+            revision: 1,
+            terminals: vec![crate::alerts::TerminalAlertSnapshot {
+                terminal_id: worker_terminal,
+                state: crate::alerts::TerminalAlertState {
+                    bell_count: 1,
+                    last_bell_at_ms: 3,
+                },
+                seen: crate::alerts::AlertCursor::default(),
+            }],
+        });
+        let model = TabBarModel::from_snapshot(&snapshot, &focused, &notifications).unwrap();
+        assert_eq!(model.tabs[0].activity, Some(ActivityIndicator::Bell));
+        assert_eq!(model.tabs[0].progress, Some(40));
+        assert_eq!(model.workspace_progress, Some(40));
+
+        let tab = &mut snapshot.sessions[0].workspaces[0].tabs[0];
+        let mut second_worker = tab.panes[0].clone();
+        second_worker.id = PaneId::new();
+        second_worker.terminal_id = TerminalId::new();
+        second_worker.activity.records[0].progress = Some(80);
+        tab.panes.push(second_worker);
+        let model = TabBarModel::from_snapshot(&snapshot, &focused, &notifications).unwrap();
+        assert_eq!(model.tabs[0].activity, Some(ActivityIndicator::Bell));
+        assert_eq!(model.tabs[0].progress, None);
+        assert_eq!(model.workspace_progress, None);
+
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[2]
+            .activity
+            .records[0]
+            .progress = None;
+        let model = TabBarModel::from_snapshot(&snapshot, &focused, &notifications).unwrap();
+        assert_eq!(model.tabs[0].progress, None);
+        assert_eq!(model.workspace_progress, None);
+    }
+
     fn render(names: &[&str], active: usize, width: u16) -> (String, Buffer) {
         let (snapshot, focused) = fixture(names, active);
         let area = Rect::new(0, 0, width, 1);
@@ -1626,7 +1800,22 @@ mod tests {
         snapshot.revision += 1;
         snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
             .activity
-            .integration = Some(AgentIntegration::default());
+            .records
+            .push(StatusRecord {
+                id: String::new(),
+                state: StatusState::Idle,
+                kind: None,
+                progress: None,
+                app: Some("agent".into()),
+                title: None,
+                message: None,
+                revision: 1,
+                updated_at_ms: 1,
+                attention_revision: 0,
+            });
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .source = Some(StatusSource::Osc);
         assert!(state.accept(snapshot.clone()));
         assert_eq!(
             state.sidebar_relevance(&focused, &UiConfig::default()),

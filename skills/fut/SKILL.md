@@ -143,10 +143,13 @@ The inferred form validates the caller's live terminal context. Use ordinary
 `workspace close` when the caller must wait for confirmed process termination;
 use retirement when the caller is itself inside the target being closed.
 
-## Coordinate an integrated agent
+## Inspect program status and coordinate agents
 
-An integrated agent is a terminal that has reported semantic lifecycle state.
-Discover and inspect it without focus changes:
+Fut learns program status primarily from OSC 7501, without a plugin. The
+historical `agent` commands include any explicitly reporting program, not just
+coding agents. CLI adapters are fallbacks that feed the same record model;
+screen-detected terminals do not qualify for agent control. Discover and inspect
+reporters without focus changes:
 
 ```sh
 fut --json agent list
@@ -165,11 +168,17 @@ fut --json agent prompt "$terminal_id" --stdin < detailed-prompt.md
 Prefer `--stdin` for multiline or generated prompts so their contents never
 need to be interpolated into a shell argument.
 
-`prompt --wait` is the fresh-prompt barrier: it requires a new `working` report
-after submission before accepting a later `completed`, `blocked`, or `idle`
-state. Inspect `.result.activity.state`; `blocked` is a successful structured
-outcome, so surface its output or blocker instead of treating exit status zero
-as completion or blindly retrying.
+Status JSON lives under `activity.records`: each record has an `id` (empty for
+root), stored `state` (`idle`, `working`, `done`, `blocked`, `error`), and optional
+`app`, `title`, `message`, `kind`, and `progress`. `activity.source` gives
+provenance. Record summary priority is blocked > error > working > done > idle.
+Do not expect the old `activity.state`, integration, detection, or event fields.
+
+`prompt --wait` is the fresh-prompt barrier: it requires a new `working`
+transition after submission before accepting settled `done`, `blocked`,
+`error`, or `idle`. Inspect `.result.activity.records`; blocked and error are
+successful structured outcomes, so surface the blocker or error and its output
+instead of treating exit status zero as completion or blindly retrying.
 
 Wait for work already in progress separately:
 
@@ -179,24 +188,47 @@ fut --json agent wait "$terminal_id" --timeout 2m
 
 Standalone `agent wait` may return an already settled state immediately. It does
 not establish a fresh prompt barrier. Treat `not_an_agent`, `agent_busy`,
-`agent_timeout`, `agent_events_lagged`, `terminal_exited`, and
+`agent_timeout`, `agent_events_lagged`, `agent_exited`, `terminal_exited`, and
 `input_backlog_full` (the program has stopped reading its input) as typed
-failures.
+failures. A retained older result must not settle fresh work on another
+record; reporting-process exit while its terminal stays alive is `agent_exited`.
 
 ## Report lifecycle from an integration
 
-Only an integration for the process in that terminal should report lifecycle:
+Prefer native OSC 7501 when adding status to a program. For example, from its
+own terminal:
+
+```sh
+printf '\e]7501;state=working:app=demo:progress=40\e\\'
+printf '\e]7501;state=done:app=demo:msg=UmVhZHk=\e\\'
+```
+
+OSC `title` and `msg` values are base64 UTF-8 without control characters. An
+optional `id=build/test` addresses a child record. Every report replaces its
+record completely; repeat fields that should remain. `state=clear` clears all
+records, or a subtree when an id is supplied. A support query
+`OSC 7501 ; ? ST` receives `?:states=idle,working,done,blocked,error:kinds=permission,question,auth`
+with the same terminator and no record contents. Queries are optional.
+
+Only an integration for the process in that terminal should use the CLI fallback:
 
 ```sh
 fut --json agent report idle --terminal-id "$FUT_TERMINAL_ID" --source codex
-fut --json agent report working --terminal-id "$FUT_TERMINAL_ID" --source codex --agent-session-id "$agent_session_id" --turn-id "$turn_id"
-fut --json agent report blocked --terminal-id "$FUT_TERMINAL_ID" --source codex --agent-session-id "$agent_session_id" --turn-id "$turn_id"
-fut --json agent report completed --terminal-id "$FUT_TERMINAL_ID" --source codex --agent-session-id "$agent_session_id" --turn-id "$turn_id"
+fut --json agent report working --terminal-id "$FUT_TERMINAL_ID" --source codex --agent-session-id "$agent_session_id" --progress 40 --app codex
+fut --json agent report blocked --terminal-id "$FUT_TERMINAL_ID" --kind permission --message 'Apply these changes?'
+fut --json agent report completed --terminal-id "$FUT_TERMINAL_ID" --message 'Ready for review'
 ```
 
 Inside Fut, `--terminal-id` may be omitted because `FUT_TERMINAL_ID` is used.
 Do not manufacture reports on behalf of another agent or infer semantic state
 from its screen.
+
+CLI `completed` stores done; `exited` clears the addressed subtree or all
+records. Optional `--id`, `--app`, `--title`, `--message`, `--kind`, and
+`--progress` express full records. CLI text is decoded plain text, not base64.
+Older `--turn-id` is accepted but ignored. Prompt start or automatic process-exit
+cleanup drops transient records, preserving done/error. Reading attention
+quiets notifications daemon-wide without deleting the stored result.
 
 ## Handle alternate-screen programs
 

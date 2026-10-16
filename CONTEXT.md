@@ -2,7 +2,7 @@
 
 ## Mental model
 
-Fut is one terminal multiplexer containing live project sessions. Each session contains one or more logical workspaces, each workspace contains tabs, and each tab contains panes. A workspace is user-defined: it may represent a checkout or worktree, but is not equated with either. Agent activity is metadata on this tree rather than a separate navigation hierarchy.
+Fut is one terminal multiplexer containing live project sessions. Each session contains one or more logical workspaces, each workspace contains tabs, and each tab contains panes. A workspace is user-defined: it may represent a checkout or worktree, but is not equated with either. Program status is metadata on this tree rather than a separate navigation hierarchy.
 
 ```text
 Fut
@@ -100,25 +100,27 @@ The user's machine-local approval for the exact current bytes at a repository re
 
 ### Activity
 
-Current semantic work state associated with a terminal: idle, working, or blocked. It is reported explicitly by an integration or `fut terminal report`; process and terminal inference are planned.
+The terminal's set of Program Status Protocol (OSC 7501) records. Each record has an id (empty for the root), a stored state (`idle`, `working`, `done`, `blocked`, or `error`), and optional app, title, message, blocked kind, and progress. A report replaces its record completely; clear removes its subtree. Missing app identifiers inherit from the nearest current ancestor.
+
+Any program can report through OSC 7501 without a plugin. `fut agent report` and Codex screen inference are fallback producers of the same records, not separate activity models. Records belong to the terminal, independently of primary or alternate screen. A new shell prompt or terminal-process exit drops transient work and blockers. Observed foreground-program and automatic CLI reporter exit removes only that reporter's transient records, not another producer's replacement or unrelated work. Done and error records persist until replaced or cleared.
 
 Activity describes a terminal; it is not itself a pane, tab, workspace, session, or separate navigation area.
 
 ### Attention event
 
-A noteworthy explicit transition: an agent becoming blocked or completing work. Attention is event-based rather than a permanent activity state.
+A record entering blocked, done, or error, or a meaningfully changed blocked request (kind, title, or message). Attention revisions are attached to records so progress-only updates do not create fresh attention and clearing one subtree does not hide another subtree's unread result.
 
 ### Seen
 
-A client-relative record that an attention event has been visited or acknowledged. One client seeing a completion does not erase it for another client.
+A daemon-wide read revision acknowledging attention visited in any attached client. Every client and external reader agrees on unread status. Acknowledging an older revision cannot silence a newer transition, and acknowledgement does not delete the status record.
 
 ### Done
 
-The presentation of an idle terminal with an unseen completion event. Done is derived from activity and seen state rather than stored as an independent terminal state.
+A stored record state indicating that a result is ready. Done survives shell prompts and process exit until replaced or cleared. Reading its attention quiets the completion indicator without changing done to idle.
 
 ### Status rollup
 
-The client-derived summary shown on tabs, workspaces, and navigator rows from descendant activity and attention. Rollups make background work visible in the normal project tree.
+The client-derived summary shown on tabs, workspaces, and navigator rows from descendant status records and unread attention. Record summary priority is blocked, error, working, done, then idle. Visible indicator priority is unread blocked, bell, unread error, unread done, blocked, error, working, then idle. Determinate progress is separate from the activity glyph. Rollups make background work visible in the normal project tree.
 
 ### Presentation token
 

@@ -132,8 +132,35 @@ async fn remote_hello(connection: &mut Connection, hello: RemoteHello) -> Server
 }
 
 #[tokio::test]
-async fn remote_generation_one_supports_unequal_versions_and_optional_omission_over_bridge() {
-    let mut harness = Harness::start("printf 'REMOTE_V1_READY\\r\\n'; while IFS= read -r line; do printf 'ANSWER:%s\\r\\n' \"$line\"; done").await;
+async fn legacy_remote_generation_is_rejected_before_resource_metadata() {
+    let harness = Harness::start("sleep 60").await;
+    let (mut connection, mut bridge) = spawn_bridge(&harness.socket);
+    let mut offer = RemoteHello::new(ClientMode::Control, "0.31.0");
+    offer.generation = 1;
+    offer.required = vec!["metadata.v1".into()];
+    assert_eq!(
+        remote_hello(&mut connection, offer).await,
+        ServerMessage::EndpointError {
+            error: EndpointError::IncompatibleGeneration {
+                client: 1,
+                server: wire::GENERATION,
+            },
+        }
+    );
+    drop(connection);
+    assert!(
+        time::timeout(DEADLINE, bridge.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_generation_two_supports_unequal_versions_and_optional_omission_over_bridge() {
+    let mut harness = Harness::start("printf 'REMOTE_V2_READY\\r\\n'; while IFS= read -r line; do printf 'ANSWER:%s\\r\\n' \"$line\"; done").await;
     let (mut metadata, mut bridge) = spawn_bridge(&harness.socket);
     let mut offer = RemoteHello::new(ClientMode::Control, "0.1.0");
     offer.optional = vec!["unknown-optional.v1".into()];
@@ -142,7 +169,7 @@ async fn remote_generation_one_supports_unequal_versions_and_optional_omission_o
         panic!()
     };
     assert_ne!(offer.client_version, welcome.server_version);
-    assert_eq!(offer.accept(&welcome).unwrap().names(), ["metadata.v1"]);
+    assert_eq!(offer.accept(&welcome).unwrap().names(), ["metadata.v2"]);
     assert!(welcome.extension_catalog.is_none());
     assert!(matches!(
         correlated_command(&mut metadata, ClientMessage::WatchResources).await,
@@ -214,7 +241,7 @@ async fn remote_generation_one_supports_unequal_versions_and_optional_omission_o
         let selected = welcome.selected.unwrap();
         harness.terminal_pid = Some(selected.focused.child_pid);
         let terminal = selected.focused.terminal_id;
-        snapshot_containing(&mut interactive, terminal, "REMOTE_V1_READY").await;
+        snapshot_containing(&mut interactive, terminal, "REMOTE_V2_READY").await;
         let response = correlated_command(
             &mut interactive,
             ClientMessage::WatchAlerts {
@@ -320,7 +347,7 @@ async fn remote_malformed_and_incompatible_handshakes_fail_in_isolation() {
                 EndpointError::MissingRequiredCapability
             }
             3 => {
-                offer.optional.push("metadata.v1".into());
+                offer.optional.push("metadata.v2".into());
                 EndpointError::InvalidHandshake
             }
             4 => {

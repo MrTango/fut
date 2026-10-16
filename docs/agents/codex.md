@@ -39,5 +39,10 @@ The integration reports idle, working, blocked, and completed activity. It does
 not control prompts, permissions, tools, terminal layout, or worktrees, and it
 remains inactive when Codex is running outside Fut.
 
+These CLI fallback reports feed the same records as native OSC 7501; completed
+stores done, rather than deriving completion from an idle state. Turn ids from
+older adapters are ignored. Native OSC-reporting programs need no plugin, and
+screen detection remains a lower-priority fallback.
+
 See [Agent activity](../agents.md) for the sidebar, notifications, screen-based
 fallback detection, and agent automation commands.

@@ -3,6 +3,7 @@
 //! These types deliberately contain no PTY, terminal-emulator, transport, or
 //! presentation-library types.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -395,21 +396,773 @@ impl MouseEvent {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentState {
+pub enum StatusState {
     #[default]
     Idle,
     Working,
+    Done,
     Blocked,
+    Error,
+}
+
+impl StatusState {
+    fn is_active(self) -> bool {
+        matches!(self, Self::Working | Self::Blocked)
+    }
+
+    fn is_result(self) -> bool {
+        matches!(self, Self::Done | Self::Error)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentReport {
-    Idle,
-    Working,
-    Blocked,
-    Completed,
-    Exited,
+pub enum BlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StatusSource {
+    Osc,
+    Report {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_session_id: Option<String>,
+    },
+    Detection {
+        agent: String,
+        rule: String,
+    },
+}
+
+impl StatusSource {
+    fn is_explicit(&self) -> bool {
+        !matches!(self, Self::Detection { .. })
+    }
+}
+
+pub const MAX_STATUS_ID_BYTES: usize = 128;
+pub const MAX_STATUS_ID_SEGMENT_BYTES: usize = 32;
+pub const MAX_STATUS_ID_LEVELS: usize = 8;
+pub const MAX_STATUS_APP_BYTES: usize = 32;
+pub const MAX_STATUS_TITLE_BYTES: usize = 192;
+pub const MAX_STATUS_MESSAGE_BYTES: usize = 2048;
+pub const MAX_STATUS_METADATA_VALUE_BYTES: usize = 128;
+pub const MAX_STATUS_RECORDS: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StatusReport {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub state: StatusState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BlockedKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl StatusReport {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_status_id(&self.id)?;
+        if self.progress.is_some_and(|progress| progress > 100) {
+            return Err("status progress must be between 0 and 100");
+        }
+        if let Some(app) = &self.app
+            && (app.is_empty()
+                || app.len() > MAX_STATUS_APP_BYTES
+                || !app.bytes().all(is_status_identifier_byte))
+        {
+            return Err("invalid status app");
+        }
+        validate_status_text(
+            self.title.as_deref(),
+            MAX_STATUS_TITLE_BYTES,
+            "status title",
+        )?;
+        validate_status_text(
+            self.message.as_deref(),
+            MAX_STATUS_MESSAGE_BYTES,
+            "status message",
+        )?;
+        Ok(())
+    }
+
+    fn normalized(mut self) -> Self {
+        if self.state != StatusState::Blocked {
+            self.kind = None;
+        }
+        if !self.state.is_active() {
+            self.progress = None;
+        }
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum StatusUpdate {
+    Report(StatusReport),
+    Clear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    PromptStart,
+    ProcessExit,
+}
+
+impl StatusUpdate {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Report(report) => report.validate(),
+            Self::Clear { id: Some(id) } => validate_status_id(id),
+            Self::Clear { id: None } | Self::PromptStart | Self::ProcessExit => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StatusRecord {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub state: StatusState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BlockedKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub revision: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attention_revision: u64,
+}
+
+impl StatusRecord {
+    fn report_eq(&self, report: &StatusReport) -> bool {
+        self.id == report.id
+            && self.state == report.state
+            && self.kind == report.kind
+            && self.progress == report.progress
+            && self.app == report.app
+            && self.title == report.title
+            && self.message == report.message
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramStatus {
+    pub records: Vec<StatusRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<StatusSource>,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attention_revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub read_revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub working_revision: u64,
+}
+
+/// Private status state that must survive independently from the public wire
+/// representation. Record provenance determines reporting eligibility while
+/// active explicit IDs form the short-lived lease that suppresses detection.
+#[derive(Clone, Debug)]
+struct StatusOrigin {
+    source: StatusSource,
+    automatic_pid: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StatusBookkeeping {
+    lru: Vec<String>,
+    origins: BTreeMap<String, StatusOrigin>,
+    active_explicit_ids: BTreeSet<String>,
+}
+
+impl ProgramStatus {
+    #[must_use]
+    pub fn root(&self) -> Option<&StatusRecord> {
+        self.records.iter().find(|record| record.id.is_empty())
+    }
+
+    #[must_use]
+    pub fn summary_record(&self) -> Option<&StatusRecord> {
+        self.records.iter().max_by_key(|record| {
+            let priority = match record.state {
+                StatusState::Blocked => 4,
+                StatusState::Error => 3,
+                StatusState::Working => 2,
+                StatusState::Done => 1,
+                StatusState::Idle => 0,
+            };
+            (priority, record.revision, record.updated_at_ms)
+        })
+    }
+
+    #[must_use]
+    pub fn summary_state(&self) -> StatusState {
+        self.summary_record()
+            .map_or(StatusState::Idle, |record| record.state)
+    }
+
+    #[must_use]
+    pub fn progress(&self) -> Option<u8> {
+        if let Some(progress) = self
+            .root()
+            .filter(|record| record.state.is_active())
+            .and_then(|record| record.progress)
+        {
+            return Some(progress);
+        }
+
+        let mut active = self
+            .records
+            .iter()
+            .filter(|record| record.state.is_active());
+        let record = active.next()?;
+        if active.next().is_some() {
+            return None;
+        }
+        record.progress
+    }
+
+    #[must_use]
+    pub fn attention(&self) -> Option<&StatusRecord> {
+        self.records
+            .iter()
+            .filter(|record| {
+                record.attention_revision != 0
+                    && matches!(
+                        record.state,
+                        StatusState::Blocked | StatusState::Done | StatusState::Error
+                    )
+            })
+            .max_by_key(|record| record.attention_revision)
+    }
+
+    #[must_use]
+    pub fn has_unread_attention(&self) -> bool {
+        self.attention()
+            .is_some_and(|record| record.attention_revision > self.read_revision)
+    }
+
+    #[must_use]
+    pub fn is_reporting(&self) -> bool {
+        !self.records.is_empty() && self.source.as_ref().is_some_and(StatusSource::is_explicit)
+    }
+
+    #[must_use]
+    pub fn app<'a>(&'a self, record: &'a StatusRecord) -> Option<&'a str> {
+        if let Some(app) = record.app.as_deref() {
+            return Some(app);
+        }
+        let mut id = record.id.as_str();
+        loop {
+            id = id.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if let Some(app) = self
+                .records
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .and_then(|candidate| candidate.app.as_deref())
+            {
+                return Some(app);
+            }
+            if id.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.summary_record()
+            .and_then(|record| self.app(record))
+            .or(match self.source.as_ref() {
+                Some(StatusSource::Report { source, .. }) => {
+                    source.as_deref().filter(|source| !source.is_empty())
+                }
+                Some(StatusSource::Detection { agent, .. }) => Some(agent.as_str()),
+                Some(StatusSource::Osc) | None => None,
+            })
+    }
+
+    #[must_use]
+    pub fn updated_at_ms(&self) -> u64 {
+        self.records
+            .iter()
+            .map(|record| record.updated_at_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn validate_source(source: &StatusSource) -> Result<(), &'static str> {
+        let values: &[&str] = match source {
+            StatusSource::Osc => &[],
+            StatusSource::Report {
+                source,
+                agent_session_id,
+            } => &[
+                source.as_deref().unwrap_or_default(),
+                agent_session_id.as_deref().unwrap_or_default(),
+            ],
+            StatusSource::Detection { agent, rule } => &[agent, rule],
+        };
+        if values
+            .iter()
+            .any(|value| value.len() > MAX_STATUS_METADATA_VALUE_BYTES || contains_control(value))
+        {
+            return Err("invalid status source metadata");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_updates(
+        &mut self,
+        updates: Vec<StatusUpdate>,
+        source: StatusSource,
+        revision: u64,
+        now_ms: u64,
+    ) -> bool {
+        let mut bookkeeping = StatusBookkeeping::from_status(self);
+        self.apply_updates_with_bookkeeping(
+            updates,
+            Some(source),
+            None,
+            revision,
+            now_ms,
+            &mut bookkeeping,
+        )
+    }
+
+    pub(crate) fn apply_updates_with_bookkeeping(
+        &mut self,
+        updates: Vec<StatusUpdate>,
+        source: Option<StatusSource>,
+        automatic_pid: Option<u32>,
+        revision: u64,
+        now_ms: u64,
+        bookkeeping: &mut StatusBookkeeping,
+    ) -> bool {
+        bookkeeping.sync(self);
+
+        let detection = source
+            .as_ref()
+            .is_some_and(|source| matches!(source, StatusSource::Detection { .. }));
+        if detection && bookkeeping.has_active_explicit() {
+            return false;
+        }
+        let mut changed = false;
+        let mut preferred_source = None;
+        for update in updates {
+            match update {
+                StatusUpdate::Report(mut report) => {
+                    let source = source
+                        .as_ref()
+                        .expect("status reports always have a source");
+                    if !detection {
+                        changed |= self.remove_detection_records(bookkeeping);
+                    }
+                    if detection && report.state == StatusState::Idle {
+                        match self
+                            .records
+                            .iter()
+                            .find(|record| record.id == report.id)
+                            .map(|record| record.state)
+                        {
+                            Some(StatusState::Working) => report.state = StatusState::Done,
+                            Some(StatusState::Done | StatusState::Error) => continue,
+                            Some(StatusState::Idle | StatusState::Blocked) | None => {}
+                        }
+                    }
+                    let id = report.id.clone();
+                    changed |= self.replace_record(
+                        report.normalized(),
+                        revision,
+                        now_ms,
+                        &mut bookkeeping.lru,
+                    );
+                    bookkeeping.origins.insert(
+                        id.clone(),
+                        StatusOrigin {
+                            source: source.clone(),
+                            automatic_pid,
+                        },
+                    );
+                    if !detection {
+                        bookkeeping.active_explicit_ids.insert(id);
+                    }
+                    preferred_source = Some(source.clone());
+                    bookkeeping.sync(self);
+                }
+                StatusUpdate::Clear { id } => {
+                    let removed = self.remove_subtree(id.as_deref(), &mut bookkeeping.lru);
+                    changed |= removed;
+                    bookkeeping.sync(self);
+                }
+                StatusUpdate::PromptStart | StatusUpdate::ProcessExit => {
+                    let before = self.records.len();
+                    self.records.retain(|record| record.state.is_result());
+                    if self.records.len() != before {
+                        changed = true;
+                    }
+                    bookkeeping.active_explicit_ids.clear();
+                    for origin in bookkeeping.origins.values_mut() {
+                        origin.automatic_pid = None;
+                    }
+                    bookkeeping.sync(self);
+                }
+            }
+        }
+
+        let source = bookkeeping.public_source(self, preferred_source.as_ref());
+        if self.source != source {
+            self.source = source;
+            changed = true;
+        }
+        if changed {
+            self.revision = revision;
+        }
+        changed
+    }
+
+    pub(crate) fn release_automatic_pid(
+        &mut self,
+        automatic_pid: u32,
+        revision: u64,
+        bookkeeping: &mut StatusBookkeeping,
+    ) -> bool {
+        bookkeeping.sync(self);
+        let owned_ids = bookkeeping
+            .origins
+            .iter()
+            .filter_map(|(id, origin)| {
+                (origin.automatic_pid == Some(automatic_pid)
+                    && bookkeeping.active_explicit_ids.contains(id))
+                .then_some(id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        if owned_ids.is_empty() {
+            return false;
+        }
+
+        let before = self.records.len();
+        self.records
+            .retain(|record| !owned_ids.contains(&record.id) || record.state.is_result());
+        let mut changed = self.records.len() != before;
+        for id in owned_ids {
+            bookkeeping.active_explicit_ids.remove(&id);
+            if let Some(origin) = bookkeeping.origins.get_mut(&id) {
+                origin.automatic_pid = None;
+            }
+        }
+        bookkeeping.sync(self);
+
+        let source = bookkeeping.public_source(self, None);
+        if self.source != source {
+            self.source = source;
+            changed = true;
+        }
+        if changed {
+            self.revision = revision;
+        }
+        changed
+    }
+
+    fn remove_detection_records(&mut self, bookkeeping: &mut StatusBookkeeping) -> bool {
+        let detection_ids = bookkeeping
+            .origins
+            .iter()
+            .filter_map(|(id, origin)| (!origin.source.is_explicit()).then_some(id.clone()))
+            .collect::<BTreeSet<_>>();
+        if detection_ids.is_empty() {
+            return false;
+        }
+        let before = self.records.len();
+        self.records
+            .retain(|record| !detection_ids.contains(&record.id));
+        let changed = self.records.len() != before;
+        if changed {
+            bookkeeping.sync(self);
+        }
+        changed
+    }
+
+    fn replace_record(
+        &mut self,
+        report: StatusReport,
+        revision: u64,
+        now_ms: u64,
+        lru: &mut Vec<String>,
+    ) -> bool {
+        let existing_index = self
+            .records
+            .iter()
+            .position(|record| record.id == report.id);
+        self.touch_lru(&report.id, lru);
+        if existing_index.is_some_and(|index| self.records[index].report_eq(&report)) {
+            return false;
+        }
+
+        let existing = existing_index.map(|index| self.records.remove(index));
+        let is_new = existing_index.is_none();
+        let previous_state = existing.as_ref().map(|record| record.state);
+        let attention_revision = if matches!(
+            report.state,
+            StatusState::Blocked | StatusState::Done | StatusState::Error
+        ) {
+            match existing.as_ref() {
+                Some(record)
+                    if record.state == report.state
+                        && !(report.state == StatusState::Blocked
+                            && (record.kind != report.kind
+                                || record.title != report.title
+                                || record.message != report.message)) =>
+                {
+                    record.attention_revision
+                }
+                Some(_) | None => revision,
+            }
+        } else {
+            0
+        };
+        if attention_revision == revision {
+            self.attention_revision = revision;
+        }
+        if report.state == StatusState::Working && previous_state != Some(StatusState::Working) {
+            self.working_revision = revision;
+        }
+        let record = StatusRecord {
+            id: report.id,
+            state: report.state,
+            kind: report.kind,
+            progress: report.progress,
+            app: report.app,
+            title: report.title,
+            message: report.message,
+            revision,
+            updated_at_ms: now_ms,
+            attention_revision,
+        };
+        if record.id.is_empty() {
+            self.records.insert(0, record);
+        } else if let Some(index) = existing_index {
+            self.records.insert(index, record);
+        } else {
+            self.records.push(record);
+        }
+        if is_new && self.records.len() > MAX_STATUS_RECORDS {
+            let evicted = lru.remove(0);
+            let index = self
+                .records
+                .iter()
+                .position(|record| record.id == evicted)
+                .expect("LRU record exists");
+            self.records.remove(index);
+        }
+        true
+    }
+
+    fn remove_subtree(&mut self, id: Option<&str>, lru: &mut Vec<String>) -> bool {
+        let id = id.unwrap_or_default();
+        let before = self.records.len();
+        if id.is_empty() {
+            self.records.clear();
+        } else {
+            self.records.retain(|record| {
+                record.id != id
+                    && !record
+                        .id
+                        .strip_prefix(id)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            });
+        }
+        let changed = self.records.len() != before;
+        if changed {
+            self.sync_lru(lru);
+        }
+        changed
+    }
+
+    fn sync_lru(&self, lru: &mut Vec<String>) {
+        lru.retain(|id| self.records.iter().any(|record| record.id == *id));
+        let mut missing = self
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| !lru.contains(&record.id))
+            .collect::<Vec<_>>();
+        missing.sort_by_key(|(index, record)| (record.updated_at_ms, record.revision, *index));
+        lru.extend(missing.into_iter().map(|(_, record)| record.id.clone()));
+    }
+
+    fn touch_lru(&self, id: &str, lru: &mut Vec<String>) {
+        lru.retain(|candidate| candidate != id);
+        lru.push(id.to_owned());
+    }
+}
+
+impl StatusBookkeeping {
+    #[cfg(test)]
+    fn from_status(status: &ProgramStatus) -> Self {
+        let origins = status.source.as_ref().map_or_else(BTreeMap::new, |source| {
+            status
+                .records
+                .iter()
+                .map(|record| {
+                    (
+                        record.id.clone(),
+                        StatusOrigin {
+                            source: source.clone(),
+                            automatic_pid: None,
+                        },
+                    )
+                })
+                .collect()
+        });
+        Self {
+            lru: status
+                .records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect(),
+            origins,
+            active_explicit_ids: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn has_detection(&self) -> bool {
+        self.origins
+            .values()
+            .any(|origin| !origin.source.is_explicit())
+    }
+
+    pub(crate) fn automatic_pids(&self) -> BTreeSet<u32> {
+        self.active_explicit_ids
+            .iter()
+            .filter_map(|id| self.origins.get(id)?.automatic_pid)
+            .collect()
+    }
+
+    fn has_active_explicit(&self) -> bool {
+        !self.active_explicit_ids.is_empty()
+    }
+
+    fn sync(&mut self, status: &ProgramStatus) {
+        status.sync_lru(&mut self.lru);
+        self.origins
+            .retain(|id, _| status.records.iter().any(|record| record.id == *id));
+        self.active_explicit_ids
+            .retain(|id| status.records.iter().any(|record| record.id == *id));
+        if let Some(source) = status.source.as_ref() {
+            for record in &status.records {
+                self.origins
+                    .entry(record.id.clone())
+                    .or_insert_with(|| StatusOrigin {
+                        source: source.clone(),
+                        automatic_pid: None,
+                    });
+            }
+        }
+    }
+
+    fn public_source(
+        &self,
+        status: &ProgramStatus,
+        preferred: Option<&StatusSource>,
+    ) -> Option<StatusSource> {
+        if status.records.is_empty() {
+            return None;
+        }
+        let has_explicit = self
+            .origins
+            .values()
+            .any(|origin| origin.source.is_explicit());
+        let eligible = |origin: &&StatusOrigin| !has_explicit || origin.source.is_explicit();
+        if let Some(preferred) = preferred
+            && self
+                .origins
+                .values()
+                .any(|origin| eligible(&origin) && &origin.source == preferred)
+        {
+            return Some(preferred.clone());
+        }
+        if let Some(current) = status.source.as_ref()
+            && self
+                .origins
+                .values()
+                .any(|origin| eligible(&origin) && &origin.source == current)
+        {
+            return Some(current.clone());
+        }
+        self.lru
+            .iter()
+            .rev()
+            .filter_map(|id| self.origins.get(id))
+            .find(eligible)
+            .map(|origin| origin.source.clone())
+    }
+}
+
+fn validate_status_id(id: &str) -> Result<(), &'static str> {
+    if id.len() > MAX_STATUS_ID_BYTES {
+        return Err("status id is too long");
+    }
+    if id.is_empty() {
+        return Ok(());
+    }
+    let mut levels = 0;
+    for segment in id.split('/') {
+        levels += 1;
+        if segment.is_empty()
+            || segment.len() > MAX_STATUS_ID_SEGMENT_BYTES
+            || !segment.bytes().all(is_status_identifier_byte)
+        {
+            return Err("invalid status id");
+        }
+    }
+    if levels > MAX_STATUS_ID_LEVELS {
+        return Err("status id has too many levels");
+    }
+    Ok(())
+}
+
+fn is_status_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"_.+-".contains(&byte)
+}
+
+fn validate_status_text(
+    value: Option<&str>,
+    maximum: usize,
+    name: &'static str,
+) -> Result<(), &'static str> {
+    if value.is_some_and(|value| value.len() > maximum || contains_control(value)) {
+        return Err(match name {
+            "status title" => "invalid status title",
+            _ => "invalid status message",
+        });
+    }
+    Ok(())
+}
+
+fn contains_control(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| matches!(character as u32, 0x00..=0x1f | 0x7f..=0x9f))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -451,222 +1204,12 @@ pub struct TerminalOutput {
     pub text: String,
 }
 
-/// Optional identity supplied by an agent integration when reporting activity.
-///
-/// These values are descriptive correlation hints, not synchronization keys.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentReportMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
-}
-
-pub const MAX_AGENT_METADATA_VALUE_BYTES: usize = 256;
 /// Prompts are deliberately smaller than the local protocol frame so malformed
 /// callers cannot monopolize the terminal input queue with one message.
 pub const MAX_AGENT_PROMPT_BYTES: usize = 1024 * 1024;
 
-impl AgentReportMetadata {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.source.is_none() && self.agent_session_id.is_none() && self.turn_id.is_none()
-    }
-
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if [&self.source, &self.agent_session_id, &self.turn_id]
-            .into_iter()
-            .flatten()
-            .any(|value| value.len() > MAX_AGENT_METADATA_VALUE_BYTES)
-        {
-            return Err("agent report metadata value is too long");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentIntegration {
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub active: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_session_id: Option<String>,
-}
-
-impl Default for AgentIntegration {
-    fn default() -> Self {
-        Self {
-            active: true,
-            source: None,
-            agent_session_id: None,
-        }
-    }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-const fn is_true(value: &bool) -> bool {
-    *value
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentEvent {
-    pub revision: u64,
-    pub kind: AgentReport,
-    pub occurred_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttentionKind {
-    Blocked,
-    Completed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentAttention {
-    pub revision: u64,
-    pub kind: AttentionKind,
-    pub occurred_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentDetection {
-    pub agent: String,
-    pub rule: String,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct AgentActivity {
-    /// Presence means this terminal has reported through an agent integration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub integration: Option<AgentIntegration>,
-    /// Presence means Fut inferred this activity from the live terminal screen.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detection: Option<AgentDetection>,
-    pub state: AgentState,
-    pub revision: u64,
-    pub updated_at_ms: u64,
-    /// The most recent lifecycle report, including completion events which map
-    /// back to the current idle state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_event: Option<AgentEvent>,
-    /// Latest attention event observed by any client. Read status belongs to
-    /// the daemon so every attached client and external status reader agrees.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub read_revision: u64,
-}
-
 fn is_zero(value: &u64) -> bool {
     *value == 0
-}
-
-impl AgentActivity {
-    /// Whether an integration currently owns this terminal. Exited sessions
-    /// retain inactive integration metadata independently from screen-inferred
-    /// events, and a later explicit report reactivates the terminal.
-    pub fn has_active_integration(&self) -> bool {
-        self.integration
-            .as_ref()
-            .is_some_and(|integration| integration.active)
-    }
-
-    pub fn attention(&self) -> Option<AgentAttention> {
-        let event = self.last_event.as_ref()?;
-        let kind = match event.kind {
-            AgentReport::Blocked => AttentionKind::Blocked,
-            AgentReport::Completed => AttentionKind::Completed,
-            AgentReport::Idle | AgentReport::Working | AgentReport::Exited => return None,
-        };
-        Some(AgentAttention {
-            revision: event.revision,
-            kind,
-            occurred_at_ms: event.occurred_at_ms,
-        })
-    }
-
-    pub fn has_unread_attention(&self) -> bool {
-        self.attention()
-            .is_some_and(|attention| self.read_revision < attention.revision)
-    }
-}
-
-impl<'de> Deserialize<'de> for AgentActivity {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct WireActivity {
-            #[serde(default)]
-            integration: Option<AgentIntegration>,
-            #[serde(default)]
-            detection: Option<AgentDetection>,
-            #[serde(default)]
-            state: AgentState,
-            #[serde(default)]
-            revision: u64,
-            #[serde(default)]
-            updated_at_ms: u64,
-            #[serde(default)]
-            last_event: Option<AgentEvent>,
-            #[serde(default)]
-            attention: Option<AgentAttention>,
-            #[serde(default)]
-            read_revision: u64,
-        }
-
-        let wire = WireActivity::deserialize(deserializer)?;
-        let had_legacy_report =
-            wire.revision != 0 || wire.state != AgentState::Idle || wire.attention.is_some();
-        let has_report =
-            (had_legacy_report && wire.detection.is_none()) || wire.last_event.is_some();
-        let integration = wire
-            .integration
-            .or_else(|| has_report.then(AgentIntegration::default));
-        let last_event = wire.last_event.or_else(|| {
-            (had_legacy_report && wire.detection.is_none()).then(|| {
-                let kind = match wire.attention.filter(|a| a.revision == wire.revision) {
-                    Some(AgentAttention {
-                        kind: AttentionKind::Completed,
-                        ..
-                    }) => AgentReport::Completed,
-                    Some(AgentAttention {
-                        kind: AttentionKind::Blocked,
-                        ..
-                    }) => AgentReport::Blocked,
-                    None => match wire.state {
-                        AgentState::Idle => AgentReport::Idle,
-                        AgentState::Working => AgentReport::Working,
-                        AgentState::Blocked => AgentReport::Blocked,
-                    },
-                };
-                AgentEvent {
-                    revision: wire.revision,
-                    kind,
-                    occurred_at_ms: wire.updated_at_ms,
-                    turn_id: None,
-                }
-            })
-        });
-        Ok(Self {
-            integration,
-            detection: wire.detection,
-            state: wire.state,
-            revision: wire.revision,
-            updated_at_ms: wire.updated_at_ms,
-            last_event,
-            read_revision: wire.read_revision,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1430,70 +1973,372 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_activity_distinguishes_unintegrated_idle_from_integrated_idle() {
-        let unintegrated = AgentActivity::default();
-        assert_eq!(unintegrated.state, AgentState::Idle);
-        assert_eq!(unintegrated.integration, None);
-        assert_eq!(unintegrated.last_event, None);
+    fn program_status_derives_summary_attention_and_inherited_app() {
+        let mut status = ProgramStatus::default();
+        status.apply_updates(
+            vec![
+                StatusUpdate::Report(status_report("", StatusState::Working).with_app("cargo")),
+                StatusUpdate::Report(status_report("tests/unit", StatusState::Blocked)),
+            ],
+            StatusSource::Osc,
+            4,
+            12,
+        );
 
-        let integrated = AgentActivity {
-            integration: Some(AgentIntegration::default()),
-            last_event: Some(AgentEvent {
-                revision: 4,
-                kind: AgentReport::Idle,
-                occurred_at_ms: 12,
-                turn_id: None,
+        assert_eq!(status.root().unwrap().state, StatusState::Working);
+        assert_eq!(status.summary_state(), StatusState::Blocked);
+        assert_eq!(status.app(status.summary_record().unwrap()), Some("cargo"));
+        assert_eq!(status.attention().unwrap().id, "tests/unit");
+        assert!(status.has_unread_attention());
+        assert_eq!(status.working_revision, 4);
+
+        let blocked_attention = status.attention_revision;
+        status.apply_updates(
+            vec![StatusUpdate::Report(StatusReport {
+                progress: Some(50),
+                ..status_report("tests/unit", StatusState::Blocked)
+            })],
+            StatusSource::Osc,
+            5,
+            13,
+        );
+        assert_eq!(status.attention_revision, blocked_attention);
+        assert_eq!(
+            status.attention().unwrap().attention_revision,
+            blocked_attention
+        );
+
+        status.apply_updates(
+            vec![StatusUpdate::Report(StatusReport {
+                progress: Some(60),
+                title: Some("A different request".into()),
+                ..status_report("tests/unit", StatusState::Blocked)
+            })],
+            StatusSource::Osc,
+            6,
+            14,
+        );
+        assert_eq!(status.attention_revision, 6);
+        assert_eq!(status.attention().unwrap().attention_revision, 6);
+
+        status.apply_updates(
+            vec![StatusUpdate::Report(status_report(
+                "tests/unit",
+                StatusState::Done,
+            ))],
+            StatusSource::Osc,
+            7,
+            15,
+        );
+        assert_eq!(status.attention_revision, 7);
+        assert_eq!(status.summary_state(), StatusState::Working);
+
+        status.apply_updates(
+            vec![StatusUpdate::Report(status_report(
+                "failure",
+                StatusState::Error,
+            ))],
+            StatusSource::Osc,
+            8,
+            16,
+        );
+        assert_eq!(status.summary_state(), StatusState::Error);
+
+        status.apply_updates(
+            vec![StatusUpdate::Report(
+                status_report("", StatusState::Working).with_app("next"),
+            )],
+            StatusSource::Osc,
+            9,
+            17,
+        );
+        assert_eq!(status.app(status.records.last().unwrap()), Some("next"));
+        let child = status
+            .records
+            .iter()
+            .find(|record| record.id == "tests/unit")
+            .unwrap();
+        assert_eq!(status.app(child), Some("next"));
+        assert_eq!(status.label(), Some("next"));
+        assert!(status.is_reporting());
+    }
+
+    #[test]
+    fn status_progress_prefers_root_and_avoids_ambiguous_workers() {
+        let mut status = ProgramStatus::default();
+        let mut root = status_report("", StatusState::Working);
+        root.progress = Some(10);
+        let mut child = status_report("child", StatusState::Working);
+        child.progress = Some(90);
+        let mut other_child = status_report("other", StatusState::Working);
+        other_child.progress = Some(70);
+        status.apply_updates(
+            vec![
+                StatusUpdate::Report(child),
+                StatusUpdate::Report(other_child),
+                StatusUpdate::Report(root),
+            ],
+            StatusSource::Osc,
+            1,
+            1,
+        );
+        assert_eq!(status.progress(), Some(10));
+        assert!(
+            status.records[0].id.is_empty(),
+            "root is always exposed first"
+        );
+
+        status.apply_updates(
+            vec![StatusUpdate::Clear { id: None }],
+            StatusSource::Osc,
+            2,
+            2,
+        );
+        let mut first = status_report("first", StatusState::Working);
+        first.progress = Some(30);
+        let mut second = status_report("second", StatusState::Working);
+        second.progress = Some(60);
+        status.apply_updates(
+            vec![StatusUpdate::Report(first), StatusUpdate::Report(second)],
+            StatusSource::Osc,
+            3,
+            3,
+        );
+        assert_eq!(status.progress(), None);
+
+        status.apply_updates(
+            vec![
+                StatusUpdate::Clear { id: None },
+                StatusUpdate::Report(StatusReport {
+                    progress: Some(40),
+                    ..status_report("blocked", StatusState::Blocked)
+                }),
+            ],
+            StatusSource::Osc,
+            4,
+            4,
+        );
+        assert_eq!(
+            status.progress(),
+            Some(40),
+            "a sole non-root blocker can report determinate progress"
+        );
+
+        status.apply_updates(
+            vec![StatusUpdate::Report(StatusReport {
+                progress: Some(30),
+                ..status_report("worker", StatusState::Working)
+            })],
+            StatusSource::Osc,
+            5,
+            5,
+        );
+        assert_eq!(
+            status.progress(),
+            None,
+            "working and blocked records make non-root progress ambiguous"
+        );
+
+        status.apply_updates(
+            vec![
+                StatusUpdate::Clear { id: None },
+                StatusUpdate::Report(StatusReport {
+                    progress: Some(45),
+                    ..status_report("", StatusState::Blocked)
+                }),
+            ],
+            StatusSource::Osc,
+            6,
+            6,
+        );
+        assert_eq!(status.progress(), Some(45));
+
+        status.apply_updates(
+            vec![
+                StatusUpdate::Clear { id: None },
+                StatusUpdate::Report(status_report("old-error", StatusState::Error)),
+                StatusUpdate::Report(StatusReport {
+                    progress: Some(40),
+                    ..status_report("active", StatusState::Working)
+                }),
+            ],
+            StatusSource::Osc,
+            7,
+            7,
+        );
+        assert_eq!(status.summary_state(), StatusState::Error);
+        assert_eq!(status.progress(), Some(40));
+
+        let mut detected = ProgramStatus::default();
+        let mut detected_report = status_report("", StatusState::Working);
+        detected_report.title = Some("not program identity".into());
+        detected_report.message = Some("also not identity".into());
+        detected.apply_updates(
+            vec![StatusUpdate::Report(detected_report)],
+            StatusSource::Detection {
+                agent: "codex".into(),
+                rule: "working_indicator".into(),
+            },
+            1,
+            1,
+        );
+        assert!(!detected.is_reporting());
+        assert_eq!(detected.label(), Some("codex"));
+    }
+
+    #[test]
+    fn status_summary_uses_protocol_priority_then_update_time_and_label_uses_identity() {
+        let mut status = ProgramStatus::default();
+        status.apply_updates(
+            vec![
+                StatusUpdate::Report(status_report("idle", StatusState::Idle)),
+                StatusUpdate::Report(status_report("done", StatusState::Done)),
+                StatusUpdate::Report(status_report("working", StatusState::Working)),
+                StatusUpdate::Report(status_report("error", StatusState::Error)),
+                StatusUpdate::Report(status_report("blocked", StatusState::Blocked)),
+            ],
+            StatusSource::Report {
+                source: Some("manual".into()),
+                agent_session_id: None,
+            },
+            1,
+            10,
+        );
+        assert_eq!(status.summary_record().unwrap().id, "blocked");
+
+        status.apply_updates(
+            vec![StatusUpdate::Clear { id: None }],
+            StatusSource::Osc,
+            2,
+            20,
+        );
+        status.apply_updates(
+            vec![StatusUpdate::Report(StatusReport {
+                title: Some("not identity".into()),
+                ..status_report("newer-time", StatusState::Working)
+            })],
+            StatusSource::Report {
+                source: Some("manual".into()),
+                agent_session_id: None,
+            },
+            3,
+            100,
+        );
+        status.apply_updates(
+            vec![StatusUpdate::Report(status_report(
+                "newer-revision",
+                StatusState::Working,
+            ))],
+            StatusSource::Report {
+                source: Some("manual".into()),
+                agent_session_id: None,
+            },
+            4,
+            50,
+        );
+        assert_eq!(status.summary_record().unwrap().id, "newer-revision");
+        assert_eq!(status.label(), Some("manual"));
+    }
+
+    #[test]
+    fn status_records_are_whole_replacements_and_subtree_clears_have_boundaries() {
+        let mut status = ProgramStatus::default();
+        for index in 0..MAX_STATUS_RECORDS {
+            status.apply_updates(
+                vec![StatusUpdate::Report(
+                    status_report(&format!("r{index}"), StatusState::Idle).with_app("app"),
+                )],
+                StatusSource::Osc,
+                index as u64 + 1,
+                index as u64,
+            );
+        }
+        status.apply_updates(
+            vec![
+                StatusUpdate::Report(status_report("r0", StatusState::Idle)),
+                StatusUpdate::Report(status_report("overflow", StatusState::Idle)),
+            ],
+            StatusSource::Osc,
+            300,
+            300,
+        );
+        assert_eq!(status.records.len(), MAX_STATUS_RECORDS);
+        assert_eq!(
+            status
+                .records
+                .iter()
+                .find(|record| record.id == "r0")
+                .unwrap()
+                .app,
+            None,
+            "a report replaces every optional field"
+        );
+        assert!(!status.records.iter().any(|record| record.id == "r1"));
+
+        status.apply_updates(
+            vec![StatusUpdate::Clear {
+                id: Some("r2".into()),
+            }],
+            StatusSource::Osc,
+            301,
+            301,
+        );
+        assert!(status.records.iter().any(|record| record.id == "r20"));
+    }
+
+    #[test]
+    fn status_validation_enforces_protocol_bounds_and_controls() {
+        assert!(
+            status_report(&"x".repeat(MAX_STATUS_ID_SEGMENT_BYTES), StatusState::Idle)
+                .validate()
+                .is_ok()
+        );
+        assert_eq!(
+            status_report(
+                &"x".repeat(MAX_STATUS_ID_SEGMENT_BYTES + 1),
+                StatusState::Idle
+            )
+            .validate(),
+            Err("invalid status id")
+        );
+        assert_eq!(
+            StatusReport {
+                message: Some("spoof\u{009b}".into()),
+                ..status_report("", StatusState::Done)
+            }
+            .validate(),
+            Err("invalid status message")
+        );
+        assert_eq!(
+            ProgramStatus::validate_source(&StatusSource::Detection {
+                agent: "codex".into(),
+                rule: "bad\nrule".into(),
             }),
-            revision: 4,
-            updated_at_ms: 12,
-            ..AgentActivity::default()
-        };
-        assert_eq!(integrated.state, AgentState::Idle);
-        assert!(integrated.integration.is_some());
+            Err("invalid status source metadata")
+        );
     }
 
-    #[test]
-    fn legacy_agent_activity_infers_presence_and_latest_event() {
-        let working: AgentActivity =
-            serde_json::from_str(r#"{"state":"working","revision":7,"updated_at_ms":20}"#).unwrap();
-        assert!(working.integration.is_some());
-        assert_eq!(working.last_event.unwrap().kind, AgentReport::Working);
-
-        let completed: AgentActivity = serde_json::from_str(
-            r#"{"state":"idle","revision":8,"updated_at_ms":30,"attention":{"revision":8,"kind":"completed","occurred_at_ms":30}}"#,
-        )
-        .unwrap();
-        assert!(completed.integration.is_some());
-        assert_eq!(
-            completed.last_event.as_ref().unwrap().kind,
-            AgentReport::Completed
-        );
-
-        let serialized = serde_json::to_value(&completed).unwrap();
-        assert!(serialized.get("attention").is_none());
-        assert_eq!(serialized["last_event"]["kind"], "completed");
-
-        let never_reported: AgentActivity =
-            serde_json::from_str(r#"{"state":"idle","revision":0,"updated_at_ms":0}"#).unwrap();
-        assert_eq!(never_reported.integration, None);
-        assert_eq!(never_reported.last_event, None);
+    fn status_report(id: &str, state: StatusState) -> StatusReport {
+        StatusReport {
+            id: id.into(),
+            state,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            message: None,
+        }
     }
 
-    #[test]
-    fn agent_report_metadata_is_bounded_per_value() {
-        let accepted = AgentReportMetadata {
-            source: Some("x".repeat(MAX_AGENT_METADATA_VALUE_BYTES)),
-            ..AgentReportMetadata::default()
-        };
-        assert_eq!(accepted.validate(), Ok(()));
-        let rejected = AgentReportMetadata {
-            turn_id: Some("x".repeat(MAX_AGENT_METADATA_VALUE_BYTES + 1)),
-            ..AgentReportMetadata::default()
-        };
-        assert_eq!(
-            rejected.validate(),
-            Err("agent report metadata value is too long")
-        );
+    trait StatusReportTestExt {
+        fn with_app(self, app: &str) -> Self;
+    }
+
+    impl StatusReportTestExt for StatusReport {
+        fn with_app(mut self, app: &str) -> Self {
+            self.app = Some(app.into());
+            self
+        }
     }
 
     #[test]

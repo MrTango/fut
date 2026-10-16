@@ -45,8 +45,8 @@ use crate::{
         run_daemon,
     },
     domain::{
-        AgentActivity, AgentReport, AgentReportMetadata, AgentState, AttentionKind,
-        MAX_AGENT_METADATA_VALUE_BYTES, MAX_TERMINAL_OUTPUT_ROWS, PaneId, SessionId, TabId,
+        BlockedKind, MAX_STATUS_METADATA_VALUE_BYTES, MAX_TERMINAL_OUTPUT_ROWS, PaneId,
+        ProgramStatus, SessionId, StatusReport, StatusSource, StatusState, StatusUpdate, TabId,
         TerminalId, TerminalOutput, TerminalOutputMatcher, TerminalOutputSource, WorkspaceId,
     },
     protocol::{
@@ -561,9 +561,9 @@ enum TerminalCommand {
     },
     /// Report explicit agent state for a terminal.
     Report {
-        /// Agent state or completion event.
+        /// Program status or lifecycle action.
         #[arg(value_enum)]
-        state: AgentReportArg,
+        state: StatusActionArg,
         /// Explicit target for external controllers; otherwise validates FUT_TERMINAL_ID against the reporting process.
         #[arg(long)]
         terminal_id: Option<TerminalId>,
@@ -573,9 +573,27 @@ enum TerminalCommand {
         /// Integration-owned agent session identifier.
         #[arg(long)]
         agent_session_id: Option<String>,
-        /// Integration-owned turn identifier for this report.
-        #[arg(long)]
+        /// Accepted for compatibility with existing integration scripts; ignored.
+        #[arg(long, hide = true)]
         turn_id: Option<String>,
+        /// OSC 7501 record ID; the empty default addresses the root record.
+        #[arg(long, default_value = "")]
+        id: String,
+        /// Program or integration name stored on this record.
+        #[arg(long)]
+        app: Option<String>,
+        /// Short status title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Detailed status message.
+        #[arg(long)]
+        message: Option<String>,
+        /// Why this program is blocked.
+        #[arg(long, value_enum)]
+        kind: Option<BlockedKindArg>,
+        /// Working or blocked progress, from 0 through 100.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        progress: Option<u8>,
     },
 }
 
@@ -776,9 +794,9 @@ enum AgentCommand {
     },
     /// Report explicit lifecycle state for an agent terminal.
     Report {
-        /// Agent state or completion event.
+        /// Program status or lifecycle action.
         #[arg(value_enum)]
-        state: AgentReportArg,
+        state: StatusActionArg,
         /// Explicit target for external controllers; otherwise validates FUT_TERMINAL_ID against the reporting process.
         #[arg(long)]
         terminal_id: Option<TerminalId>,
@@ -788,9 +806,27 @@ enum AgentCommand {
         /// Integration-owned agent session identifier.
         #[arg(long)]
         agent_session_id: Option<String>,
-        /// Integration-owned turn identifier for this report.
-        #[arg(long)]
+        /// Accepted for compatibility with existing integration scripts; ignored.
+        #[arg(long, hide = true)]
         turn_id: Option<String>,
+        /// OSC 7501 record ID; the empty default addresses the root record.
+        #[arg(long, default_value = "")]
+        id: String,
+        /// Program or integration name stored on this record.
+        #[arg(long)]
+        app: Option<String>,
+        /// Short status title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Detailed status message.
+        #[arg(long)]
+        message: Option<String>,
+        /// Why this program is blocked.
+        #[arg(long, value_enum)]
+        kind: Option<BlockedKindArg>,
+        /// Working or blocked progress, from 0 through 100.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        progress: Option<u8>,
     },
     /// Receive a native coding-agent notification.
     Notify {
@@ -808,22 +844,30 @@ enum AgentNotificationSource {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum AgentReportArg {
+enum StatusActionArg {
     Idle,
     Working,
     Blocked,
     Completed,
+    Done,
+    Error,
     Exited,
+    Clear,
 }
 
-impl From<AgentReportArg> for AgentReport {
-    fn from(value: AgentReportArg) -> Self {
+#[derive(Clone, Copy, ValueEnum)]
+enum BlockedKindArg {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl From<BlockedKindArg> for BlockedKind {
+    fn from(value: BlockedKindArg) -> Self {
         match value {
-            AgentReportArg::Idle => Self::Idle,
-            AgentReportArg::Working => Self::Working,
-            AgentReportArg::Blocked => Self::Blocked,
-            AgentReportArg::Completed => Self::Completed,
-            AgentReportArg::Exited => Self::Exited,
+            BlockedKindArg::Permission => Self::Permission,
+            BlockedKindArg::Question => Self::Question,
+            BlockedKindArg::Auth => Self::Auth,
         }
     }
 }
@@ -1697,8 +1741,8 @@ async fn execute(cli: Cli) -> Result<()> {
                         "activity": activity,
                     }),
                     format!(
-                        "agent={terminal_id} submitted=true state={:?} barrier={barrier_revision} working={}",
-                        activity.state,
+                        "agent={terminal_id} submitted=true state={} barrier={barrier_revision} working={}",
+                        status_state_name(activity.summary_state()),
                         working_revision
                             .map_or_else(|| "-".into(), |revision| revision.to_string())
                     ),
@@ -1735,7 +1779,10 @@ async fn execute(cli: Cli) -> Result<()> {
                     "working_revision": working_revision,
                     "activity": activity,
                 }),
-                format!("agent={terminal_id} state={:?}", activity.state),
+                format!(
+                    "agent={terminal_id} state={}",
+                    status_state_name(activity.summary_state())
+                ),
             ),
             other => unexpected(other),
         },
@@ -1795,18 +1842,30 @@ async fn execute(cli: Cli) -> Result<()> {
                     source,
                     agent_session_id,
                     turn_id,
+                    id,
+                    app,
+                    title,
+                    message,
+                    kind,
+                    progress,
                 },
         }) => {
+            let _ = turn_id;
             report_agent_command(
                 &socket,
                 cli.json,
                 "agent.report",
                 state,
                 terminal_id,
-                AgentReportMetadata {
+                ReportFields {
+                    id,
+                    app,
+                    title,
+                    message,
+                    kind: kind.map(Into::into),
+                    progress,
                     source,
                     agent_session_id,
-                    turn_id,
                 },
             )
             .await
@@ -1981,18 +2040,30 @@ async fn execute(cli: Cli) -> Result<()> {
                     source,
                     agent_session_id,
                     turn_id,
+                    id,
+                    app,
+                    title,
+                    message,
+                    kind,
+                    progress,
                 },
         }) => {
+            let _ = turn_id;
             report_agent_command(
                 &socket,
                 cli.json,
                 "terminal.report",
                 state,
                 terminal_id,
-                AgentReportMetadata {
+                ReportFields {
+                    id,
+                    app,
+                    title,
+                    message,
+                    kind: kind.map(Into::into),
+                    progress,
                     source,
                     agent_session_id,
-                    turn_id,
                 },
             )
             .await
@@ -3250,9 +3321,9 @@ async fn report_agent_command(
     socket: &std::path::Path,
     json_output: bool,
     command: &'static str,
-    state: AgentReportArg,
+    state: StatusActionArg,
     terminal_id: Option<TerminalId>,
-    metadata: AgentReportMetadata,
+    fields: ReportFields,
 ) -> Result<()> {
     let explicit_target = terminal_id.is_some();
     let terminal_id = match terminal_id {
@@ -3262,17 +3333,22 @@ async fn report_agent_command(
             .parse()
             .context("FUT_TERMINAL_ID is invalid")?,
     };
+    let source = StatusSource::Report {
+        source: fields.source.clone(),
+        agent_session_id: fields.agent_session_id.clone(),
+    };
+    let report = fields.into_update(state);
     let message = if explicit_target {
         ClientMessage::ReportAgent {
             terminal_id,
-            report: state.into(),
-            metadata: metadata.clone(),
+            report: report.clone(),
+            source: source.clone(),
         }
     } else {
-        ClientMessage::ReportTerminalAgent {
+        ClientMessage::ReportAutomaticAgent {
             terminal_id,
-            report: state.into(),
-            metadata: metadata.clone(),
+            report: report.clone(),
+            source: source.clone(),
         }
     };
     response_ok(
@@ -3284,14 +3360,59 @@ async fn report_agent_command(
         command,
         json!({
             "terminal_id": terminal_id,
-            "state": AgentReport::from(state),
-            "metadata": metadata,
+            "report": report,
+            "source": source,
         }),
-        format!(
-            "agent={terminal_id} state={}",
-            state.to_possible_value().expect("value enum").get_name()
-        ),
+        format!("agent={terminal_id} state={}", report_action_name(state)),
     )
+}
+
+struct ReportFields {
+    id: String,
+    app: Option<String>,
+    title: Option<String>,
+    message: Option<String>,
+    kind: Option<BlockedKind>,
+    progress: Option<u8>,
+    source: Option<String>,
+    agent_session_id: Option<String>,
+}
+
+impl ReportFields {
+    fn into_update(self, action: StatusActionArg) -> StatusUpdate {
+        let state = match action {
+            StatusActionArg::Idle => StatusState::Idle,
+            StatusActionArg::Working => StatusState::Working,
+            StatusActionArg::Blocked => StatusState::Blocked,
+            StatusActionArg::Completed | StatusActionArg::Done => StatusState::Done,
+            StatusActionArg::Error => StatusState::Error,
+            StatusActionArg::Exited | StatusActionArg::Clear => {
+                return StatusUpdate::Clear {
+                    id: (!self.id.is_empty()).then_some(self.id),
+                };
+            }
+        };
+        StatusUpdate::Report(StatusReport {
+            id: self.id,
+            state,
+            kind: self.kind,
+            progress: self.progress,
+            app: self.app,
+            title: self.title,
+            message: self.message,
+        })
+    }
+}
+
+fn report_action_name(action: StatusActionArg) -> &'static str {
+    match action {
+        StatusActionArg::Idle => "idle",
+        StatusActionArg::Working => "working",
+        StatusActionArg::Blocked => "blocked",
+        StatusActionArg::Completed | StatusActionArg::Done => "done",
+        StatusActionArg::Error => "error",
+        StatusActionArg::Exited | StatusActionArg::Clear => "clear",
+    }
 }
 
 async fn receive_agent_notification(
@@ -3309,10 +3430,10 @@ async fn receive_agent_notification(
         return Ok(());
     }
 
-    let metadata = match source {
+    let source = match source {
         AgentNotificationSource::Codex => codex_completion_metadata(payload),
     };
-    let Some(metadata) = metadata else {
+    let Some(source) = source else {
         return Ok(());
     };
     let Ok(socket) = socket_path(socket_override) else {
@@ -3323,10 +3444,18 @@ async fn receive_agent_notification(
         Duration::from_secs(2),
         control(
             &socket,
-            ClientMessage::ReportTerminalAgent {
+            ClientMessage::ReportAutomaticAgent {
                 terminal_id,
-                report: AgentReport::Completed,
-                metadata,
+                report: StatusUpdate::Report(StatusReport {
+                    id: String::new(),
+                    state: StatusState::Done,
+                    kind: None,
+                    progress: None,
+                    app: Some("codex".into()),
+                    title: None,
+                    message: None,
+                }),
+                source,
             },
         ),
     )
@@ -3334,12 +3463,11 @@ async fn receive_agent_notification(
     Ok(())
 }
 
-fn codex_completion_metadata(payload: &str) -> Option<AgentReportMetadata> {
+fn codex_completion_metadata(payload: &str) -> Option<StatusSource> {
     let event = serde_json::from_str::<CodexNotification>(payload).ok()?;
-    (event.kind == "agent-turn-complete").then(|| AgentReportMetadata {
+    (event.kind == "agent-turn-complete").then(|| StatusSource::Report {
         source: Some("codex".into()),
         agent_session_id: bounded_notification_string(event.thread_id),
-        turn_id: bounded_notification_string(event.turn_id),
     })
 }
 
@@ -3350,18 +3478,20 @@ struct CodexNotification {
     #[serde(rename = "thread-id")]
     thread_id: Option<String>,
     #[serde(rename = "turn-id")]
-    turn_id: Option<String>,
+    _turn_id: Option<String>,
 }
 
 fn bounded_notification_string(value: Option<String>) -> Option<String> {
-    value.filter(|value| !value.is_empty() && value.len() <= MAX_AGENT_METADATA_VALUE_BYTES)
+    value.filter(|value| !value.is_empty() && value.len() <= MAX_STATUS_METADATA_VALUE_BYTES)
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct AgentWire<'a> {
-    activity: &'a AgentActivity,
+    activity: &'a ProgramStatus,
+    app: Option<&'a str>,
     available: bool,
     pane_id: PaneId,
+    record: Option<&'a crate::domain::StatusRecord>,
     session: AgentSessionWire<'a>,
     tab: AgentTabWire<'a>,
     terminal_id: TerminalId,
@@ -3371,14 +3501,22 @@ struct AgentWire<'a> {
 
 impl<'a> From<PanePathRef<'a>> for AgentWire<'a> {
     fn from(path: PanePathRef<'a>) -> Self {
+        let record = path.pane.activity.summary_record();
         Self {
             activity: &path.pane.activity,
+            app: path.pane.activity.label(),
             available: !path.session.closing
                 && !path.workspace.closing
                 && !path.tab.closing
                 && !path.pane.closing
-                && path.pane.activity.state != AgentState::Working,
+                && !path
+                    .pane
+                    .activity
+                    .records
+                    .iter()
+                    .any(|record| record.state == StatusState::Working),
             pane_id: path.pane.id,
+            record,
             session: AgentSessionWire {
                 id: path.session.id,
                 name: &path.session.name,
@@ -3440,7 +3578,7 @@ struct AgentReadWire<'a> {
 fn integrated_agents(snapshot: &ResourceSnapshot) -> impl Iterator<Item = AgentWire<'_>> {
     snapshot
         .pane_paths()
-        .filter(|path| path.pane.activity.has_active_integration())
+        .filter(|path| path.pane.activity.is_reporting())
         .map(Into::into)
 }
 
@@ -3456,7 +3594,7 @@ fn resolve_agent<'a>(
             CliError::new("not_found", format!("terminal {terminal_id} was not found")).into(),
         );
     };
-    if !path.pane.activity.has_active_integration() {
+    if !path.pane.activity.is_reporting() {
         Err(CliError::new(
             "not_an_agent",
             format!("terminal {terminal_id} has no agent integration"),
@@ -3467,26 +3605,59 @@ fn resolve_agent<'a>(
     }
 }
 
-fn agent_state_name(state: AgentState) -> &'static str {
+fn status_state_name(state: StatusState) -> &'static str {
     match state {
-        AgentState::Idle => "idle",
-        AgentState::Working => "working",
-        AgentState::Blocked => "blocked",
+        StatusState::Idle => "idle",
+        StatusState::Working => "working",
+        StatusState::Done => "done",
+        StatusState::Blocked => "blocked",
+        StatusState::Error => "error",
     }
 }
 
 fn render_agent(agent: &AgentWire<'_>) -> String {
+    let record = agent.record;
+    let sanitize = |value: Option<&str>| {
+        value
+            .map(client::sanitize_display_text)
+            .unwrap_or_else(|| "-".into())
+    };
     format!(
-        "agent={} state={} available={} unread={} session={} workspace={} tab={} pane={}",
+        "agent={} state={} available={} unread={} app={} id={} kind={} progress={} title={} message={} session={} workspace={} tab={} pane={}",
         agent.terminal_id,
-        agent_state_name(agent.activity.state),
+        status_state_name(agent.activity.summary_state()),
         agent.available,
         agent.unread,
+        sanitize(agent.app),
+        record.map_or("-", |record| {
+            if record.id.is_empty() {
+                "<root>"
+            } else {
+                &record.id
+            }
+        }),
+        record
+            .and_then(|record| record.kind)
+            .map_or("-", blocked_kind_name),
+        agent
+            .activity
+            .progress()
+            .map_or_else(|| "-".into(), |progress| progress.to_string()),
+        sanitize(record.and_then(|record| record.title.as_deref())),
+        sanitize(record.and_then(|record| record.message.as_deref())),
         agent.session.id,
         agent.workspace.id,
         agent.tab.id,
         agent.pane_id,
     )
+}
+
+fn blocked_kind_name(kind: BlockedKind) -> &'static str {
+    match kind {
+        BlockedKind::Permission => "permission",
+        BlockedKind::Question => "question",
+        BlockedKind::Auth => "auth",
+    }
 }
 
 fn reject_interactive_json(cli: &Cli) -> Result<()> {
@@ -4534,10 +4705,14 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
                     }));
                 }
                 for pane in &tab.panes {
+                    let summary_record = pane.activity.summary_record();
                     let pane_json = json!({
                         "id": pane.id,
                         "closing": pane.closing,
                         "activity": pane.activity,
+                        "app": pane.activity.label(),
+                        "record": summary_record,
+                        "state": pane.activity.summary_state(),
                     });
                     let terminal_json = json!({ "id": pane.terminal_id });
                     if pane.id.uuid() == id {
@@ -4584,14 +4759,14 @@ fn render_discovered_target(revision: u64, target: &serde_json::Value) -> String
             .unwrap_or("-")
     };
     format!(
-        "revision={revision} kind={} session={} workspace={} tab={} pane={} terminal={} activity={}",
+        "revision={revision} kind={} session={} workspace={} tab={} pane={} terminal={} state={}",
         field("/kind"),
         field("/session/id"),
         field("/workspace/id"),
         field("/tab/id"),
         field("/pane/id"),
         field("/terminal/id"),
-        field("/pane/activity/state"),
+        field("/pane/state"),
     )
 }
 
@@ -4715,32 +4890,42 @@ fn resource_line<'a>(
     closing: bool,
     panes: impl IntoIterator<Item = &'a PaneSnapshot>,
 ) -> String {
-    let marker = if closing {
-        "×"
-    } else {
-        activity_marker(panes)
-    };
+    let marker = if closing { "×" } else { status_marker(panes) };
     format!("{}{marker} {label}", "  ".repeat(depth))
 }
 
-fn activity_marker<'a>(panes: impl IntoIterator<Item = &'a PaneSnapshot>) -> &'static str {
+fn status_marker<'a>(panes: impl IntoIterator<Item = &'a PaneSnapshot>) -> &'static str {
+    let mut unread_blocked = false;
+    let mut unread_completed = false;
+    let mut unread_error = false;
     let mut blocked = false;
-    let mut completed = false;
+    let mut error = false;
     let mut working = false;
     for pane in panes {
-        let attention = pane
+        for record in pane
             .activity
-            .attention()
-            .filter(|_| pane.activity.has_unread_attention());
-        blocked |= pane.activity.state == AgentState::Blocked
-            || attention.is_some_and(|attention| attention.kind == AttentionKind::Blocked);
-        completed |= attention.is_some_and(|attention| attention.kind == AttentionKind::Completed);
-        working |= pane.activity.state == AgentState::Working;
+            .records
+            .iter()
+            .filter(|record| record.attention_revision > pane.activity.read_revision)
+        {
+            unread_blocked |= record.state == StatusState::Blocked;
+            unread_error |= record.state == StatusState::Error;
+            unread_completed |= record.state == StatusState::Done;
+        }
+        blocked |= pane.activity.summary_state() == StatusState::Blocked;
+        error |= pane.activity.summary_state() == StatusState::Error;
+        working |= pane.activity.summary_state() == StatusState::Working;
     }
-    if blocked {
+    if unread_blocked {
         "!"
-    } else if completed {
+    } else if unread_error {
+        "×"
+    } else if unread_completed {
         "•"
+    } else if blocked {
+        "!"
+    } else if error {
+        "×"
     } else if working {
         "⠋"
     } else {
@@ -4927,11 +5112,8 @@ mod tests {
             config: crate::protocol::ExtensionCatalogConfig::default(),
         }
     }
-    use crate::{
-        domain::AgentIntegration,
-        resources::{
-            PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
-        },
+    use crate::resources::{
+        PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
     };
 
     fn agent_fixture() -> ResourceSnapshot {
@@ -4940,6 +5122,24 @@ mod tests {
         let tab_id = "33333333-3333-3333-3333-333333333333".parse().unwrap();
         let pane_id = "44444444-4444-4444-4444-444444444444".parse().unwrap();
         let terminal_id = "55555555-5555-5555-5555-555555555555".parse().unwrap();
+        let mut activity = ProgramStatus::default();
+        activity.apply_updates(
+            vec![StatusUpdate::Report(StatusReport {
+                id: String::new(),
+                state: StatusState::Blocked,
+                kind: Some(BlockedKind::Permission),
+                progress: Some(60),
+                app: Some("codex".into()),
+                title: Some("Review".into()),
+                message: Some("Approve command".into()),
+            })],
+            StatusSource::Report {
+                source: Some("codex".into()),
+                agent_session_id: None,
+            },
+            9,
+            1234,
+        );
         ResourceSnapshot {
             revision: 42,
             sessions: vec![SessionSnapshot {
@@ -4969,18 +5169,7 @@ mod tests {
                             terminal_id,
                             closing: false,
                             tokens: Default::default(),
-                            activity: AgentActivity {
-                                integration: Some(AgentIntegration {
-                                    source: Some("codex".into()),
-                                    ..AgentIntegration::default()
-                                }),
-                                detection: None,
-                                state: AgentState::Blocked,
-                                revision: 9,
-                                updated_at_ms: 1234,
-                                last_event: None,
-                                read_revision: 0,
-                            },
+                            activity,
                             cwd: None,
                             worktree: None,
                         }],
@@ -5140,14 +5329,14 @@ mod tests {
             result: AgentListWire {
                 agents,
                 revision: snapshot.revision,
-                unread_count: 0,
+                unread_count: 1,
             },
             version: 1,
         })
         .unwrap();
         assert_eq!(
             list,
-            r#"{"command":"agent.list","result":{"agents":[{"activity":{"integration":{"source":"codex"},"state":"blocked","revision":9,"updated_at_ms":1234},"available":true,"pane_id":"44444444-4444-4444-4444-444444444444","session":{"id":"11111111-1111-1111-1111-111111111111","name":"session"},"tab":{"id":"33333333-3333-3333-3333-333333333333","name":"tab"},"terminal_id":"55555555-5555-5555-5555-555555555555","unread":false,"workspace":{"id":"22222222-2222-2222-2222-222222222222","name":"workspace","root":"/project"}}],"revision":42,"unread_count":0},"version":1}"#
+            r#"{"command":"agent.list","result":{"agents":[{"activity":{"records":[{"state":"blocked","kind":"permission","progress":60,"app":"codex","title":"Review","message":"Approve command","revision":9,"updated_at_ms":1234,"attention_revision":9}],"source":{"type":"report","source":"codex"},"revision":9,"attention_revision":9},"app":"codex","available":true,"pane_id":"44444444-4444-4444-4444-444444444444","record":{"state":"blocked","kind":"permission","progress":60,"app":"codex","title":"Review","message":"Approve command","revision":9,"updated_at_ms":1234,"attention_revision":9},"session":{"id":"11111111-1111-1111-1111-111111111111","name":"session"},"tab":{"id":"33333333-3333-3333-3333-333333333333","name":"tab"},"terminal_id":"55555555-5555-5555-5555-555555555555","unread":true,"workspace":{"id":"22222222-2222-2222-2222-222222222222","name":"workspace","root":"/project"}}],"revision":42,"unread_count":1},"version":1}"#
         );
 
         let agent = resolve_agent(
@@ -5155,6 +5344,23 @@ mod tests {
             "55555555-5555-5555-5555-555555555555".parse().unwrap(),
         )
         .unwrap();
+        let human = render_agent(&agent);
+        for expected in [
+            "state=blocked",
+            "available=true",
+            "unread=true",
+            "app=codex",
+            "id=<root>",
+            "kind=permission",
+            "progress=60",
+            "title=Review",
+            "message=Approve command",
+        ] {
+            assert!(
+                human.contains(expected),
+                "missing {expected:?} in {human:?}"
+            );
+        }
         let get = serde_json::to_string(&OutputEnvelope {
             command: "agent.get",
             result: AgentGetWire {
@@ -5166,7 +5372,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             get,
-            r#"{"command":"agent.get","result":{"agent":{"activity":{"integration":{"source":"codex"},"state":"blocked","revision":9,"updated_at_ms":1234},"available":true,"pane_id":"44444444-4444-4444-4444-444444444444","session":{"id":"11111111-1111-1111-1111-111111111111","name":"session"},"tab":{"id":"33333333-3333-3333-3333-333333333333","name":"tab"},"terminal_id":"55555555-5555-5555-5555-555555555555","unread":false,"workspace":{"id":"22222222-2222-2222-2222-222222222222","name":"workspace","root":"/project"}},"revision":42},"version":1}"#
+            r#"{"command":"agent.get","result":{"agent":{"activity":{"records":[{"state":"blocked","kind":"permission","progress":60,"app":"codex","title":"Review","message":"Approve command","revision":9,"updated_at_ms":1234,"attention_revision":9}],"source":{"type":"report","source":"codex"},"revision":9,"attention_revision":9},"app":"codex","available":true,"pane_id":"44444444-4444-4444-4444-444444444444","record":{"state":"blocked","kind":"permission","progress":60,"app":"codex","title":"Review","message":"Approve command","revision":9,"updated_at_ms":1234,"attention_revision":9},"session":{"id":"11111111-1111-1111-1111-111111111111","name":"session"},"tab":{"id":"33333333-3333-3333-3333-333333333333","name":"tab"},"terminal_id":"55555555-5555-5555-5555-555555555555","unread":true,"workspace":{"id":"22222222-2222-2222-2222-222222222222","name":"workspace","root":"/project"}},"revision":42},"version":1}"#
         );
     }
 
@@ -5181,44 +5387,166 @@ mod tests {
         snapshot.sessions[0].closing = false;
         snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
             .activity
-            .state = AgentState::Working;
+            .apply_updates(
+                vec![StatusUpdate::Report(StatusReport {
+                    id: String::new(),
+                    state: StatusState::Working,
+                    kind: None,
+                    progress: Some(42),
+                    app: Some("codex".into()),
+                    title: None,
+                    message: None,
+                })],
+                StatusSource::Osc,
+                10,
+                1235,
+            );
         assert!(!resolve_agent(&snapshot, terminal_id).unwrap().available);
 
         snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
             .activity
-            .last_event = Some(crate::domain::AgentEvent {
-            revision: 10,
-            kind: AgentReport::Exited,
-            occurred_at_ms: 1235,
-            turn_id: None,
-        });
-        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
-            .activity
-            .integration
-            .as_mut()
-            .unwrap()
-            .active = false;
+            .apply_updates(
+                vec![StatusUpdate::Clear { id: None }],
+                StatusSource::Osc,
+                11,
+                1236,
+            );
         assert!(integrated_agents(&snapshot).next().is_none());
         let error = resolve_agent(&snapshot, terminal_id).unwrap_err();
         assert_eq!(
             error.downcast_ref::<CliError>().unwrap().code,
             "not_an_agent"
         );
-
-        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
-            .activity
-            .last_event = None;
-        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
-            .activity
-            .integration = None;
-        let error = resolve_agent(&snapshot, terminal_id).unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<CliError>().unwrap().code,
-            "not_an_agent"
-        );
-
         let error = resolve_agent(&snapshot, TerminalId::new()).unwrap_err();
         assert_eq!(error.downcast_ref::<CliError>().unwrap().code, "not_found");
+    }
+
+    #[test]
+    fn agent_projection_is_busy_when_any_record_is_working() {
+        let mut snapshot = agent_fixture();
+        let terminal_id = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+        let activity = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        activity.apply_updates(
+            vec![
+                StatusUpdate::Report(StatusReport {
+                    id: String::new(),
+                    state: StatusState::Error,
+                    kind: None,
+                    progress: None,
+                    app: Some("codex".into()),
+                    title: None,
+                    message: Some("old failure".into()),
+                }),
+                StatusUpdate::Report(StatusReport {
+                    id: "child".into(),
+                    state: StatusState::Working,
+                    kind: None,
+                    progress: Some(40),
+                    app: None,
+                    title: None,
+                    message: None,
+                }),
+            ],
+            StatusSource::Osc,
+            10,
+            1235,
+        );
+
+        assert_eq!(activity.summary_state(), StatusState::Error);
+        let agent = resolve_agent(&snapshot, terminal_id).unwrap();
+        assert!(!agent.available);
+        let human = render_agent(&agent);
+        assert!(human.contains("state=error"), "{human}");
+        assert!(human.contains("progress=40"), "{human}");
+    }
+
+    #[test]
+    fn human_agent_output_sanitizes_bidi_text_and_uses_the_program_label() {
+        let mut snapshot = agent_fixture();
+        let activity = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        activity.records[0].app = None;
+        activity.records[0].title = Some("safe\u{202e}title".into());
+        activity.records[0].message = Some("safe\u{2066}message".into());
+        activity.source = Some(StatusSource::Report {
+            source: Some("driver\u{200f}".into()),
+            agent_session_id: None,
+        });
+        let agent = integrated_agents(&snapshot).next().unwrap();
+
+        assert_eq!(agent.app, Some("driver\u{200f}"));
+        let human = render_agent(&agent);
+        assert!(human.contains("app=driver�"), "{human:?}");
+        assert!(human.contains("title=safe�title"), "{human:?}");
+        assert!(human.contains("message=safe�message"), "{human:?}");
+        assert!(!human.contains('\u{202e}'));
+        assert!(!human.contains('\u{2066}'));
+
+        let json = serde_json::to_value(agent).unwrap();
+        assert_eq!(json["app"], "driver\u{200f}");
+        assert_eq!(json["record"]["title"], "safe\u{202e}title");
+        assert_eq!(json["record"]["message"], "safe\u{2066}message");
+    }
+
+    #[test]
+    fn source_only_program_identity_matches_agent_and_general_get_projections() {
+        let mut snapshot = agent_fixture();
+        let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
+        pane.activity.records[0].app = None;
+        pane.activity.source = Some(StatusSource::Report {
+            source: Some("source-only".into()),
+            agent_session_id: None,
+        });
+        let pane_id = pane.id;
+        let terminal_id = pane.terminal_id;
+
+        let agent = resolve_agent(&snapshot, terminal_id).unwrap();
+        let target = discover_target(&snapshot, pane_id.uuid()).unwrap();
+
+        assert_eq!(agent.app, Some("source-only"));
+        assert_eq!(target["pane"]["app"], "source-only");
+    }
+
+    #[test]
+    fn resource_marker_scans_all_unread_records_before_stored_state() {
+        let mut snapshot = agent_fixture();
+        let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
+        pane.activity.records = vec![
+            crate::domain::StatusRecord {
+                id: "old-blocker".into(),
+                state: StatusState::Blocked,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                message: None,
+                revision: 4,
+                updated_at_ms: 4,
+                attention_revision: 4,
+            },
+            crate::domain::StatusRecord {
+                id: "new-result".into(),
+                state: StatusState::Done,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                message: None,
+                revision: 5,
+                updated_at_ms: 5,
+                attention_revision: 5,
+            },
+        ];
+        pane.activity.read_revision = 0;
+        assert_eq!(status_marker([&*pane]), "!");
+
+        pane.activity.read_revision = 4;
+        assert_eq!(status_marker([&*pane]), "•");
+        pane.activity.read_revision = 5;
+        assert_eq!(status_marker([&*pane]), "!");
+
+        pane.activity.records[0].state = StatusState::Error;
+        pane.activity.records[0].attention_revision = 6;
+        assert_eq!(status_marker([&*pane]), "×");
     }
 
     #[test]
@@ -5459,9 +5787,21 @@ mod tests {
                 "fut",
                 "agent",
                 "report",
-                "working",
+                "blocked",
                 "--terminal-id",
                 &terminal,
+                "--id",
+                "task/build",
+                "--app",
+                "codex",
+                "--title",
+                "Approval",
+                "--message",
+                "Allow command",
+                "--kind",
+                "permission",
+                "--progress",
+                "40",
                 "--source",
                 "codex",
                 "--agent-session-id",
@@ -5484,6 +5824,20 @@ mod tests {
             vec!["fut", "daemon", "shutdown", "--force"],
         ] {
             Cli::try_parse_from(args).unwrap();
+        }
+
+        for action in [
+            "idle",
+            "working",
+            "blocked",
+            "completed",
+            "done",
+            "error",
+            "exited",
+            "clear",
+        ] {
+            Cli::try_parse_from(["fut", "agent", "report", action, "--terminal-id", &terminal])
+                .unwrap();
         }
     }
 
@@ -5511,13 +5865,17 @@ mod tests {
 
     #[test]
     fn codex_completion_notification_maps_supported_payloads_only() {
-        let metadata = codex_completion_metadata(
+        let source = codex_completion_metadata(
             r#"{"type":"agent-turn-complete","thread-id":"session-1","turn-id":"turn-1"}"#,
         )
         .unwrap();
-        assert_eq!(metadata.source.as_deref(), Some("codex"));
-        assert_eq!(metadata.agent_session_id.as_deref(), Some("session-1"));
-        assert_eq!(metadata.turn_id.as_deref(), Some("turn-1"));
+        assert!(matches!(
+            source,
+            StatusSource::Report {
+                source: Some(source),
+                agent_session_id: Some(session),
+            } if source == "codex" && session == "session-1"
+        ));
 
         assert!(codex_completion_metadata("not-json").is_none());
         assert!(codex_completion_metadata(r#"{"type":"approval-requested"}"#).is_none());
@@ -5525,13 +5883,17 @@ mod tests {
             codex_completion_metadata(
                 &json!({
                     "type": "agent-turn-complete",
-                    "turn-id": "x".repeat(MAX_AGENT_METADATA_VALUE_BYTES + 1),
+                    "thread-id": "x".repeat(MAX_STATUS_METADATA_VALUE_BYTES + 1),
                 })
                 .to_string()
             )
-            .unwrap()
-            .turn_id
-            .is_none()
+            .is_some_and(|source| matches!(
+                source,
+                StatusSource::Report {
+                    agent_session_id: None,
+                    ..
+                }
+            ))
         );
     }
 

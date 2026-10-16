@@ -23,7 +23,7 @@ use super::dialog::{
 use super::federation::{Generation, MachineId, State as FederationState, Status as MachineStatus};
 use super::fuzzy;
 use super::navigation::NavigationHistory;
-use super::notifications::{ActivityIndicator, NotificationState};
+use super::notifications::{ActivityIndicator, NotificationState, activity_priority};
 
 const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 30;
@@ -237,7 +237,9 @@ impl NavigatorState {
             let mut notifications = NotificationState::default();
             if machine == active {
                 notifications = active_notifications.clone();
-            } else if let Some(alerts) = endpoint.metadata.alerts.as_ref() {
+            } else if let Some(alerts) = endpoint.metadata.alerts.as_ref().filter(|alerts| {
+                resources.is_some_and(|resources| alerts.generation == resources.generation)
+            }) {
                 notifications.accept_alerts(alerts.value.clone());
             }
             let mut machine_rows = resources.map_or_else(Vec::new, |resources| {
@@ -911,15 +913,6 @@ fn machine_uuid(machine: MachineId) -> Uuid {
     }
 }
 
-fn activity_priority(activity: ActivityIndicator) -> u8 {
-    match activity {
-        ActivityIndicator::Bell => 4,
-        ActivityIndicator::Blocked => 3,
-        ActivityIndicator::Completed => 2,
-        ActivityIndicator::Working => 1,
-    }
-}
-
 fn row_identity(row: &NavigatorRow) -> (MachineId, bool, ResourceKey) {
     (row.machine, row.machine_header, row.key)
 }
@@ -1134,15 +1127,15 @@ fn flatten_optional(
             destination: (!session.closing)
                 .then(|| history.session_destination(session))
                 .flatten(),
-            activity: notifications.indicator(
-                &session
-                    .workspaces
-                    .iter()
-                    .flat_map(|workspace| &workspace.tabs)
-                    .flat_map(|tab| &tab.panes)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            ),
+            activity: notifications
+                .rollup(
+                    session
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| &workspace.tabs)
+                        .flat_map(|tab| &tab.panes),
+                )
+                .indicator,
             open_elsewhere: false,
         });
         let mut workspace_ancestry = Vec::<String>::new();
@@ -1173,14 +1166,9 @@ fn flatten_optional(
                 destination: (!closing)
                     .then(|| history.workspace_destination(workspace))
                     .flatten(),
-                activity: notifications.indicator(
-                    &workspace
-                        .tabs
-                        .iter()
-                        .flat_map(|tab| &tab.panes)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                ),
+                activity: notifications
+                    .rollup(workspace.tabs.iter().flat_map(|tab| &tab.panes))
+                    .indicator,
                 open_elsewhere: false,
             });
             for (tab_index, tab) in workspace.tabs.iter().enumerate() {
@@ -1215,7 +1203,7 @@ fn flatten_optional(
                     destination: (!tab_row_closing)
                         .then(|| history.tab_destination(tab))
                         .flatten(),
-                    activity: notifications.indicator(&tab.panes),
+                    activity: notifications.rollup(tab.panes.iter()).indicator,
                     open_elsewhere: false,
                 });
                 if single_pane.is_some() {
@@ -1260,8 +1248,11 @@ fn put(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style
 mod tests {
     use super::*;
     use crate::{
-        client::federation::{EndpointSpec, Generation, State as FederationState, Status},
-        domain::TerminalId,
+        alerts::{ClientAlertSnapshot, TerminalAlertSnapshot},
+        client::federation::{
+            EndpointSpec, Generation, Snapshot, State as FederationState, Status,
+        },
+        domain::{ProgramStatus, StatusRecord, StatusSource, StatusState, TerminalId},
         machines::Machine,
         resources::{
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
@@ -1328,6 +1319,135 @@ mod tests {
         for (width, height) in [(1, 1), (8, 3), (16, 4)] {
             let _ = rendered(&mut navigator, width, height);
         }
+    }
+
+    #[test]
+    fn federated_rows_pair_cached_alerts_with_their_resource_generation() {
+        let (mut snapshot, current, _) = fixture();
+        let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
+        let terminal_id = pane.terminal_id;
+        pane.activity = ProgramStatus {
+            records: vec![StatusRecord {
+                id: String::new(),
+                state: StatusState::Working,
+                kind: None,
+                progress: None,
+                app: Some("agent".into()),
+                title: None,
+                message: None,
+                revision: 1,
+                updated_at_ms: 1,
+                attention_revision: 0,
+            }],
+            source: Some(StatusSource::Osc),
+            revision: 1,
+            ..ProgramStatus::default()
+        };
+        let machine = Machine {
+            id: Uuid::new_v4(),
+            label: "remote".into(),
+            target: "remote.example".into(),
+            enabled: true,
+        };
+        let remote = MachineId::Ssh(machine.id);
+        let generation = Generation {
+            supervisor: 1,
+            connection: 2,
+        };
+        let previous = Generation {
+            connection: 1,
+            ..generation
+        };
+        let mut state = FederationState::fixture(vec![
+            (
+                EndpointSpec::Local,
+                Status::Ready,
+                Generation::default(),
+                Some(snapshot.clone()),
+            ),
+            (
+                EndpointSpec::Ssh(machine),
+                Status::Ready,
+                generation,
+                Some(snapshot),
+            ),
+        ]);
+        state.fixture_metadata_mut(remote).alerts = Some(Snapshot {
+            generation: previous,
+            value: ClientAlertSnapshot {
+                revision: 1,
+                terminals: vec![TerminalAlertSnapshot {
+                    terminal_id,
+                    state: crate::alerts::TerminalAlertState {
+                        bell_count: 1,
+                        last_bell_at_ms: 20,
+                    },
+                    seen: crate::alerts::AlertCursor::default(),
+                }],
+            },
+        });
+        let mut navigator = NavigatorState::open();
+        let notifications = NotificationState::default();
+        let remote_pane_activity = |navigator: &NavigatorState| {
+            navigator
+                .rows
+                .iter()
+                .find(|row| row.machine == remote && row.key == ResourceKey::Pane(current.pane_id))
+                .and_then(|row| row.activity)
+        };
+
+        navigator.accept_federation(
+            &state,
+            MachineId::Local,
+            &current,
+            &NavigationHistory::default(),
+            &notifications,
+        );
+        assert_eq!(
+            remote_pane_activity(&navigator),
+            Some(ActivityIndicator::Working),
+            "alerts from another generation must not hide current status"
+        );
+
+        state
+            .fixture_metadata_mut(remote)
+            .alerts
+            .as_mut()
+            .unwrap()
+            .generation = generation;
+        navigator.accept_federation(
+            &state,
+            MachineId::Local,
+            &current,
+            &NavigationHistory::default(),
+            &notifications,
+        );
+        assert_eq!(
+            remote_pane_activity(&navigator),
+            Some(ActivityIndicator::Bell)
+        );
+
+        let metadata = state.fixture_metadata_mut(remote);
+        metadata.resources.as_mut().unwrap().generation = previous;
+        metadata.alerts.as_mut().unwrap().generation = previous;
+        navigator.accept_federation(
+            &state,
+            MachineId::Local,
+            &current,
+            &NavigationHistory::default(),
+            &notifications,
+        );
+        assert_eq!(
+            remote_pane_activity(&navigator),
+            Some(ActivityIndicator::Bell)
+        );
+        assert!(
+            navigator
+                .rows
+                .iter()
+                .filter(|row| row.machine == remote)
+                .all(|row| !row.selectable && row.destination.is_none())
+        );
     }
     use std::path::PathBuf;
 

@@ -1166,7 +1166,12 @@ panes = [{ command = ["pi"] }]
         // SAFETY: signal zero only checks the numeric process identifier.
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
 
+        let cleaned_up = Arc::clone(&spawned[0]);
         close_spawned_terminals(spawned).await;
+        assert!(
+            cleaned_up.take_status_updates().is_none(),
+            "cleanup left an unclaimed status stream attached"
+        );
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 // SAFETY: signal zero only checks the numeric process identifier.

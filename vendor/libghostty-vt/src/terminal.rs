@@ -14,6 +14,66 @@ use crate::{
 #[doc(inline)]
 pub use ffi::{SizeReportSize, TerminalScrollbar as Scrollbar};
 
+/// An owned, validated OSC 7501 report. Text is copied before the C callback returns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramStatusReport {
+    /// Protocol state, including the clear operation.
+    pub state: ProgramStatusState,
+    /// Reason a blocked program needs input.
+    pub kind: Option<ProgramStatusKind>,
+    /// Percentage, or indeterminate when absent.
+    pub progress: Option<u8>,
+    /// Record path; empty denotes the root.
+    pub id: String,
+    /// Application identifier, empty when absent.
+    pub app: String,
+    /// Decoded plain-text title.
+    pub title: String,
+    /// Decoded plain-text message.
+    pub message: String,
+}
+
+/// OSC 7501 states and clear operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramStatusState {
+    /// Waiting for instructions.
+    Idle,
+    /// Running independently.
+    Working,
+    /// Result ready.
+    Done,
+    /// Needs user input.
+    Blocked,
+    /// Failed and stopped.
+    Error,
+    /// Remove the addressed subtree.
+    Clear,
+}
+
+/// What a blocked program needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramStatusKind {
+    /// Approval.
+    Permission,
+    /// An answer.
+    Question,
+    /// Credentials.
+    Auth,
+}
+
+/// Shell command lifecycle step (OSC 133).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticPromptKind {
+    /// A new prompt is being drawn.
+    PromptStart,
+    /// Input can begin.
+    InputStart,
+    /// A command has started.
+    OutputStart,
+    /// A command has finished.
+    CommandEnd,
+}
+
 /// Complete terminal emulator state and rendering.
 ///
 /// A terminal instance manages the full emulator state including the screen,
@@ -245,18 +305,8 @@ pub struct Options {
     pub max_scrollback: usize,
 }
 
-impl From<Options> for ffi::TerminalOptions {
-    fn from(value: Options) -> Self {
-        Self {
-            cols: value.cols,
-            rows: value.rows,
-            max_scrollback: value.max_scrollback,
-        }
-    }
-}
-
 /// Default visual style used when the cursor style is reset.
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
 #[non_exhaustive]
 pub enum CursorStyle {
@@ -291,12 +341,15 @@ impl<'alloc: 'cb, 'cb> Terminal<'alloc, 'cb> {
 
     unsafe fn new_inner(alloc: *const ffi::Allocator, opts: Options) -> Result<Self> {
         let mut raw: ffi::Terminal = std::ptr::null_mut();
-        let result = unsafe { ffi::ghostty_terminal_new(alloc, &raw mut raw, opts.into()) };
+        let result =
+            unsafe { ffi::ghostty_terminal_new(alloc, &raw mut raw, opts.cols, opts.rows) };
         from_result(result)?;
-        Ok(Self {
+        let terminal = Self {
             inner: Object::new(raw)?,
             vtable: Box::new(VTable::default()),
-        })
+        };
+        terminal.set(Opt::SCROLLBACK_MAX_BYTES, &opts.max_scrollback)?;
+        Ok(terminal)
     }
 
     /// Write VT-encoded data to the terminal for processing.
@@ -445,19 +498,30 @@ impl<'alloc: 'cb, 'cb> Terminal<'alloc, 'cb> {
 
     /// Get the current value of a terminal mode.
     pub fn mode(&self, mode: Mode) -> Result<bool> {
-        let mut value = false;
+        let mut config = ffi::TerminalModeConfig {
+            mode: mode.into(),
+            value: false,
+        };
         let result = unsafe {
-            ffi::ghostty_terminal_mode_get(self.inner.as_raw(), mode.into(), &raw mut value)
+            ffi::ghostty_terminal_get(
+                self.inner.as_raw(),
+                Data::MODE,
+                std::ptr::from_mut(&mut config).cast(),
+            )
         };
         from_result(result)?;
-        Ok(value)
+        Ok(config.value)
     }
 
     /// Set the value of a terminal mode.
     pub fn set_mode(&mut self, mode: Mode, value: bool) -> Result<&mut Self> {
-        let result =
-            unsafe { ffi::ghostty_terminal_mode_set(self.inner.as_raw(), mode.into(), value) };
-        from_result(result)?;
+        self.set(
+            Opt::MODE,
+            &ffi::TerminalModeConfig {
+                mode: mode.into(),
+                value,
+            },
+        )?;
         Ok(self)
     }
 
@@ -1194,7 +1258,7 @@ impl From<TertiaryDeviceAttributes> for ffi::DeviceAttributesTertiary {
 
 /// Color scheme reported in response to a CSI ? 996 n query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
+#[repr(i32)]
 #[expect(missing_docs, reason = "self-explanatory")]
 pub enum ColorScheme {
     Light = ffi::ColorScheme::LIGHT,
@@ -1240,7 +1304,7 @@ impl From<ColorScheme> for ffi::ColorScheme::Type {
 
 /// Amount of compression work to perform before returning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum CompressionMode {
     /// Perform one bounded compression step suitable for idle scheduling.
     Incremental = ffi::TerminalCompressionMode::INCREMENTAL,
@@ -1250,7 +1314,7 @@ pub enum CompressionMode {
 
 /// Scheduling result from terminal compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum CompressionResult {
     /// Retained-mapping reclamation is unavailable on this target.
     Unsupported = ffi::TerminalCompressionResult::UNSUPPORTED,
@@ -1368,7 +1432,7 @@ impl<'t> ClipboardContent<'t> {
 /// Protocol-specific destination identifiers are normalized to these values
 /// before the clipboard write callback is invoked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum ClipboardLocation {
     /// The standard system clipboard.
     Standard = ffi::ClipboardLocation::STANDARD,
@@ -1383,7 +1447,7 @@ pub enum ClipboardLocation {
 /// Protocols without write acknowledgements, including OSC 52 and iTerm2
 /// OSC 1337 Copy, ignore this result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum ClipboardWriteError {
     /// The clipboard write was denied by policy or the user.
     Denied = ffi::ClipboardWriteResult::DENIED,
@@ -1593,6 +1657,68 @@ handlers! {
         func(&term);
     }
 
+    /// Receive validated OSC 7501 records. Also enables capability query replies.
+    pub fn on_program_status(
+        &mut self,
+        tag = PROGRAM_STATUS,
+        from = GhosttyTerminalProgramStatusFn(report: *const ffi::TerminalProgramStatus),
+        to = ProgramStatusFn(ProgramStatusReport),
+    ) |term, func| {
+        // SAFETY: libghostty lends a valid report and its strings for this callback.
+        let report = unsafe { &*report };
+        let state = match report.state {
+            ffi::ProgramStatusState::IDLE => ProgramStatusState::Idle,
+            ffi::ProgramStatusState::WORKING => ProgramStatusState::Working,
+            ffi::ProgramStatusState::DONE => ProgramStatusState::Done,
+            ffi::ProgramStatusState::BLOCKED => ProgramStatusState::Blocked,
+            ffi::ProgramStatusState::ERROR => ProgramStatusState::Error,
+            ffi::ProgramStatusState::CLEAR => ProgramStatusState::Clear,
+            _ => return,
+        };
+        let kind = match report.kind {
+            ffi::ProgramStatusKind::PERMISSION => Some(ProgramStatusKind::Permission),
+            ffi::ProgramStatusKind::QUESTION => Some(ProgramStatusKind::Question),
+            ffi::ProgramStatusKind::AUTH => Some(ProgramStatusKind::Auth),
+            _ => None,
+        };
+        let copy = |s: ffi::String| {
+            if s.len == 0 {
+                String::new()
+            } else {
+                // SAFETY: the strings are valid for the callback duration.
+                String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(s.ptr, s.len) }).into_owned()
+            }
+        };
+        func(term, ProgramStatusReport {
+            state,
+            kind,
+            progress: u8::try_from(report.progress).ok(),
+            id: copy(report.id),
+            app: copy(report.app),
+            title: copy(report.title),
+            message: copy(report.message),
+        });
+    }
+
+    /// Receive shell lifecycle steps, independently of screen contents.
+    pub fn on_semantic_prompt(
+        &mut self,
+        tag = SEMANTIC_PROMPT,
+        from = GhosttyTerminalSemanticPromptFn(event: *const ffi::TerminalSemanticPrompt),
+        to = SemanticPromptFn(SemanticPromptKind),
+    ) |term, func| {
+        // SAFETY: libghostty lends a valid event for this callback.
+        let event = unsafe { &*event };
+        let kind = match event.kind {
+            ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => SemanticPromptKind::PromptStart,
+            ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_INPUT_START => SemanticPromptKind::InputStart,
+            ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => SemanticPromptKind::OutputStart,
+            ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => SemanticPromptKind::CommandEnd,
+            _ => return,
+        };
+        func(term, kind);
+    }
+
     /// Call the given function when the terminal receives
     /// an ENQ character (0x05).
     pub fn on_enquiry(
@@ -1733,6 +1859,83 @@ mod tests {
     use crate::render::CursorVisualStyle;
     use std::cell::{Cell, RefCell};
     use std::mem::ManuallyDrop;
+
+    #[test]
+    fn program_status_callbacks_own_text_and_reply_to_queries() {
+        let reports = RefCell::new(Vec::new());
+        let prompts = RefCell::new(Vec::new());
+        let replies = RefCell::new(Vec::new());
+        let mut terminal = Terminal::new(Options {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        terminal
+            .on_program_status(|_, report| reports.borrow_mut().push(report))
+            .unwrap();
+        terminal
+            .on_semantic_prompt(|_, kind| prompts.borrow_mut().push(kind))
+            .unwrap();
+        terminal
+            .on_pty_write(|_, bytes| replies.borrow_mut().extend_from_slice(bytes))
+            .unwrap();
+        terminal.vt_write(
+            b"\x1b]7501;state=working:app=demo:progress=40:title=VGVzdA:msg=SGVsbG8=\x1b\\",
+        );
+        terminal.vt_write(b"\x1b]7501;state=blocked:msg=Cg==\x07");
+        terminal.vt_write(b"\x1b]7501;?\x07\x1b]133;A\x1b\\");
+        let reports = reports.borrow();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, ProgramStatusState::Working);
+        assert_eq!(reports[0].progress, Some(40));
+        assert_eq!(reports[0].app, "demo");
+        assert_eq!(reports[0].title, "Test");
+        assert_eq!(reports[0].message, "Hello");
+        assert_eq!(*prompts.borrow(), [SemanticPromptKind::PromptStart]);
+        assert_eq!(
+            replies.borrow().as_slice(),
+            b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x07"
+        );
+        drop(reports);
+        replies.borrow_mut().clear();
+        terminal.vt_write(b"\x1b]7501;?\x1b\\");
+        assert_eq!(
+            replies.borrow().as_slice(),
+            b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+        );
+    }
+
+    #[test]
+    fn program_status_is_screen_independent_and_ris_clears() {
+        let reports = RefCell::new(Vec::new());
+        let mut terminal = Terminal::new(Options {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        terminal
+            .on_program_status(|_, report| reports.borrow_mut().push(report))
+            .unwrap();
+        // Feed one byte at a time, including the two-byte ST terminator.
+        for byte in b"\x1b]7501;state=blocked:id=build/test:kind=permission:progress=75\x1b\\" {
+            terminal.vt_write(&[*byte]);
+        }
+        terminal.vt_write(b"\x1b[?1049h\x1b[?1049l\x1b[!p");
+        assert_eq!(reports.borrow().len(), 1);
+        assert_eq!(
+            reports.borrow()[0].kind,
+            Some(ProgramStatusKind::Permission)
+        );
+        assert_eq!(reports.borrow()[0].id, "build/test");
+        assert_eq!(reports.borrow()[0].progress, Some(75));
+        terminal.vt_write(b"\x1bc");
+        let reports = reports.borrow();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[1].state, ProgramStatusState::Clear);
+        assert!(reports[1].id.is_empty());
+    }
 
     #[inline(never)]
     fn build_terminal<'cb>(callback_count: &'cb RefCell<usize>) -> Terminal<'static, 'cb> {

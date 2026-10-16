@@ -1,4 +1,4 @@
-//! Frozen remote generation 1. Package versions are diagnostics, never a
+//! Remote generation 2. Package versions are diagnostics, never a
 //! compatibility decision. See docs/remote-protocol.md before changing any
 //! reused payload or adding a method to the allowlists below.
 
@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use super::{ClientMessage, ClientMode, ExtensionCatalog, SelectedView, ServerMessage};
 
-pub const GENERATION: u16 = 1;
+pub const GENERATION: u16 = 2;
 pub const CODEC: &str = "msgpack-map-v1";
 pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_NAME_BYTES: usize = 64;
@@ -90,7 +90,7 @@ impl Capability {
 
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Metadata => "metadata.v1",
+            Self::Metadata => "metadata.v2",
             Self::NestedWorkspaces => "nested-workspaces.v1",
             Self::Interactive => "interactive.v1",
             Self::Health => "health.v1",
@@ -443,15 +443,16 @@ pub fn decode_handshake<T: de::DeserializeOwned>(payload: &[u8]) -> Result<T, En
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{ProgramStatus, StatusRecord, StatusSource, StatusState};
     use crate::protocol::{Envelope, MAX_FRAME_LEN, codec, encode_payload};
     use serde_json::json;
     use tokio_util::codec::Decoder;
 
     #[test]
-    fn generation_one_handshake_wire_fixture_is_independent_of_package_version() {
+    fn generation_two_handshake_wire_fixture_is_independent_of_package_version() {
         let fixture = json!({"message": {
-            "type": "remote_hello", "generation": 1, "codec": "msgpack-map-v1",
-            "client_version": "0.1.2", "required": ["metadata.v1"],
+            "type": "remote_hello", "generation": 2, "codec": "msgpack-map-v1",
+            "client_version": "0.1.2", "required": ["metadata.v2"],
             "optional": ["future.v1"], "mode": "control"
         }});
         let envelope: Envelope<ClientMessage> =
@@ -461,10 +462,10 @@ mod tests {
             panic!()
         };
         let caps = hello.negotiate(Capabilities::ALL).unwrap();
-        assert_eq!(caps.names(), ["metadata.v1"]);
+        assert_eq!(caps.names(), ["metadata.v2"]);
         let fixture = json!({"message": {
-            "type": "remote_welcome", "generation": 1, "codec": "msgpack-map-v1",
-            "server_version": "9.123.4-dev", "capabilities": ["metadata.v1"],
+            "type": "remote_welcome", "generation": 2, "codec": "msgpack-map-v1",
+            "server_version": "9.123.4-dev", "capabilities": ["metadata.v2"],
             "selected": null, "extension_catalog": null
         }});
         let envelope: Envelope<ServerMessage> =
@@ -474,11 +475,11 @@ mod tests {
             panic!()
         };
         assert_eq!(hello.accept(&welcome).unwrap(), caps);
-        assert_eq!(GENERATION, 1);
+        assert_eq!(GENERATION, 2);
     }
 
     #[test]
-    fn generation_one_allowed_message_shapes_are_pinned() {
+    fn generation_two_allowed_message_shapes_are_pinned() {
         let client = [
             json!({"message": {"type": "watch_resources"}}),
             json!({"message": {"type": "ping"}}),
@@ -514,6 +515,50 @@ mod tests {
     }
 
     #[test]
+    fn metadata_v2_program_status_shape_is_pinned() {
+        let status = ProgramStatus {
+            records: vec![StatusRecord {
+                id: "build/test".into(),
+                state: StatusState::Done,
+                kind: None,
+                progress: None,
+                app: Some("cargo".into()),
+                title: None,
+                message: Some("Passed".into()),
+                revision: 7,
+                updated_at_ms: 123,
+                attention_revision: 7,
+            }],
+            source: Some(StatusSource::Report {
+                source: Some("pi".into()),
+                agent_session_id: None,
+            }),
+            revision: 7,
+            attention_revision: 7,
+            read_revision: 0,
+            working_revision: 6,
+        };
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            json!({
+                "records": [{
+                    "id": "build/test",
+                    "state": "done",
+                    "app": "cargo",
+                    "message": "Passed",
+                    "revision": 7,
+                    "updated_at_ms": 123,
+                    "attention_revision": 7
+                }],
+                "source": {"type": "report", "source": "pi"},
+                "revision": 7,
+                "attention_revision": 7,
+                "working_revision": 6
+            })
+        );
+    }
+
+    #[test]
     fn offers_validate_bounds_duplicates_and_diagnostic_versions() {
         let hello = RemoteHello::new(ClientMode::Control, "0.1.0");
         for version in [
@@ -546,7 +591,7 @@ mod tests {
             );
         }
         let mut bad = hello.clone();
-        bad.optional.push("metadata.v1".into());
+        bad.optional.push("metadata.v2".into());
         assert_eq!(
             bad.negotiate(Capabilities::ALL),
             Err(EndpointError::InvalidHandshake)
@@ -605,8 +650,8 @@ mod tests {
         fixture["optional"] = json!([]);
         fixture["unexpected"] = json!(true);
         assert!(decode_handshake::<RemoteHello>(&encode_payload(&fixture).unwrap()).is_err());
-        let welcome = json!({"generation": 1, "codec": CODEC, "server_version": "0.1.0",
-            "capabilities": ["metadata.v1"], "selected": null, "extension_catalog": null});
+        let welcome = json!({"generation": 2, "codec": CODEC, "server_version": "0.1.0",
+            "capabilities": ["metadata.v2"], "selected": null, "extension_catalog": null});
         for field in [
             "generation",
             "codec",
