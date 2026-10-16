@@ -1327,7 +1327,16 @@ done
         },
     )
     .await;
-    snapshot_with_size(&mut client, terminal_id, large).await;
+    loop {
+        match receive(&mut client).await.expect("daemon disconnected") {
+            ServerMessage::KittyImage { .. } => panic!("resize resent unchanged image pixels"),
+            ServerMessage::Snapshot {
+                terminal_id: id,
+                screen,
+            } if id == terminal_id && screen.size == large => break,
+            _ => {}
+        }
+    }
 
     send(
         &mut client,

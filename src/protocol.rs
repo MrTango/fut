@@ -1459,11 +1459,18 @@ mod tests {
             },
         )
         .unwrap();
-        // Maximize both URI bytes and per-entry string headers, not just URI
-        // bytes. Every cell also uses a three-byte hyperlink index.
+        // Maximize URI bytes, entry count, and string headers. Starting with
+        // one byte per entry, spend the remaining bytes on 32-byte strings:
+        // each crosses MessagePack's fixstr boundary and adds a header byte.
+        // Every cell also uses a three-byte hyperlink index.
         let entries = usize::from(u16::MAX) + 1;
-        let uri = "h".repeat(crate::domain::MAX_SCREEN_HYPERLINK_BYTES / entries);
-        screen.hyperlinks = vec![uri.into(); entries];
+        let extra = crate::domain::MAX_SCREEN_HYPERLINK_BYTES - entries;
+        let long_entries = extra / 31;
+        screen.hyperlinks = vec!["h".into(); entries];
+        for uri in &mut screen.hyperlinks[..long_entries] {
+            *uri = "h".repeat(32).into();
+        }
+        screen.hyperlinks[long_entries] = "h".repeat(1 + extra % 31).into();
         screen.graphics = crate::domain::KittyGraphics {
             images: (0..crate::domain::MAX_KITTY_PLACEMENTS)
                 .map(|index| crate::domain::KittyImage {
