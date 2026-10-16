@@ -1,5 +1,11 @@
 # Fut lifecycle adapter for Pi
 
+**Legacy fallback for status.** Pi 1.1.0 and later reports status to Fut
+natively over OSC 7501 and needs no lifecycle extension. The extension remains
+for older Pi versions and for setups where Pi never receives Fut's OSC 7501
+support reply, such as running inside tmux. The package also bundles the Fut
+skill, which is still worth installing.
+
 This first-party Pi extension reports lifecycle state for the Pi session running
 in a Fut terminal. It is a one-way adapter: it does not create or change
 layouts, submit prompts, read terminal output, or coordinate agents.

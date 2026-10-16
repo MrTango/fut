@@ -50,6 +50,9 @@ before changing configuration or closing anything.
 
 ## Agent integrations
 
-Fut can show native lifecycle activity from Claude Code, Codex, and Pi. See the
-dedicated setup guides for [Claude Code](https://fut.sh/agents/claude-code/),
+Any program that speaks [OSC 7501](https://fut.sh/agents/) shows its status in
+Fut with nothing installed. Current Claude Code, Codex, and Pi releases emit it
+natively. Fut's lifecycle plugins remain as legacy fallbacks for older agent
+versions; see the guides for [Claude Code](https://fut.sh/agents/claude-code/),
 [Codex](https://fut.sh/agents/codex/), and [Pi](https://fut.sh/agents/pi/).
+Codex still needs its `notify` setting for turn completion.

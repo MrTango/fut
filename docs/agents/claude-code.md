@@ -7,6 +7,12 @@ permalink: /agents/claude-code/
 
 # Claude Code integration
 
+> **Legacy fallback.** Claude Code 2.1.295 and later emits OSC 7501 natively
+> and shows status in Fut with nothing installed. Install this plugin only for
+> older Claude Code versions, when terminal title reporting is disabled with
+> `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, or when Claude Code runs inside a
+> multiplexer such as tmux that does not forward Fut's OSC 7501 support reply.
+
 Install Fut first, then add Fut's marketplace and lifecycle plugin:
 
 ```sh
@@ -22,9 +28,10 @@ does not control prompts, permissions, tools, terminal layout, or worktrees,
 and it remains inactive when Claude Code is running outside Fut.
 
 The adapter uses Fut's CLI fallback: completed stores an OSC-model done record,
-and exited clears its records. Programs with native OSC 7501 support need no
-plugin. Transient records are also cleaned up automatically when the reporting
-process exits; done and error results survive automatic exit cleanup.
+and exited clears its records. It feeds the same records as native OSC 7501, so
+running both is harmless. Transient records are also cleaned up automatically
+when the reporting process exits; done and error results survive automatic exit
+cleanup.
 
 The `fut` binary must be on `PATH`. Managed Claude Code policy can disable
 plugin hooks; use `/hooks` or the plugin manager's Errors view if activity does

@@ -8,9 +8,11 @@ description: OSC 7501 program status, progress, and agent automation in Fut.
 
 > **TL;DR:** Any program that speaks OSC 7501 shows status in Fut without a
 > plugin. Follow progress, messages, completion, and errors in the normal
-> project tree and Agents sidebar. Agent integrations and screen detection
-> remain fallbacks. Automation can use `fut --json agent list`, `agent prompt`,
-> `agent wait`, and `agent read` without changing client focus.
+> project tree and Agents sidebar. Claude Code, Codex, and Pi emit OSC 7501
+> natively; the agent plugins are legacy fallbacks for older versions, and
+> screen detection is the last resort. Automation can use
+> `fut --json agent list`, `agent prompt`, `agent wait`, and `agent read`
+> without changing client focus.
 
 ## OSC 7501: the default
 
@@ -93,20 +95,24 @@ fut agent skill
 The printed `SKILL.md` is bundled with the binary, so its instructions match the
 installed Fut release.
 
-## Integration fallbacks
+## Legacy plugin fallbacks
 
-Fut ships first-party lifecycle adapters for:
+Current releases of Claude Code (2.1.295 and later), Codex, and Pi (1.1.0 and
+later) emit OSC 7501 themselves, so they show status in Fut with nothing
+installed. Fut still ships first-party lifecycle plugins as legacy fallbacks
+for older agent versions and for setups where the agent never sees Fut's
+support reply, such as an agent running inside tmux:
 
 - [Claude Code](agents/claude-code.md)
 - [Codex](agents/codex.md)
 - [Pi](agents/pi.md)
 
-Claude Code and Codex require their Fut plugin; Codex also requires the
-documented `notify` command setting for authoritative turn completion. Follow
-the linked installation guides, restart the agent, and launch it inside Fut. A
-screen-based Codex fallback exists, but explicit OSC or CLI reports are more
-reliable and take precedence. These adapters currently call `fut agent report`;
-programs that already emit OSC 7501 need no adapter.
+The plugins call `fut agent report` and feed the same status records as native
+OSC 7501, so installing one alongside a native reporter is harmless but
+unnecessary. One exception remains: Codex does not report turn completion over
+OSC 7501, so its documented `notify` command setting is still the way to get
+completion attention. Screen-based Codex detection exists as a lower-priority
+fallback; explicit OSC or CLI reports take precedence.
 
 ## Control integrated agents
 

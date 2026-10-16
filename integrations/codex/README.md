@@ -1,5 +1,11 @@
 # Codex lifecycle integration
 
+**Legacy fallback, except for completion.** Recent Codex releases report idle,
+working, and blocked status to Fut natively over OSC 7501. Codex does not
+report turn completion that way, so the `notify` setting below is still
+required. The plugin hooks remain for older Codex versions and for setups where
+Codex never receives Fut's OSC 7501 support reply, such as running inside tmux.
+
 This integration reports Codex's supported native lifecycle decision points to
 the Fut terminal containing Codex. A report describes Codex when this hook
 fires; it does not claim that a later concurrent hook cannot change what Codex

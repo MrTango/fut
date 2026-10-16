@@ -94,7 +94,7 @@ fut --json pane new "$FUT_TAB_ID" --cwd "$PWD" -- codex
 ```
 
 Arguments after `--` are a child argument vector. Wait for a launched agent's
-integration report before expecting it in `agent list`; inspect its explicit
+status report before expecting it in `agent list`; inspect its explicit
 terminal ID with `agent get`.
 
 ## Control an ordinary terminal

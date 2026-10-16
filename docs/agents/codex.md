@@ -7,7 +7,14 @@ permalink: /agents/codex/
 
 # Codex integration
 
-The Codex adapter requires `python3`. Install Fut first, then add Fut's
+> **Legacy fallback, except for completion.** Recent Codex releases emit OSC
+> 7501 idle, working, and blocked status natively and need no plugin for those.
+> Codex does not report turn completion over OSC 7501, so the `notify` setting
+> below is still required for completion attention. Install the plugin only for
+> older Codex versions or when Codex runs inside a multiplexer such as tmux that
+> does not forward Fut's OSC 7501 support reply.
+
+The Codex plugin requires `python3`. Install Fut first, then add Fut's
 marketplace and plugin:
 
 ```sh
@@ -39,10 +46,10 @@ The integration reports idle, working, blocked, and completed activity. It does
 not control prompts, permissions, tools, terminal layout, or worktrees, and it
 remains inactive when Codex is running outside Fut.
 
-These CLI fallback reports feed the same records as native OSC 7501; completed
-stores done, rather than deriving completion from an idle state. Turn ids from
-older adapters are ignored. Native OSC-reporting programs need no plugin, and
-screen detection remains a lower-priority fallback.
+These CLI fallback reports feed the same records as native OSC 7501, so running
+the plugin alongside a native reporter is harmless; completed stores done,
+rather than deriving completion from an idle state. Turn ids from older
+adapters are ignored. Screen detection remains a lower-priority fallback.
 
 See [Agent activity](../agents.md) for the sidebar, notifications, screen-based
 fallback detection, and agent automation commands.
