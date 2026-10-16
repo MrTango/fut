@@ -2519,10 +2519,9 @@ enum Outbound {
         /// hold a matching base grid to splice a delta into.
         force_full: bool,
     },
-    /// An ordered message carrying a screen, such as a copy-mode reply.
-    /// Encoded by the writer so its Kitty images go through the same
-    /// per-connection image tracking as live snapshots.
-    Screen {
+    /// An ordered screen or view change. The writer owns both the delta
+    /// bases and image delivery cache, including their eviction on selection.
+    Message {
         request_id: Option<uuid::Uuid>,
         message: Box<ServerMessage>,
     },
@@ -2739,24 +2738,23 @@ fn diff_rows(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Option<Vec<Del
 }
 
 /// Kitty images a client holds, per terminal, when screens reference
-/// separately sent pixels. Mirrors the client's cache: after each message
-/// that states a screen's complete graphics, both sides keep exactly that
-/// screen's images (the client may keep more), so an image is resent only
-/// when the client could have dropped it.
+/// separately sent pixels. Both sides retain exactly the latest complete
+/// graphics on the wire, even when the client rejects that screen as stale.
+/// Displayed screens own shared pixels independently of this delivery cache.
 #[derive(Default)]
 struct SentImages(HashMap<TerminalId, HashSet<(u32, u64)>>);
 
 impl SentImages {
-    /// Forget everything sent for `terminal_id`, e.g. before a forced full
-    /// snapshot to a client that may have discarded its pane.
-    fn reset(&mut self, terminal_id: TerminalId) {
-        self.0.remove(&terminal_id);
-    }
-
     /// Return `kitty_image` messages for images in `message` the client may
     /// lack, and replace the pixels in `message` with references.
     fn prepare(&mut self, message: &mut ServerMessage) -> Vec<ServerMessage> {
         let (terminal_id, graphics) = match message {
+            ServerMessage::TargetSelected { selected } => {
+                let visible: HashSet<_> =
+                    selected.panes.iter().map(|pane| pane.terminal_id).collect();
+                self.0.retain(|id, _| visible.contains(id));
+                return Vec::new();
+            }
             ServerMessage::Snapshot {
                 terminal_id,
                 screen,
@@ -2829,19 +2827,32 @@ async fn write_outbound(
                 terminal_id,
                 screen,
                 force_full,
-            } => {
-                if force_full {
-                    sent_images.reset(terminal_id);
-                }
-                (
-                    None,
-                    snapshot_message(terminal_id, screen, force_full, &mut last_sent),
-                )
-            }
-            Outbound::Screen {
+            } => (
+                None,
+                snapshot_message(terminal_id, screen, force_full, &mut last_sent),
+            ),
+            Outbound::Message {
                 request_id,
                 message,
-            } => (request_id, *message),
+            } => {
+                match &*message {
+                    ServerMessage::TargetSelected { selected } => {
+                        let visible: HashSet<_> =
+                            selected.panes.iter().map(|pane| pane.terminal_id).collect();
+                        last_sent.retain(|id, _| visible.contains(id));
+                    }
+                    ServerMessage::CopyModeSnapshot { terminal_id, .. }
+                    | ServerMessage::CopyModeFinalized { terminal_id, .. }
+                    | ServerMessage::CopyModeCancelled { terminal_id, .. } => {
+                        // Copy-mode graphics can evict live images. The next
+                        // live screen must state its graphics again, rather
+                        // than diff against a pre-copy-mode delivery.
+                        last_sent.remove(terminal_id);
+                    }
+                    _ => {}
+                }
+                (request_id, *message)
+            }
         };
         if !queue
             .embed_images
@@ -7279,8 +7290,9 @@ async fn send(
         ServerMessage::CopyModeSnapshot { .. }
             | ServerMessage::CopyModeFinalized { .. }
             | ServerMessage::CopyModeCancelled { .. }
+            | ServerMessage::TargetSelected { .. }
     ) {
-        return connection.enqueue(Outbound::Screen {
+        return connection.enqueue(Outbound::Message {
             request_id,
             message: Box::new(message),
         });
@@ -7503,10 +7515,113 @@ mod tests {
         let mut previous = snapshot(screen_with_image(5, 1));
         assert_eq!(sent_image_generations(&sent.prepare(&mut previous)), [1]);
 
-        // A forced full snapshot may target a client that discarded the pane.
-        sent.reset(terminal_id);
+        // Forcing a grid refresh does not discard the image delivery cache.
         let mut forced = snapshot(screen_with_image(6, 1));
-        assert_eq!(sent_image_generations(&sent.prepare(&mut forced)), [1]);
+        assert!(sent.prepare(&mut forced).is_empty());
+
+        let pane_id = PaneId::new();
+        let focused = SelectedTarget {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            pane_id,
+            terminal_id: TerminalId::new(),
+            child_pid: 1,
+        };
+        let mut selected = ServerMessage::TargetSelected {
+            selected: SelectedView {
+                resource_revision: 1,
+                focused: focused.clone(),
+                panes: vec![focused],
+                layout: SplitTree::leaf(pane_id),
+            },
+        };
+        assert!(sent.prepare(&mut selected).is_empty());
+        assert!(sent.0.is_empty());
+        let mut returned = snapshot(screen_with_image(7, 1));
+        assert_eq!(sent_image_generations(&sent.prepare(&mut returned)), [1]);
+    }
+
+    #[tokio::test]
+    async fn copy_mode_invalidates_live_graphics_and_forced_snapshots_keep_images() {
+        let terminal_id = TerminalId::new();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (sink, _) = Framed::new(server, codec()).split();
+        let mut reader = Framed::new(client, codec());
+        let queue = Arc::new(OutboundQueue::default());
+        queue
+            .push(Outbound::Snapshot {
+                terminal_id,
+                screen: screen_with_image(1, 1),
+                force_full: true,
+            })
+            .unwrap();
+        for revision in [2, 3] {
+            queue
+                .push(Outbound::Message {
+                    request_id: Some(uuid::Uuid::new_v4()),
+                    message: Box::new(ServerMessage::CopyModeSnapshot {
+                        terminal_id,
+                        screen: screen_with_image(revision, 2),
+                    }),
+                })
+                .unwrap();
+        }
+        queue
+            .push(Outbound::Snapshot {
+                terminal_id,
+                screen: screen_with_image(4, 1),
+                force_full: false,
+            })
+            .unwrap();
+        let writer = tokio::spawn(write_outbound(sink, Arc::clone(&queue)));
+        // Pixels precede their screen, copy-mode is an ordered barrier, and
+        // returning live must restate graphics even though its cells match.
+        for expected in [
+            "image1", "snapshot", "image2", "copy", "copy", "image1", "snapshot",
+        ] {
+            let frame = timeout(Duration::from_secs(2), reader.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
+            match (expected, envelope.message) {
+                ("image1", ServerMessage::KittyImage { image, .. }) => {
+                    assert_eq!(image.generation, 1)
+                }
+                ("image2", ServerMessage::KittyImage { image, .. }) => {
+                    assert_eq!(image.generation, 2)
+                }
+                ("snapshot", ServerMessage::Snapshot { screen, .. }) => {
+                    assert!(screen.graphics.images[0].is_reference())
+                }
+                ("copy", ServerMessage::CopyModeSnapshot { screen, .. }) => {
+                    assert!(envelope.request_id.is_some());
+                    assert!(screen.graphics.images[0].is_reference());
+                }
+                (_, other) => panic!("expected {expected}, got {other:?}"),
+            }
+        }
+        queue
+            .push(Outbound::Snapshot {
+                terminal_id,
+                screen: screen_with_image(5, 1),
+                force_full: true,
+            })
+            .unwrap();
+        queue.finish();
+        let frame = timeout(Duration::from_secs(2), reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
+        assert!(
+            matches!(envelope.message, ServerMessage::Snapshot { .. }),
+            "forced full resent image pixels"
+        );
+        writer.await.unwrap();
     }
 
     #[tokio::test]

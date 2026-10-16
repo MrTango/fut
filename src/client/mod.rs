@@ -973,6 +973,35 @@ async fn stage_machine_view(
                 ServerMessage::KittyImage { terminal_id, image } => {
                     view.accept_kitty_image(terminal_id, image);
                 }
+                ServerMessage::SnapshotDelta { terminal_id, delta } => {
+                    if matches!(
+                        view.accept_delta(terminal_id, delta),
+                        DeltaApplyResult::NeedsRefresh
+                    ) {
+                        send(
+                            &mut prepared.framed,
+                            ClientMessage::RefreshTerminal { terminal_id },
+                        )
+                        .await?;
+                    }
+                }
+                ServerMessage::CopyModeSnapshot {
+                    terminal_id,
+                    screen,
+                }
+                | ServerMessage::CopyModeFinalized {
+                    terminal_id,
+                    screen,
+                }
+                | ServerMessage::CopyModeCancelled {
+                    terminal_id,
+                    screen,
+                } => {
+                    view.retain_kitty_images(terminal_id, &screen.graphics);
+                }
+                ServerMessage::TargetSelected { selected } => {
+                    view.replace(selected)?;
+                }
                 ServerMessage::Resources { snapshot, presence } => {
                     resources.accept_presence(presence);
                     resources.accept(snapshot);
@@ -1648,6 +1677,8 @@ async fn run_loop(
                                 framed,
                                 copy_mode.as_mut().expect("accepted copy-mode snapshot"),
                             ).await?;
+                        } else {
+                            view.retain_kitty_images(terminal_id, &screen.graphics);
                         }
                     }
                     ServerMessage::CopyModePrepared {
@@ -1849,6 +1880,8 @@ async fn run_loop(
                                 toasts.info(format!("copied {bytes} bytes to clipboard"));
                             }
                             force_draw = true;
+                        } else {
+                            view.retain_kitty_images(terminal_id, &screen.graphics);
                         }
                     }
                     ServerMessage::CopyModeCancelled { terminal_id, screen } => {
@@ -1864,6 +1897,8 @@ async fn run_loop(
                             copy_mode = None;
                             toasts.info("copy mode cancelled");
                             force_draw = true;
+                        } else {
+                            view.retain_kitty_images(terminal_id, &screen.graphics);
                         }
                     }
                     ServerMessage::CopyModeError { terminal_id, error } => {
@@ -6821,9 +6856,8 @@ struct ViewState {
     resize_requests: HashMap<Uuid, TerminalId>,
     /// Kitty image pixels delivered apart from the screens that reference
     /// them, per terminal and keyed by (image ID, generation). Pruned in
-    /// step with the daemon's per-connection record (`SentImages`): after a
-    /// screen states its complete graphics, at least that screen's images
-    /// stay cached.
+    /// step with the daemon's `SentImages`, independently of whether a
+    /// screen is accepted. Displayed screens retain their own shared pixels.
     kitty_images: HashMap<TerminalId, HashMap<(u32, u64), KittyImage>>,
 }
 
@@ -6861,6 +6895,10 @@ impl ViewState {
     }
 
     fn replace(&mut self, selected: SelectedView) -> anyhow::Result<bool> {
+        // Follow wire selection even if the displayed view is newer. The
+        // writer evicts these same terminals before sending TargetSelected.
+        let visible: HashSet<_> = selected.panes.iter().map(|pane| pane.terminal_id).collect();
+        self.kitty_images.retain(|id, _| visible.contains(id));
         if selected.resource_revision < self.selected_revision {
             return Ok(false);
         }
@@ -6980,8 +7018,8 @@ impl ViewState {
         Some(self.zoomed)
     }
 
-    fn accept(&mut self, terminal_id: TerminalId, screen: ScreenSnapshot) -> bool {
-        self.retain_kitty_images(terminal_id, &screen.graphics);
+    fn accept(&mut self, terminal_id: TerminalId, mut screen: ScreenSnapshot) -> bool {
+        self.resolve_kitty_images(terminal_id, &mut screen.graphics);
         self.panes
             .iter_mut()
             .find(|pane| pane.target.terminal_id == terminal_id)
@@ -6998,34 +7036,34 @@ impl ViewState {
             .insert((image.id, image.generation), image);
     }
 
-    /// Drop cached pixels that neither `graphics`, a terminal's newly
-    /// received complete graphics, nor its current screen references, along
-    /// with caches for terminals no longer shown. Retaining both sides keeps
-    /// every image the daemon assumes this client holds, whether or not the
-    /// new screen is accepted.
+    /// Give a displayed screen shared ownership of its pixels, so delivery
+    /// cache eviction cannot invalidate a current screen after a stale reply.
+    fn resolve_kitty_images(&mut self, terminal_id: TerminalId, graphics: &mut KittyGraphics) {
+        for image in &mut graphics.images {
+            if image.is_reference()
+                && let Some(cached) = self
+                    .kitty_images
+                    .get(&terminal_id)
+                    .and_then(|images| images.get(&(image.id, image.generation)))
+            {
+                *image = cached.clone();
+            }
+        }
+        self.retain_kitty_images(terminal_id, graphics);
+    }
+
+    /// Mirror the writer's latest complete graphics, even for rejected
+    /// replies. No dependence on the locally accepted screen or pane list.
     fn retain_kitty_images(&mut self, terminal_id: TerminalId, graphics: &KittyGraphics) {
-        let panes = &self.panes;
-        self.kitty_images.retain(|cached_terminal, _| {
-            *cached_terminal == terminal_id
-                || panes
-                    .iter()
-                    .any(|pane| pane.target.terminal_id == *cached_terminal)
-        });
         let Some(images) = self.kitty_images.get_mut(&terminal_id) else {
             return;
         };
-        let current = panes
+        let retained: HashSet<_> = graphics
+            .images
             .iter()
-            .find(|pane| pane.target.terminal_id == terminal_id)
-            .and_then(|pane| pane.pending.as_ref())
-            .map_or(&[][..], |screen| &screen.graphics.images[..]);
-        images.retain(|&(id, generation), _| {
-            graphics
-                .images
-                .iter()
-                .chain(current)
-                .any(|image| image.id == id && image.generation == generation)
-        });
+            .map(|image| (image.id, image.generation))
+            .collect();
+        images.retain(|key, _| retained.contains(key));
         if images.is_empty() {
             self.kitty_images.remove(&terminal_id);
         }
@@ -7105,9 +7143,13 @@ impl ViewState {
     /// open. Rate-limited per pane: [`DeltaApplyResult::NeedsRefresh`] is
     /// returned at most once per run of unapplicable deltas, so a burst of
     /// mismatches can't spam the daemon with refresh requests.
-    fn accept_delta(&mut self, terminal_id: TerminalId, delta: ScreenDelta) -> DeltaApplyResult {
-        if let Some(graphics) = &delta.graphics {
-            self.retain_kitty_images(terminal_id, graphics);
+    fn accept_delta(
+        &mut self,
+        terminal_id: TerminalId,
+        mut delta: ScreenDelta,
+    ) -> DeltaApplyResult {
+        if let Some(graphics) = &mut delta.graphics {
+            self.resolve_kitty_images(terminal_id, graphics);
         }
         let Some(pane) = self
             .panes
@@ -8737,15 +8779,98 @@ mod tests {
         assert!(resolves(&state, 1));
 
         // A newer generation arrives before the screen that references it;
-        // the current screen's image survives until that screen replaces it.
+        // a stale screen still advances the delivery cache, but cannot strip
+        // pixels from the displayed screen.
         state.accept_kitty_image(terminal_id, image(2));
+        assert!(!state.accept(terminal_id, screen(1, &[2])));
+        assert!(!resolves(&state, 1));
+        assert_eq!(
+            state.panes[0].pending.as_ref().unwrap().graphics.images[0],
+            image(1)
+        );
+        assert!(resolves(&state, 2));
         assert!(state.accept(terminal_id, screen(2, &[2])));
         assert!(resolves(&state, 2));
-        assert!(state.accept(terminal_id, screen(3, &[])));
+
+        let current = state.panes[0].pending.as_ref().unwrap();
+        let delta = ScreenDelta {
+            revision: 3,
+            base_revision: 2,
+            size: current.size,
+            rows: Vec::new(),
+            hyperlinks: current.hyperlinks.clone(),
+            cursor: current.cursor,
+            scroll: current.scroll,
+            mouse_tracking: current.mouse_tracking,
+            graphics: None,
+        };
+        assert!(matches!(
+            state.accept_delta(terminal_id, delta),
+            DeltaApplyResult::Applied
+        ));
         assert!(resolves(&state, 2));
-        assert!(state.accept(terminal_id, screen(4, &[])));
+
+        // A rejected graphics delta still states the delivery cache, just
+        // like a stale full screen. The displayed image remains usable.
+        state.accept_kitty_image(terminal_id, image(3));
+        let current = state.panes[0].pending.as_ref().unwrap();
+        let rejected = ScreenDelta {
+            revision: 4,
+            base_revision: 0,
+            size: current.size,
+            rows: Vec::new(),
+            hyperlinks: current.hyperlinks.clone(),
+            cursor: current.cursor,
+            scroll: current.scroll,
+            mouse_tracking: current.mouse_tracking,
+            graphics: Some(screen(4, &[3]).graphics),
+        };
+        assert!(matches!(
+            state.accept_delta(terminal_id, rejected),
+            DeltaApplyResult::NeedsRefresh
+        ));
+        assert!(!resolves(&state, 2));
+        assert!(resolves(&state, 3));
+        assert_eq!(
+            state.panes[0].pending.as_ref().unwrap().graphics.images[0],
+            image(2)
+        );
+        assert!(state.accept(terminal_id, screen(4, &[3])));
+        assert_eq!(
+            state.panes[0].pending.as_ref().unwrap().graphics.images[0],
+            image(3)
+        );
+        assert!(state.accept(terminal_id, screen(5, &[])));
         assert!(!resolves(&state, 2));
         assert!(state.kitty_images.is_empty());
+    }
+
+    #[test]
+    fn kitty_delivery_cache_follows_even_a_stale_wire_selection() {
+        let panes = targets(2);
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(3, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
+        for pane in &panes {
+            state.accept_kitty_image(
+                pane.terminal_id,
+                KittyImage {
+                    id: 7,
+                    generation: 1,
+                    png: vec![1].into(),
+                },
+            );
+        }
+        assert!(
+            !state
+                .replace(selected_view(2, panes[1].clone(), vec![panes[1].clone()]))
+                .unwrap()
+        );
+        assert!(!state.kitty_images.contains_key(&panes[0].terminal_id));
+        assert!(state.kitty_images.contains_key(&panes[1].terminal_id));
+        assert_eq!(state.panes.len(), 2);
     }
 
     #[test]
