@@ -1,6 +1,121 @@
 use super::*;
 use fut::protocol::remote::{self as wire, Capabilities, Capability, EndpointError, RemoteHello};
 
+async fn send_upload(connection: &mut Connection, message: ClientMessage) {
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: None,
+            message,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn remote_image_upload_requires_its_optional_capability() {
+    let mut harness = Harness::start("printf 'UPLOAD_READY\\r\\n'; cat").await;
+    let (mut connection, mut bridge) = spawn_bridge(&harness.socket);
+    let mut offer = RemoteHello::new(interactive_mode(None), "0.1.0");
+    offer.optional.clear();
+    let ServerMessage::RemoteWelcome(welcome) = remote_hello(&mut connection, offer).await else {
+        panic!("expected remote welcome")
+    };
+    let selected = welcome.selected.unwrap();
+    harness.terminal_pid = Some(selected.focused.child_pid);
+    assert_eq!(
+        correlated_command(
+            &mut connection,
+            ClientMessage::AttachmentBegin {
+                transfer_id: Uuid::new_v4(),
+                terminal_id: selected.focused.terminal_id,
+                size: 8,
+            }
+        )
+        .await,
+        ServerMessage::EndpointError {
+            error: EndpointError::MethodNotNegotiated
+        }
+    );
+    harness.detach(&mut connection).await;
+    drop(connection);
+    assert!(
+        time::timeout(DEADLINE, bridge.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_image_upload_pastes_a_complete_file_without_submitting_it() {
+    let mut harness = Harness::start("printf 'UPLOAD_READY\\r\\n'; while IFS= read -r line; do eval \"set -- $line\"; if [ -f \"$1\" ]; then printf 'UPLOADED:%s\\r\\n' \"$(wc -c < \"$1\" | tr -d ' ')\"; fi; done").await;
+    let (mut connection, mut bridge) = spawn_bridge(&harness.socket);
+    let offer = RemoteHello::new(interactive_mode(None), "0.1.0");
+    let ServerMessage::RemoteWelcome(welcome) = remote_hello(&mut connection, offer.clone()).await
+    else {
+        panic!("expected remote welcome")
+    };
+    offer.accept(&welcome).unwrap();
+    let selected = welcome.selected.unwrap();
+    harness.terminal_pid = Some(selected.focused.child_pid);
+    let terminal_id = selected.focused.terminal_id;
+    snapshot_containing(&mut connection, terminal_id, "UPLOAD_READY").await;
+
+    // Cross multiple chunks so the bridge exercises the transfer, not just a
+    // single small paste frame. PNG signature validation is daemon-side.
+    let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+    image.resize(150_000, 42);
+    let transfer_id = Uuid::new_v4();
+    send_upload(
+        &mut connection,
+        ClientMessage::AttachmentBegin {
+            transfer_id,
+            terminal_id,
+            size: image.len() as u64,
+        },
+    )
+    .await;
+    for chunk in image.chunks(fut::protocol::ATTACHMENT_CHUNK_BYTES) {
+        send_upload(
+            &mut connection,
+            ClientMessage::AttachmentChunk {
+                transfer_id,
+                bytes: chunk.to_vec(),
+            },
+        )
+        .await;
+    }
+    send_upload(
+        &mut connection,
+        ClientMessage::AttachmentCommit { transfer_id },
+    )
+    .await;
+    let pasted = snapshot_containing(&mut connection, terminal_id, ".png").await;
+    assert!(!snapshot_text(&pasted).contains("UPLOADED:"));
+    // The path must remain editable input until the user explicitly submits it.
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, terminal_id, "UPLOADED:150000").await;
+    harness.detach(&mut connection).await;
+    drop(connection);
+    assert!(
+        time::timeout(DEADLINE, bridge.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    harness.shutdown().await;
+}
+
 async fn remote_hello(connection: &mut Connection, hello: RemoteHello) -> ServerMessage {
     let request_id = Some(Uuid::new_v4());
     send_envelope(

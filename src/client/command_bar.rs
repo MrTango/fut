@@ -457,6 +457,26 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_image_action_is_discoverable_and_dispatches_explicitly() {
+        for query in ["paste image", "png", "screenshot", "ctrl-b ctrl-v"] {
+            let mut bar = CommandBarState::open();
+            bar.paste(query);
+            let position = bar
+                .filtered
+                .iter()
+                .position(|action| *action == ClientAction::PasteImage)
+                .unwrap_or_else(|| panic!("image paste missing from results for {query}"));
+            for _ in 0..position {
+                bar.key(key(KeyCode::Down, KeyModifiers::NONE));
+            }
+            assert_eq!(
+                bar.key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                CommandBarAction::Dispatch(ClientAction::PasteImage)
+            );
+        }
+    }
+
+    #[test]
     fn filtering_is_stable_case_insensitive_multi_token_and_searches_bindings() {
         let mut bar = CommandBarState::open();
         assert_eq!(bar.filtered.len(), COMMANDS.len());

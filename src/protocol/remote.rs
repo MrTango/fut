@@ -69,10 +69,11 @@ pub enum Capability {
     ExtensionCatalog,
     TerminalColors,
     ProjectOpen,
+    Attachments,
 }
 
 impl Capability {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -82,6 +83,7 @@ impl Capability {
         Self::ExtensionCatalog,
         Self::TerminalColors,
         Self::ProjectOpen,
+        Self::Attachments,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -95,6 +97,7 @@ impl Capability {
             Self::ExtensionCatalog => "extension-catalog.v1",
             Self::TerminalColors => "terminal-colors.v1",
             Self::ProjectOpen => "project-open.v1",
+            Self::Attachments => "attachments.v1",
         }
     }
 }
@@ -137,6 +140,10 @@ impl Capabilities {
             Ping => Capability::Health,
             GetExtensionCatalog => Capability::ExtensionCatalog,
             TerminalColors { .. } => Capability::TerminalColors,
+            AttachmentBegin { .. }
+            | AttachmentChunk { .. }
+            | AttachmentCommit { .. }
+            | AttachmentCancel { .. } => Capability::Attachments,
             WatchAlerts { .. } | AcknowledgeAlerts { .. } => {
                 return self.contains(Capability::Alerts)
                     || self.contains(Capability::ControlAlerts);
@@ -186,6 +193,9 @@ impl Capabilities {
                     || self.contains(Capability::ControlAlerts);
             }
             CommandCompleted {
+                command: super::AcknowledgedCommand::Paste,
+            } if self.contains(Capability::Attachments) => return true,
+            CommandCompleted {
                 command:
                     super::AcknowledgedCommand::Input
                     | super::AcknowledgedCommand::Paste
@@ -233,6 +243,7 @@ impl RemoteHello {
         ];
         if matches!(mode, ClientMode::Interactive { .. }) {
             optional.push(Capability::TerminalColors.name().into());
+            optional.push(Capability::Attachments.name().into());
         }
         Self {
             generation: GENERATION,
@@ -635,6 +646,46 @@ mod tests {
         let selected = old.negotiate(Capabilities::ALL).unwrap();
         assert!(!selected.allows_client(&message));
         assert!(selected.contains(Capability::Interactive));
+    }
+
+    #[test]
+    fn attachments_require_explicit_optional_negotiation() {
+        let mut hello = RemoteHello::new(
+            ClientMode::Interactive {
+                size: crate::domain::TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+                selector: None,
+            },
+            "0.1.0",
+        );
+        let transfer_id = uuid::Uuid::new_v4();
+        let messages = [
+            ClientMessage::AttachmentBegin {
+                transfer_id,
+                terminal_id: crate::domain::TerminalId::new(),
+                size: 8,
+            },
+            ClientMessage::AttachmentChunk {
+                transfer_id,
+                bytes: vec![0; 8],
+            },
+            ClientMessage::AttachmentCommit { transfer_id },
+            ClientMessage::AttachmentCancel { transfer_id },
+        ];
+        let selected = hello.negotiate(Capabilities::ALL).unwrap();
+        assert!(selected.contains(Capability::Attachments));
+        for message in &messages {
+            assert!(selected.allows_client(message));
+        }
+        hello
+            .optional
+            .retain(|name| name != Capability::Attachments.name());
+        let legacy = hello.negotiate(Capabilities::ALL).unwrap();
+        for message in &messages {
+            assert!(!legacy.allows_client(message));
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod agents;
 mod attachment;
 mod cheatsheet;
 mod chrome;
+mod clipboard_image;
 mod colors;
 mod command_bar;
 mod command_form;
@@ -1313,6 +1314,7 @@ async fn run_loop(
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let animation_started = time::Instant::now();
     let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
+    let mut image_upload = clipboard_image::Upload::default();
     let (background_results, mut background_result) = mpsc::unbounded_channel();
     let (project_preparation_results, mut project_preparation_result) =
         mpsc::unbounded_channel::<ProjectPreparationCompletion>();
@@ -1343,6 +1345,16 @@ async fn run_loop(
             send_request(framed, Some(id), message).await?;
         }
         tokio::select! {
+            update = image_upload.next() => {
+                match update {
+                    clipboard_image::Update::Message(message) => send(framed, message).await?,
+                    clipboard_image::Update::Finished(Ok(())) => {}
+                    clipboard_image::Update::Finished(Err(error)) => {
+                        toasts.error(format!("image paste failed · {}", one_line_error(&error)));
+                        force_draw = true;
+                    }
+                }
+            }
             changed = async {
                 federation_updates
                     .as_mut()
@@ -2147,6 +2159,11 @@ async fn run_loop(
                     }
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
+                        if image_upload.reject_error(request_id, &code) {
+                            toasts.error(format!("image paste failed · {}", sanitize(&message)));
+                            force_draw = true;
+                            continue;
+                        }
                         let reload_failed = extension_reload
                             .as_ref()
                             .is_some_and(|reload| request_id == Some(reload.request_id()));
@@ -2904,6 +2921,9 @@ async fn run_loop(
                                     // Commit is one synchronous ownership swap. Until here every
                                     // send used the source connection; afterwards every send uses
                                     // the candidate. No candidate transport is exposed to input.
+                                    // Clipboard bytes are scoped to the source connection, never
+                                    // to whichever machine happens to be selected on completion.
+                                    image_upload = clipboard_image::Upload::default();
                                     std::mem::swap(framed, &mut prepared.framed);
                                     let old_bridge = active_bridge.take();
                                     active_bridge = prepared.bridge.take();
@@ -3251,6 +3271,7 @@ async fn run_loop(
                                     config_location,
                                     &mut extension_reload,
                                     &mut project_config_reload,
+                                    &mut image_upload,
                                     true,
                                 ).await?;
                                 toasts.replace(toast);
@@ -3830,6 +3851,7 @@ async fn run_loop(
                                     config_location,
                                     &mut extension_reload,
                                     &mut project_config_reload,
+                                    &mut image_upload,
                                     focused_terminal_was_covered,
                                 ).await?;
                                 toasts.replace(toast);
@@ -4196,6 +4218,9 @@ async fn run_loop(
                 if attachment.locality() == Locality::Remote
                     && connection::Lost::retryable(&error) =>
             {
+                // Never replay clipboard data into a replacement connection.
+                let image_paste_cancelled = image_upload.is_pending();
+                image_upload = clipboard_image::Upload::default();
                 if let Some(bridge) = active_bridge.take() {
                     let _ = bridge.shutdown().await;
                 }
@@ -4235,7 +4260,11 @@ async fn run_loop(
                 prefix_keys_awaiting_release.clear();
                 host_colors.reattach();
                 pending_focused_exit = None;
-                toasts.info("machine reconnected");
+                if image_paste_cancelled {
+                    toasts.error("machine reconnected; image paste interrupted — retry explicitly");
+                } else {
+                    toasts.info("machine reconnected");
+                }
                 force_draw = true;
             }
             result => {
@@ -5435,12 +5464,25 @@ async fn dispatch_client_action(
     config_location: &config::ConfigLocation,
     extension_reload: &mut Option<ExtensionReloadState>,
     project_config_reload: &mut Option<ProjectConfigReloadState>,
+    image_upload: &mut clipboard_image::Upload,
     focused_terminal_was_covered: bool,
 ) -> anyhow::Result<Option<Toast>> {
     if let Some(message) = attachment.locality().blocked_action(action) {
         return Ok(Some(Toast::info(message)));
     }
     match action {
+        ClientAction::PasteImage => {
+            if !attachment.supports_attachments() {
+                return Ok(Some(Toast::info(
+                    "remote daemon does not support image paste",
+                )));
+            }
+            // Capture now, not when clipboard acquisition or upload completes.
+            return Ok(Some(match image_upload.start(view.focused().terminal_id) {
+                Ok(()) => Toast::info("reading clipboard image…"),
+                Err(error) => Toast::error(one_line_error(&error)),
+            }));
+        }
         ClientAction::RunCommand(index) => {
             let Some(command) = ui.bindings.command(index) else {
                 return Ok(Some(Toast::error(

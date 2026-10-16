@@ -167,6 +167,7 @@ fields = [{ name = 'value', label = 'Value' }]
             &location,
             &mut reload,
             &mut project_reload,
+            &mut clipboard_image::Upload::default(),
             false,
         )
         .await

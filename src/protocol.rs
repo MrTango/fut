@@ -27,6 +27,10 @@ pub const PROTOCOL_VERSION: u16 = parse_protocol_version(env!("CARGO_PKG_VERSION
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
+/// Maximum encoded PNG size for a clipboard attachment.
+pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+/// Maximum bytes carried by one attachment chunk.
+pub const ATTACHMENT_CHUNK_BYTES: usize = 64 * 1024;
 
 const fn parse_protocol_version(value: &str) -> u16 {
     let bytes = value.as_bytes();
@@ -378,6 +382,21 @@ pub enum ClientMessage {
     },
     Paste {
         text: String,
+    },
+    AttachmentBegin {
+        transfer_id: Uuid,
+        terminal_id: TerminalId,
+        size: u64,
+    },
+    AttachmentChunk {
+        transfer_id: Uuid,
+        bytes: Vec<u8>,
+    },
+    AttachmentCommit {
+        transfer_id: Uuid,
+    },
+    AttachmentCancel {
+        transfer_id: Uuid,
     },
     TerminalInput {
         terminal_id: TerminalId,
@@ -1061,6 +1080,35 @@ mod tests {
             decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn attachment_envelopes_round_trip_without_request_ids() {
+        let transfer_id = Uuid::new_v4();
+        for message in [
+            ClientMessage::AttachmentBegin {
+                transfer_id,
+                terminal_id: TerminalId::new(),
+                size: MAX_ATTACHMENT_BYTES as u64,
+            },
+            ClientMessage::AttachmentChunk {
+                transfer_id,
+                bytes: vec![255; ATTACHMENT_CHUNK_BYTES],
+            },
+            ClientMessage::AttachmentCommit { transfer_id },
+            ClientMessage::AttachmentCancel { transfer_id },
+        ] {
+            let envelope = Envelope {
+                request_id: None,
+                message,
+            };
+            let bytes = encode_payload(&envelope).unwrap();
+            assert!(bytes.len() < MAX_FRAME_LEN);
+            assert_eq!(
+                decode_payload::<Envelope<ClientMessage>>(&bytes).unwrap(),
+                envelope
+            );
+        }
     }
 
     #[test]

@@ -266,6 +266,18 @@ mod tests {
     }
 
     #[test]
+    fn image_paste_requires_prefix_and_plain_ctrl_v_is_unchanged() {
+        let mut prefix = PrefixState::default();
+        let ctrl_v = encode_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(prefix.feed(ctrl_v.clone()), PrefixAction::Send(vec![22]));
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(ctrl_v),
+            PrefixAction::Dispatch(ClientAction::PasteImage)
+        );
+    }
+
+    #[test]
     fn preserves_physical_arrow_identity_for_terminal_owned_encoding() {
         assert_eq!(
             terminal_key_event(key(

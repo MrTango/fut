@@ -90,6 +90,7 @@ pub(super) enum ClientAction {
     ReloadConfig,
     ReloadProjectConfig,
     EnterCopyMode,
+    PasteImage,
     OpenNavigator,
     OpenAgents,
     OpenLeftSidebar,
@@ -134,13 +135,14 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 50] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 51] = [
     ClientAction::OpenCommandBar,
     ClientAction::OpenMessages,
     ClientAction::OpenProject,
     ClientAction::ReloadConfig,
     ClientAction::ReloadProjectConfig,
     ClientAction::EnterCopyMode,
+    ClientAction::PasteImage,
     ClientAction::OpenNavigator,
     ClientAction::OpenAgents,
     ClientAction::OpenLeftSidebar,
@@ -187,7 +189,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 50] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 49] = [
+pub(super) const COMMANDS: [ActionDefinition; 50] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -429,6 +431,11 @@ pub(super) const COMMANDS: [ActionDefinition; 49] = [
         keywords: "copy select scrollback search clipboard",
     },
     ActionDefinition {
+        action: ClientAction::PasteImage,
+        title: "Paste clipboard image",
+        keywords: "paste image png clipboard attachment upload screenshot",
+    },
+    ActionDefinition {
         action: ClientAction::Detach,
         title: "Detach client",
         keywords: "detach disconnect leave client",
@@ -438,7 +445,7 @@ pub(super) const COMMANDS: [ActionDefinition; 49] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 43] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 44] = [
     DirectBinding {
         suffix: b":",
         action: ClientAction::OpenCommandBar,
@@ -458,6 +465,10 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 43] = [
     DirectBinding {
         suffix: b"[",
         action: ClientAction::EnterCopyMode,
+    },
+    DirectBinding {
+        suffix: b"\x16",
+        action: ClientAction::PasteImage,
     },
     DirectBinding {
         suffix: b"s",
@@ -631,6 +642,7 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::ReloadConfig => "reload-config",
         ClientAction::ReloadProjectConfig => "reload-project-config",
         ClientAction::EnterCopyMode => "copy-mode",
+        ClientAction::PasteImage => "paste-image",
         ClientAction::OpenNavigator => "choose-tree",
         ClientAction::OpenAgents => "choose-agent",
         ClientAction::OpenLeftSidebar => "choose-left-sidebar",
@@ -687,6 +699,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::ReloadProjectConfig => "reload_project_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
+        ClientAction::PasteImage => "paste_image",
         ClientAction::OpenNavigator => "open_navigator",
         ClientAction::OpenAgents => "open_agents",
         ClientAction::OpenLeftSidebar => "open_left_sidebar",
@@ -790,6 +803,7 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::ReloadConfig
         | ClientAction::ReloadProjectConfig
         | ClientAction::EnterCopyMode
+        | ClientAction::PasteImage
         | ClientAction::OpenNavigator
         | ClientAction::OpenAgents
         | ClientAction::OpenLeftSidebar

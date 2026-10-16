@@ -2,6 +2,7 @@
 
 mod agent_detection;
 pub mod alerts;
+pub(crate) mod attachments;
 pub mod cli;
 pub mod client;
 pub(crate) mod command;

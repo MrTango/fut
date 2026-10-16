@@ -86,6 +86,7 @@ are common to every negotiated connection.
 | `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-1 metadata payloads are unchanged |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
 | `terminal-colors.v1` | Interactive `terminal_colors` updates with host foreground, background, and 16 ANSI palette colors | Child applications retain the emulator’s last known colors; host color updates are not sent |
+| `attachments.v1` | Interactive `attachment_begin`, `attachment_chunk`, `attachment_commit`, `attachment_cancel`; upload a PNG and paste its daemon-local path into the original terminal | Clipboard image paste is unavailable |
 | `health.v1` | `ping` / `pong` | Machine verification probes health when available and otherwise uses the successful handshake |
 | `alerts.v1` | Interactive `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | No attached-terminal bell subscription or acknowledgement |
 | `control-alerts.v1` | Lease-free control `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | Background metadata retains no bell summary; agent summaries remain in resources |
@@ -105,6 +106,31 @@ local renderer; remote catalog validation retains structural/fingerprint checks
 without imposing the local package version on remote declarations.
 No capability in generation 1 permits daemon shutdown, configuration mutation,
 agent reporting, token publication, or private control/automation methods.
+
+### Image attachment uploads
+
+`attachments.v1` is optional and offered by interactive clients. Upload messages
+are ordered, fire-and-forget envelopes without request IDs:
+
+1. `attachment_begin` supplies a fresh `transfer_id`, explicit `terminal_id`, and
+   declared byte `size` (8 bytes to 20 MiB).
+2. `attachment_chunk` supplies the same transfer ID and 1–64 KiB of `bytes`.
+3. `attachment_commit` supplies the transfer ID. The daemon verifies the exact
+   size and PNG signature, writes a private temporary file, and pastes its quoted
+   daemon-local path into the original terminal without submitting it.
+
+`attachment_cancel`, a replacement begin, errors, and disconnect discard pending
+state. Each connection has at most one pending transfer. Clients cancel work
+when switching endpoints and never replay uploads after reconnect. Switching
+tabs on the same endpoint does not change the target.
+
+Commit success uses the existing `command_completed` message with `paste`;
+upload failures use an uncorrelated operational error with code
+`attachment_error`. No destination path is accepted from the client. Pending
+and retained attachments share a daemon-wide 256 MiB budget, with at least
+64 KiB charged per file. Completed files remain until daemon shutdown rather
+than being evicted while an application may still use their paths. Abrupt
+termination may leave private files in the OS temporary directory.
 
 ## Endpoint supervision
 

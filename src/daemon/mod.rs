@@ -140,6 +140,7 @@ struct RuntimeEntry {
 }
 
 struct SharedState {
+    attachment_store: Arc<crate::attachments::Store>,
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
     automatic_agent_owners: HashMap<TerminalId, u32>,
@@ -1826,6 +1827,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let (extension_catalog, _) = watch::channel(initial_extension_catalog);
     let (agent_events, _) = broadcast::channel(AGENT_EVENT_CAPACITY);
     let mut state = SharedState {
+        attachment_store: Default::default(),
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
         automatic_agent_owners: HashMap::new(),
@@ -2922,6 +2924,8 @@ async fn handle_connection(
         return control_loop(&mut connection, shared, exited, shutdown).await;
     };
     let mut attachment = leased.expect("interactive connection selected a tab view");
+    let mut upload = crate::attachments::Upload::default();
+    let attachment_store = shared.lock().await.attachment_store.clone();
     let mut prepared_extension_reload: Option<PreparedExtensionReload> = None;
     let mut alert_client_id = None;
     let mut alert_changes = None;
@@ -2942,9 +2946,27 @@ async fn handle_connection(
                         operation,
                     ).await?
                 {
+                    if is_attachment_message(&envelope.message) {
+                        upload.clear();
+                    }
                     continue;
                 }
                 match envelope.message {
+                    message @ (ClientMessage::AttachmentBegin { .. }
+                    | ClientMessage::AttachmentChunk { .. }
+                    | ClientMessage::AttachmentCommit { .. }
+                    | ClientMessage::AttachmentCancel { .. }) => {
+                        match receive_attachment(&shared, &attachment, &attachment_store, &mut upload, message).await {
+                            Ok(true) => send(&mut connection, None, ServerMessage::CommandCompleted {
+                                command: AcknowledgedCommand::Paste,
+                            }).await?,
+                            Ok(false) => {},
+                            Err(error) => {
+                                upload.clear();
+                                send_error(&mut connection, None, "attachment_error", &error.message).await?;
+                            }
+                        }
+                    }
                     ClientMessage::PrepareExtensionReload => {
                         if envelope.request_id.is_none() {
                             send_error(
@@ -4698,6 +4720,10 @@ async fn control_loop(
             | ClientMessage::Input { .. }
             | ClientMessage::KeyInput { .. }
             | ClientMessage::Paste { .. }
+            | ClientMessage::AttachmentBegin { .. }
+            | ClientMessage::AttachmentChunk { .. }
+            | ClientMessage::AttachmentCommit { .. }
+            | ClientMessage::AttachmentCancel { .. }
             | ClientMessage::CopyMode { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::SelectTarget { .. } => {
@@ -6749,6 +6775,82 @@ async fn wait_for_agent_events(
     }
 }
 
+fn is_attachment_message(message: &ClientMessage) -> bool {
+    matches!(
+        message,
+        ClientMessage::AttachmentBegin { .. }
+            | ClientMessage::AttachmentChunk { .. }
+            | ClientMessage::AttachmentCommit { .. }
+            | ClientMessage::AttachmentCancel { .. }
+    )
+}
+
+async fn receive_attachment(
+    shared: &Shared,
+    attachment: &Attachment,
+    store: &crate::attachments::Store,
+    upload: &mut crate::attachments::Upload,
+    message: ClientMessage,
+) -> Result<bool, DaemonError> {
+    let upload_error =
+        |error: anyhow::Error| DaemonError::new("attachment_error", error.to_string());
+    match message {
+        ClientMessage::AttachmentBegin {
+            transfer_id,
+            terminal_id,
+            size,
+        } => {
+            upload.clear();
+            {
+                // Clipboard acquisition is asynchronous: the client may have
+                // selected another tab before Begin arrives. Authorize the
+                // explicit daemon-local target, not the current attachment view.
+                let state = shared.lock().await;
+                state
+                    .resources
+                    .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))?;
+                if !state.accepting || !state.runtimes.contains_key(&terminal_id) {
+                    return Err(DaemonError::new(
+                        "attachment_error",
+                        "attachment target is not running",
+                    ));
+                }
+            }
+            if attachment.owns_copy_mode(terminal_id) {
+                return Err(DaemonError::new(
+                    "copy_mode_active",
+                    "terminal paste is disabled while copy mode is active",
+                ));
+            }
+            upload
+                .begin(store, transfer_id, terminal_id, size)
+                .map_err(upload_error)?;
+        }
+        ClientMessage::AttachmentChunk { transfer_id, bytes } => {
+            upload.chunk(transfer_id, bytes).map_err(upload_error)?;
+        }
+        ClientMessage::AttachmentCancel { transfer_id } => {
+            upload.cancel(transfer_id).map_err(upload_error)?;
+        }
+        ClientMessage::AttachmentCommit { transfer_id } => {
+            let (terminal_id, file) = upload.commit(transfer_id).await.map_err(upload_error)?;
+            if attachment.owns_copy_mode(terminal_id) {
+                return Err(DaemonError::new(
+                    "copy_mode_active",
+                    "terminal paste is disabled while copy mode is active",
+                ));
+            }
+            let text = file.quoted_path().map_err(upload_error)?;
+            targeted_terminal_input(shared, terminal_id, TerminalInputOperation::Text { text })
+                .await?;
+            store.retain(file);
+            return Ok(true);
+        }
+        _ => unreachable!("only attachment messages reach the upload handler"),
+    }
+    Ok(false)
+}
+
 async fn targeted_terminal_input(
     shared: &Shared,
     terminal_id: TerminalId,
@@ -6959,6 +7061,7 @@ async fn send_agent_report_result(
 
 fn fire_and_forget_operation(message: &ClientMessage) -> Option<&'static str> {
     match message {
+        message if is_attachment_message(message) => Some("attachment upload"),
         ClientMessage::MouseInput { .. } => Some("mouse input"),
         ClientMessage::ResetViewport { .. } => Some("reset viewport"),
         ClientMessage::RefreshTerminal { .. } => Some("refresh terminal"),
@@ -7574,6 +7677,80 @@ mod tests {
         assert!(attachment.copy_mode_terminal.is_none());
     }
 
+    #[tokio::test]
+    async fn attachment_pastes_to_original_target_when_view_changes_before_begin_without_enter() {
+        let (mut state, path) = inconsistent_state();
+        let (_original, terminal) =
+            test_attachment("IFS= read -r line; printf ENTER_RECEIVED; sleep 60");
+        state.runtimes.insert(
+            path.terminal_id,
+            RuntimeEntry {
+                handle: terminal.clone(),
+                lease: AttachmentLease::default(),
+            },
+        );
+        let store = state.attachment_store.clone();
+        let shared = Arc::new(Mutex::new(state));
+        let mut upload = crate::attachments::Upload::default();
+        let transfer_id = Uuid::new_v4();
+        let (changed_view, other_terminal) = test_attachment("sleep 60");
+        receive_attachment(
+            &shared,
+            &changed_view,
+            &store,
+            &mut upload,
+            ClientMessage::AttachmentBegin {
+                transfer_id,
+                terminal_id: path.terminal_id,
+                size: 8,
+            },
+        )
+        .await
+        .unwrap();
+        receive_attachment(
+            &shared,
+            &changed_view,
+            &store,
+            &mut upload,
+            ClientMessage::AttachmentChunk {
+                transfer_id,
+                bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        // This view's terminal has no resource/runtime entry. Success proves
+        // commit did not redirect through the new focused terminal.
+        assert!(
+            receive_attachment(
+                &shared,
+                &changed_view,
+                &store,
+                &mut upload,
+                ClientMessage::AttachmentCommit { transfer_id }
+            )
+            .await
+            .unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let output = terminal
+                    .read_output(TerminalOutputSource::Visible, 24, false)
+                    .await
+                    .unwrap();
+                if output.text.contains("fut-attachment-") {
+                    assert!(!output.text.contains("ENTER_RECEIVED"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        terminal.close().await.unwrap();
+        other_terminal.close().await.unwrap();
+    }
+
     fn test_attachment(script: &str) -> (Attachment, Arc<TerminalHandle>) {
         let terminal = Arc::new(spawn_test_terminal(script));
         let pane_id = PaneId::new();
@@ -7985,6 +8162,7 @@ mod tests {
         let extension_catalog = watch::channel(extension_registry.catalog().unwrap()).0;
         (
             SharedState {
+                attachment_store: Default::default(),
                 resources,
                 runtimes: HashMap::new(),
                 automatic_agent_owners: HashMap::new(),
@@ -8790,6 +8968,7 @@ scope = "workspace"
         );
         let extension_catalog = watch::channel(extension_registry.catalog().unwrap()).0;
         let mut state = SharedState {
+            attachment_store: Default::default(),
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),
             automatic_agent_owners: HashMap::new(),

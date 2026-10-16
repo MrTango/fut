@@ -36,6 +36,15 @@ impl Attachment {
         }
     }
 
+    pub(super) fn supports_attachments(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote { capabilities, .. } => {
+                capabilities.contains(crate::protocol::remote::Capability::Attachments)
+            }
+        }
+    }
+
     pub(super) fn locality(&self) -> Locality {
         match self {
             Self::Local(_) => Locality::Local,
@@ -98,5 +107,17 @@ impl Attachment {
                 socket.to_owned(),
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_paste_requires_remote_attachment_negotiation_but_is_available_locally() {
+        assert!(Attachment::Local(PathBuf::from("/tmp/fut.sock")).supports_attachments());
+        assert!(!Attachment::remote(Capabilities::default(), "old-host").supports_attachments());
+        assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_attachments());
     }
 }

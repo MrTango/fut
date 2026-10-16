@@ -113,6 +113,24 @@ filesystem. Remote terminal links are limited to HTTP and HTTPS. Ordinary
 terminal input, navigation, layout actions, copy mode, and pane links continue
 to work.
 
+### Paste a clipboard image
+
+Press `Ctrl-b Ctrl-v`, or search for **Paste clipboard image** in the command
+palette. Fut reads an image from your local clipboard, uploads it to the daemon
+hosting the terminal, and inserts a quoted PNG file path without pressing Enter.
+The target is captured when you invoke the action, so switching panes does not
+redirect the paste. Ordinary text paste is unchanged.
+
+This works locally and with `fut --machine workbox`; the remote daemon must
+support image attachments. Running `ssh workbox` and then starting Fut there
+does not give Fut access to your laptop's clipboard.
+
+macOS uses the system clipboard, including TIFF screenshot conversion. On Linux,
+install `wl-clipboard` for Wayland or `xclip` for X11; the clipboard must offer
+PNG data. Images are limited to 20 MiB. Uploaded files are private and retained
+until the daemon exits, with a 256 MiB shared storage budget. Incomplete uploads
+are discarded on disconnect, and transfers are never replayed after reconnect.
+
 Fut supplies SSH keepalive defaults of `ServerAliveInterval 30` and
 `ServerAliveCountMax 6` through a private temporary config file. Your user and
 system SSH settings take precedence, including an explicit interval of zero.
