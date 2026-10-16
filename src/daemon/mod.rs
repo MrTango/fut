@@ -7442,6 +7442,22 @@ mod tests {
             png: vec![1, 2, 3].into(),
         });
         screen
+            .graphics
+            .placements
+            .push(crate::domain::KittyPlacement {
+                image_id: 7,
+                placement_id: 1,
+                column: 0,
+                row: 0,
+                columns: 1,
+                rows: 1,
+                source_x: 0,
+                source_y: 0,
+                source_width: 1,
+                source_height: 1,
+                z: 0,
+            });
+        screen
     }
 
     fn sent_image_generations(images: &[ServerMessage]) -> Vec<u64> {
