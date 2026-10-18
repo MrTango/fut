@@ -4,6 +4,7 @@
 
 - Forward Fut's status rollup to the terminal Fut runs in as OSC 7501, so Ghostty or an outer Fut shows working, blocked, done, and error status for every Fut terminal. Fut sends it only after the terminal answers the support query, clears it on detach, and can be forced on or off with `alerts.outer_terminal_status`.
 - Report status from the Pi extension over OSC 7501 on Pi's terminal, so it also works in other terminals that support the protocol and over SSH, falling back to `fut agent report` when Pi has no terminal.
+- Show progress from programs that only emit ConEmu-style OSC 9;4 progress as working or error status in tabs and workspaces. Explicit OSC 7501 and agent reports always take precedence, and once a program speaks OSC 7501 its legacy progress is ignored until a full reset.
 
 ## 0.37
 

@@ -27,7 +27,7 @@ use crate::domain::{
 use super::{
     CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
     ghostty::{CopyModeFailure, GhosttyTerminal, MouseForwarding},
-    status::{NativeStatusBatch, StatusCoalescer},
+    status::{NativeStatusBatch, NativeStatusSource, StatusCoalescer},
 };
 
 const QUEUE_CAPACITY: usize = 64;
@@ -701,24 +701,37 @@ impl<'a> RuntimeStatusProducer<'a> {
     /// Accept callbacks immediately after one VT feed. The foreground process
     /// is sampled only when that feed actually produced status records.
     fn receive(&mut self, terminal: &GhosttyTerminal) {
-        let updates = terminal.take_status_updates();
+        let updates = terminal.take_status_receipts();
         let process = self.process;
         self.receive_updates(updates, || process.map(StatusProcess::foreground_pid));
     }
 
     fn receive_updates(
         &mut self,
-        updates: Vec<StatusUpdate>,
+        updates: Vec<(NativeStatusSource, StatusUpdate)>,
         foreground_pid: impl FnOnce() -> Option<u32>,
     ) {
         if updates.is_empty() {
             return;
         }
-        for batch in self.coalescer.receive(NativeStatusBatch {
-            updates,
-            foreground_pid: foreground_pid(),
-        }) {
-            self.publish(batch);
+        let foreground_pid = foreground_pid();
+        // Split at protocol boundaries, keeping parser order: each run is
+        // applied with its own provenance.
+        let mut runs: Vec<NativeStatusBatch> = Vec::new();
+        for (source, update) in updates {
+            match runs.last_mut() {
+                Some(run) if run.source == source => run.updates.push(update),
+                _ => runs.push(NativeStatusBatch {
+                    updates: vec![update],
+                    foreground_pid,
+                    source,
+                }),
+            }
+        }
+        for run in runs {
+            for batch in self.coalescer.receive(run) {
+                self.publish(batch);
+            }
         }
     }
 
@@ -736,8 +749,9 @@ impl<'a> RuntimeStatusProducer<'a> {
         if let Some(batch) = self.coalescer.flush(true) {
             self.publish(batch);
         }
-        let batch = self.coalescer.finish();
-        self.publish(batch);
+        for batch in self.coalescer.finish() {
+            self.publish(batch);
+        }
     }
 
     fn publish(&self, batch: NativeStatusBatch) {
@@ -2667,7 +2681,7 @@ mod tests {
     fn status_pid_is_sampled_once_only_for_nonempty_vt_receipts() {
         use std::cell::Cell;
 
-        let (status_updates, _statuses) = async_mpsc::channel(2);
+        let (status_updates, mut statuses) = async_mpsc::channel(2);
         let mut producer = RuntimeStatusProducer::new(&status_updates, None);
         let samples = Cell::new(0);
         producer.receive_updates(Vec::new(), || {
@@ -2676,14 +2690,37 @@ mod tests {
         });
         assert_eq!(samples.get(), 0);
 
+        let progress = StatusUpdate::Clear { id: None };
         producer.receive_updates(
-            vec![StatusUpdate::Clear { id: None }, StatusUpdate::PromptStart],
+            vec![
+                (NativeStatusSource::Progress, progress.clone()),
+                (NativeStatusSource::Osc, StatusUpdate::Clear { id: None }),
+                (NativeStatusSource::Osc, StatusUpdate::PromptStart),
+            ],
             || {
                 samples.set(samples.get() + 1);
                 Some(41)
             },
         );
         assert_eq!(samples.get(), 1);
+
+        // Each protocol run keeps its own provenance and parser order.
+        let batch = |updates, source| NativeStatusBatch {
+            updates,
+            foreground_pid: Some(41),
+            source,
+        };
+        assert_eq!(
+            statuses.try_recv().unwrap(),
+            batch(vec![progress], NativeStatusSource::Progress)
+        );
+        assert_eq!(
+            statuses.try_recv().unwrap(),
+            batch(
+                vec![StatusUpdate::Clear { id: None }, StatusUpdate::PromptStart],
+                NativeStatusSource::Osc,
+            )
+        );
     }
 
     #[tokio::test]

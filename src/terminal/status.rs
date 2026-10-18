@@ -3,10 +3,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::domain::{StatusReport, StatusState, StatusUpdate};
+use crate::domain::{StatusReport, StatusSource, StatusState, StatusUpdate};
 
 const STATUS_CLASSIFIER_CAPACITY: usize = 256;
 const STATUS_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Which in-band protocol produced a status update.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NativeStatusSource {
+    /// OSC 7501 reports and terminal lifecycle boundaries.
+    #[default]
+    Osc,
+    /// Root records inferred from legacy OSC 9;4 progress.
+    Progress,
+}
+
+impl NativeStatusSource {
+    pub(crate) fn status_source(self) -> StatusSource {
+        match self {
+            Self::Osc => StatusSource::Osc,
+            Self::Progress => StatusSource::legacy_progress(),
+        }
+    }
+}
 
 /// Status records received from one foreground process observation. This is
 /// producer metadata only; it never enters the public status model or wire.
@@ -14,6 +33,7 @@ const STATUS_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct NativeStatusBatch {
     pub updates: Vec<StatusUpdate>,
     pub foreground_pid: Option<u32>,
+    pub source: NativeStatusSource,
 }
 
 impl NativeStatusBatch {
@@ -33,6 +53,7 @@ impl NativeStatusBatch {
 pub(super) struct StatusCoalescer {
     pending: PendingStatusUpdates,
     foreground_pid: Option<u32>,
+    source: NativeStatusSource,
     has_producer: bool,
 }
 
@@ -49,10 +70,22 @@ impl StatusCoalescer {
         self.pending.wait_at(Instant::now())
     }
 
-    pub(super) fn finish(&mut self) -> NativeStatusBatch {
+    /// Flush everything pending and end with process exit. The exit is a
+    /// lifecycle boundary, so it always travels with OSC provenance: a weak
+    /// batch is ignored while an explicit report holds the terminal.
+    pub(super) fn finish(&mut self) -> Vec<NativeStatusBatch> {
+        let mut ready = Vec::with_capacity(2);
+        if self.source != NativeStatusSource::Osc {
+            ready.extend(self.take());
+            self.pending = PendingStatusUpdates::default();
+            self.source = NativeStatusSource::Osc;
+        }
         self.pending.process_exit();
-        self.take()
-            .expect("process exit is an urgent status update")
+        ready.push(
+            self.take()
+                .expect("process exit is an urgent status update"),
+        );
+        ready
     }
 
     fn receive_at(&mut self, batch: NativeStatusBatch, now: Instant) -> Vec<NativeStatusBatch> {
@@ -61,16 +94,20 @@ impl StatusCoalescer {
         }
 
         let mut ready = Vec::with_capacity(2);
-        if self.has_producer && self.foreground_pid != batch.foreground_pid {
+        if self.has_producer
+            && (self.foreground_pid != batch.foreground_pid || self.source != batch.source)
+        {
             if let Some(previous) = self.take() {
                 ready.push(previous);
             }
             // Report history belongs to the producer that established it. A
-            // new producer's first record is semantic evidence, not progress
-            // that may be folded into the previous producer's record.
+            // new producer's (or protocol's) first record is semantic
+            // evidence, not progress that may be folded into the previous
+            // producer's record.
             self.pending = PendingStatusUpdates::default();
         }
         self.foreground_pid = batch.foreground_pid;
+        self.source = batch.source;
         self.has_producer = true;
 
         for update in batch.updates {
@@ -96,6 +133,7 @@ impl StatusCoalescer {
         (!updates.is_empty()).then_some(NativeStatusBatch {
             updates,
             foreground_pid: self.foreground_pid,
+            source: self.source,
         })
     }
 }
@@ -235,6 +273,7 @@ mod tests {
         let mut batch = NativeStatusBatch {
             updates: Vec::new(),
             foreground_pid: Some(12345),
+            source: NativeStatusSource::Osc,
         };
         assert_eq!(batch.owner_pid(12344), Some(12345));
         assert_eq!(batch.owner_pid(12345), None);
@@ -260,6 +299,7 @@ mod tests {
         NativeStatusBatch {
             updates,
             foreground_pid: Some(pid),
+            source: NativeStatusSource::Osc,
         }
     }
 
@@ -386,6 +426,54 @@ mod tests {
             vec![
                 StatusUpdate::Report(report("b", 10)),
                 StatusUpdate::Report(report("a", 20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn protocol_boundary_flushes_and_exit_keeps_osc_provenance() {
+        let now = Instant::now();
+        let progress = |updates| NativeStatusBatch {
+            source: NativeStatusSource::Progress,
+            ..receipt(41, updates)
+        };
+        let mut statuses = StatusCoalescer::default();
+        assert_eq!(
+            statuses.receive_at(progress(vec![StatusUpdate::Report(report("", 10))]), now),
+            vec![progress(vec![StatusUpdate::Report(report("", 10))])]
+        );
+        // Legacy progress-only updates coalesce like native ones.
+        assert!(
+            statuses
+                .receive_at(progress(vec![StatusUpdate::Report(report("", 20))]), now)
+                .is_empty()
+        );
+        assert!(
+            statuses
+                .receive_at(progress(vec![StatusUpdate::Report(report("", 30))]), now)
+                .is_empty()
+        );
+
+        // An OSC record for the same id is not folded into legacy progress.
+        assert_eq!(
+            statuses.receive_at(receipt(41, vec![StatusUpdate::Report(report("", 40))]), now),
+            vec![
+                progress(vec![StatusUpdate::Report(report("", 30))]),
+                receipt(41, vec![StatusUpdate::Report(report("", 40))]),
+            ]
+        );
+
+        let _ = statuses.receive_at(progress(vec![StatusUpdate::Report(report("", 50))]), now);
+        assert!(
+            statuses
+                .receive_at(progress(vec![StatusUpdate::Report(report("", 60))]), now)
+                .is_empty()
+        );
+        assert_eq!(
+            statuses.finish(),
+            vec![
+                progress(vec![StatusUpdate::Report(report("", 60))]),
+                receipt(41, vec![StatusUpdate::ProcessExit]),
             ]
         );
     }

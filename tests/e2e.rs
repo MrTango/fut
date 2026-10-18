@@ -1454,6 +1454,90 @@ async fn osc_7501_capability_queries_reply_over_the_real_pty_with_bel_and_st() {
 }
 
 #[tokio::test]
+async fn osc_9_4_progress_drives_a_weak_root_until_osc_7501_and_resumes_after_ris() {
+    let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    start) printf '\033]9;4;1;40\007' ;;
+    fail) printf '\033]9;4;2\033\\' ;;
+    remove) printf '\033]9;4;0\007' ;;
+    native) printf '\033]7501;state=blocked:kind=permission:msg=QXBwbHk/\007' ;;
+    legacy) printf '\033]9;4;1;90\007\033]9;4;0\007\033]7501;state=working:id=marker\007' ;;
+    reset) printf '\033c\033]9;4;3\007' ;;
+  esac
+done
+"#;
+    let harness = Harness::start(script).await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+    let send = |line: &str| {
+        let output = harness
+            .cli()
+            .args(["terminal", "run", &terminal, line])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    let harness_ref = &harness;
+    let activity_until = |condition: fn(&fut::domain::ProgramStatus) -> bool| async move {
+        time::timeout(DEADLINE, async {
+            loop {
+                let activity = harness_ref.resources().await.sessions[0].workspaces[0].tabs[0]
+                    .panes[0]
+                    .activity
+                    .clone();
+                if condition(&activity) {
+                    break activity;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("program status did not reach the expected state")
+    };
+
+    send("start");
+    let activity = activity_until(|activity| activity.progress() == Some(40)).await;
+    assert_eq!(activity.root().unwrap().state, StatusState::Working);
+    assert_eq!(activity.source, Some(StatusSource::legacy_progress()));
+    // Legacy progress is inferred, not an agent integration.
+    let get = harness
+        .cli()
+        .args(["--json", "agent", "get", &terminal])
+        .output()
+        .unwrap();
+    assert!(!get.status.success());
+
+    send("fail");
+    let activity = activity_until(|activity| activity.summary_state() == StatusState::Error).await;
+    assert!(activity.has_unread_attention());
+    send("remove");
+    activity_until(|activity| activity.records.is_empty()).await;
+
+    send("start");
+    activity_until(|activity| activity.progress() == Some(40)).await;
+    send("native");
+    activity_until(|activity| activity.summary_state() == StatusState::Blocked).await;
+    send("legacy");
+    let activity = activity_until(|activity| activity.records.len() == 2).await;
+    let root = activity.root().unwrap();
+    assert_eq!(root.state, StatusState::Blocked);
+    assert_eq!(root.message.as_deref(), Some("Apply?"));
+    assert_eq!(activity.source, Some(StatusSource::Osc));
+
+    send("reset");
+    let activity = activity_until(|activity| {
+        activity.records.len() == 1 && activity.summary_state() == StatusState::Working
+    })
+    .await;
+    assert_eq!(activity.root().unwrap().progress, None);
+    assert_eq!(activity.source, Some(StatusSource::legacy_progress()));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn agent_waiters_follow_fresh_work_despite_old_error_and_reject_concurrent_prompt() {
     let binary = env!("CARGO_BIN_EXE_fut");
     let script = format!(

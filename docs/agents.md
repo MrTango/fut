@@ -64,6 +64,38 @@ record contents. Queries are optional: programs may report immediately.
 Fut rejects reports over the protocol's bounds and text containing control
 characters. Displayed messages remain untrusted plain text.
 
+### Legacy OSC 9;4 progress
+
+Programs that only emit ConEmu-style progress (`OSC 9 ; 4 ; state ; percent ST`,
+as emitted by tools such as cargo's `term.progress.term-integration`) still
+show progress in Fut. Fut
+maps it onto the root record:
+
+| OSC 9;4 state | Root record |
+| --- | --- |
+| `1` set | `working` with the percentage, or indeterminate without one |
+| `3` indeterminate | `working`, indeterminate |
+| `4` paused | `working`, keeping the last percentage when none is given |
+| `2` error | `error` |
+| `0` remove | removes the record that OSC 9;4 created |
+
+Paused maps to `working`, not `blocked`: a paused bar does not mean the
+program is waiting for the user, and `blocked` would raise attention.
+
+This mapping is always on and deliberately weak. Its records report
+`activity.source` as `{"type": "detection", "agent": "progress", "rule":
+"osc_9_4"}`, so like screen detection they never make a terminal an agent in
+`agent list`, `agent get`, or the Agents projections; they drive the normal
+status, tab and workspace progress, and error attention. Explicit OSC 7501
+and CLI reports take precedence: they replace the inferred record, OSC 9;4 is
+ignored while an explicit reporter owns the terminal, and `9;4;0` only removes
+what OSC 9;4 created. Once a program sends any OSC 7501 report, Fut ignores
+OSC 9;4 in that terminal until a full reset (RIS), so legacy progress emitted
+alongside the real protocol cannot overwrite a blocked kind or message. A new
+prompt or the exit of the foreground program that sent it ends inferred
+working progress; an inferred error stays, like any error, until `9;4;0` or
+new progress replaces it.
+
 Programs running inside Fut receive scoped `FUT_SESSION_ID`, `FUT_WORKSPACE_ID`,
 `FUT_TAB_ID`, `FUT_PANE_ID`, and `FUT_TERMINAL_ID` environment variables. These
 use Fut's compact, reversible 23-character form; CLI ID arguments also accept

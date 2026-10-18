@@ -655,7 +655,7 @@ impl SharedState {
         self.apply_status_updates_internal(
             terminal_id,
             batch.updates,
-            StatusSource::Osc,
+            batch.source.status_source(),
             true,
             automatic_pid,
         )
@@ -9416,6 +9416,56 @@ mod tests {
     }
 
     #[test]
+    fn legacy_progress_batches_are_weak_and_their_clear_spares_explicit_records() {
+        let (mut state, path) = inconsistent_state();
+        let mut events = state.agent_events.subscribe();
+        let legacy = |updates| NativeStatusBatch {
+            updates,
+            foreground_pid: None,
+            source: crate::terminal::NativeStatusSource::Progress,
+        };
+        state
+            .apply_status_updates(
+                path.terminal_id,
+                vec![
+                    status_report("result", StatusState::Done),
+                    StatusUpdate::PromptStart,
+                ],
+                StatusSource::Osc,
+            )
+            .unwrap();
+        let _ = events.try_recv().unwrap();
+
+        state
+            .apply_terminal_status_updates(
+                path.terminal_id,
+                legacy(vec![status_report("", StatusState::Working)]),
+            )
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert_eq!(
+            event.transitions,
+            vec![StatusRecordLifecycle::Working(String::new())]
+        );
+        assert_eq!(event.status.records.len(), 2);
+
+        state
+            .apply_terminal_status_updates(
+                path.terminal_id,
+                legacy(vec![StatusUpdate::Clear { id: None }]),
+            )
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert_eq!(
+            event.transitions,
+            vec![StatusRecordLifecycle::Removed(String::new())]
+        );
+        let status = state.resources.program_status(path.terminal_id).unwrap();
+        assert_eq!(status.records.len(), 1);
+        assert_eq!(status.records[0].id, "result");
+    }
+
+    #[test]
     fn terminal_process_exit_is_distinct_and_retained_result_still_settles() {
         let (mut state, path) = inconsistent_state();
         let mut events = state.agent_events.subscribe();
@@ -9436,6 +9486,7 @@ mod tests {
                 NativeStatusBatch {
                     updates: vec![StatusUpdate::ProcessExit],
                     foreground_pid: None,
+                    source: crate::terminal::NativeStatusSource::Osc,
                 },
             )
             .unwrap();
@@ -9464,6 +9515,7 @@ mod tests {
                         StatusUpdate::ProcessExit,
                     ],
                     foreground_pid: None,
+                    source: crate::terminal::NativeStatusSource::Osc,
                 },
             )
             .unwrap();

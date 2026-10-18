@@ -23,12 +23,12 @@ use libghostty_vt::{
     style::{StyleColor, Underline},
     terminal::{
         Mode, Point, PointCoordinate, PointSpace, ProgramStatusKind, ProgramStatusReport,
-        ProgramStatusState, ScrollViewport, SemanticPromptKind,
+        ProgramStatusState, ProgressReport, ProgressState, ScrollViewport, SemanticPromptKind,
     },
 };
 use uuid::Uuid;
 
-use super::{DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH};
+use super::{DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH, status::NativeStatusSource};
 use crate::domain::{
     BlockedKind, Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError,
     CopyModeMovement, Cursor, CursorShape, KittyGraphics, KittyImage, KittyPlacement,
@@ -86,6 +86,64 @@ fn status_update(report: ProgramStatusReport) -> StatusUpdate {
         title: (!report.title.is_empty()).then_some(report.title),
         message: (!report.message.is_empty()).then_some(report.message),
     })
+}
+
+/// Status callbacks in parser order, plus the per-stream state that decides
+/// whether legacy progress may still speak for the root record.
+#[derive(Default)]
+struct StatusReceipts {
+    updates: Vec<(NativeStatusSource, StatusUpdate)>,
+    /// An OSC 7501 report arrived since the last full reset. From then on the
+    /// program speaks the real protocol, and OSC 9;4 progress (often emitted
+    /// alongside it) must not overwrite its kind or message.
+    program_status_seen: bool,
+    /// Last OSC 9;4 percentage, kept for a pause that omits it.
+    progress: Option<u8>,
+}
+
+impl StatusReceipts {
+    fn push_progress(&mut self, report: ProgressReport) {
+        if self.program_status_seen {
+            return;
+        }
+        let state = match report.state {
+            ProgressState::Remove => {
+                self.progress = None;
+                self.updates.push((
+                    NativeStatusSource::Progress,
+                    StatusUpdate::Clear { id: None },
+                ));
+                return;
+            }
+            ProgressState::Set => {
+                self.progress = report.progress;
+                StatusState::Working
+            }
+            ProgressState::Indeterminate => {
+                self.progress = None;
+                StatusState::Working
+            }
+            // Paused work is still the program's own, not a request for
+            // input, so it stays working rather than blocked.
+            ProgressState::Pause => {
+                self.progress = report.progress.or(self.progress);
+                StatusState::Working
+            }
+            ProgressState::Error => StatusState::Error,
+        };
+        self.updates.push((
+            NativeStatusSource::Progress,
+            StatusUpdate::Report(StatusReport {
+                id: String::new(),
+                state,
+                kind: None,
+                progress: self.progress,
+                app: None,
+                title: None,
+                message: None,
+            }),
+        ));
+    }
 }
 
 pub(crate) enum MouseInputOutcome {
@@ -205,7 +263,7 @@ pub(super) struct GhosttyTerminal {
     kitty_placements: PlacementIterator<'static>,
     kitty_png_cache: HashMap<u64, Arc<[u8]>>,
     bell_count: Arc<AtomicU64>,
-    status_updates: Arc<Mutex<Vec<StatusUpdate>>>,
+    status_updates: Arc<Mutex<StatusReceipts>>,
     size: TerminalSize,
     revision: u64,
     synchronized_output_started: Option<Instant>,
@@ -260,19 +318,49 @@ impl GhosttyTerminal {
         terminal.on_bell(move |_| {
             callback_bell_count.fetch_add(1, Ordering::Relaxed);
         })?;
-        let status_updates = Arc::new(Mutex::new(Vec::new()));
+        let status_updates = Arc::new(Mutex::new(StatusReceipts::default()));
         let callback_statuses = Arc::clone(&status_updates);
         terminal.on_program_status(move |_, report| {
-            if let Ok(mut updates) = callback_statuses.lock() {
-                updates.push(status_update(report));
+            if let Ok(mut receipts) = callback_statuses.lock() {
+                receipts.program_status_seen = true;
+                let update = status_update(report);
+                // RIS removes progress just before it clears program status;
+                // the full clear subsumes that legacy removal.
+                let legacy_clear = (
+                    NativeStatusSource::Progress,
+                    StatusUpdate::Clear { id: None },
+                );
+                if update == (StatusUpdate::Clear { id: None })
+                    && receipts.updates.last() == Some(&legacy_clear)
+                {
+                    receipts.updates.pop();
+                }
+                receipts.updates.push((NativeStatusSource::Osc, update));
             }
         })?;
         let callback_statuses = Arc::clone(&status_updates);
         terminal.on_semantic_prompt(move |_, kind| {
             if kind == SemanticPromptKind::PromptStart
-                && let Ok(mut updates) = callback_statuses.lock()
+                && let Ok(mut receipts) = callback_statuses.lock()
             {
-                updates.push(StatusUpdate::PromptStart);
+                receipts
+                    .updates
+                    .push((NativeStatusSource::Osc, StatusUpdate::PromptStart));
+            }
+        })?;
+        let callback_statuses = Arc::clone(&status_updates);
+        terminal.on_progress_report(move |_, report| {
+            if let Ok(mut receipts) = callback_statuses.lock() {
+                receipts.push_progress(report);
+            }
+        })?;
+        // Ghostty reports RIS's program-status clear before this callback, so
+        // the reset releases legacy progress only after the records are gone.
+        let callback_statuses = Arc::clone(&status_updates);
+        terminal.on_reset(move |_| {
+            if let Ok(mut receipts) = callback_statuses.lock() {
+                receipts.program_status_seen = false;
+                receipts.progress = None;
             }
         })?;
 
@@ -351,10 +439,19 @@ impl GhosttyTerminal {
         self.bell_count.load(Ordering::Relaxed)
     }
 
-    pub(super) fn take_status_updates(&self) -> Vec<StatusUpdate> {
-        self.status_updates
-            .lock()
-            .map_or_else(|_| Vec::new(), |mut updates| std::mem::take(&mut *updates))
+    pub(super) fn take_status_receipts(&self) -> Vec<(NativeStatusSource, StatusUpdate)> {
+        self.status_updates.lock().map_or_else(
+            |_| Vec::new(),
+            |mut receipts| std::mem::take(&mut receipts.updates),
+        )
+    }
+
+    #[cfg(test)]
+    fn take_status_updates(&self) -> Vec<StatusUpdate> {
+        self.take_status_receipts()
+            .into_iter()
+            .map(|(_, update)| update)
+            .collect()
     }
 
     /// Snapshot half of `feed`. Respects synchronized-output suppression the
@@ -2603,6 +2700,95 @@ mod tests {
                 title: None,
                 message: None,
             })]
+        );
+    }
+
+    fn legacy_root(state: StatusState, progress: Option<u8>) -> StatusUpdate {
+        StatusUpdate::Report(StatusReport {
+            id: String::new(),
+            state,
+            kind: None,
+            progress,
+            app: None,
+            title: None,
+            message: None,
+        })
+    }
+
+    #[test]
+    fn legacy_progress_maps_onto_the_root_record() {
+        let mut terminal = terminal(20, 2);
+        terminal.vt_write(
+            b"\x1b]9;4;1;40\x07\
+              \x1b]9;4;4\x07\
+              \x1b]9;4;4;55\x1b\\\
+              \x1b]9;4;3\x07\
+              \x1b]9;4;2;80\x07\
+              \x1b]9;4;0\x07",
+        );
+        let progress = NativeStatusSource::Progress;
+        assert_eq!(
+            terminal.take_status_receipts(),
+            vec![
+                (progress, legacy_root(StatusState::Working, Some(40))),
+                // A pause without a value keeps the last percentage.
+                (progress, legacy_root(StatusState::Working, Some(40))),
+                (progress, legacy_root(StatusState::Working, Some(55))),
+                (progress, legacy_root(StatusState::Working, None)),
+                (progress, legacy_root(StatusState::Error, None)),
+                (progress, StatusUpdate::Clear { id: None }),
+            ]
+        );
+
+        // RIS's own progress removal folds into its full status clear.
+        terminal.vt_write(b"\x1b]9;4;1;5\x07\x1bc");
+        assert_eq!(
+            terminal.take_status_receipts(),
+            vec![
+                (progress, legacy_root(StatusState::Working, Some(5))),
+                (NativeStatusSource::Osc, StatusUpdate::Clear { id: None }),
+            ]
+        );
+    }
+
+    #[test]
+    fn program_status_silences_legacy_progress_until_full_reset() {
+        let mut terminal = terminal(20, 2);
+        terminal.vt_write(
+            b"\x1b]9;4;1;10\x07\
+              \x1b]7501;state=blocked:kind=permission:msg=QXBwbHk/\x07\
+              \x1b]9;4;1;20\x07\
+              \x1b]9;4;0\x07\
+              \x1b]133;A\x07\
+              \x1b]9;4;3\x07\
+              \x1b[!p\x1b]9;4;3\x07",
+        );
+        let receipts = terminal.take_status_receipts();
+        let sources = receipts
+            .iter()
+            .map(|(source, _)| *source)
+            .collect::<Vec<_>>();
+        // Neither a prompt boundary nor a soft reset re-enables progress.
+        assert_eq!(
+            sources,
+            [
+                NativeStatusSource::Progress,
+                NativeStatusSource::Osc,
+                NativeStatusSource::Osc,
+            ]
+        );
+        assert_eq!(receipts[2].1, StatusUpdate::PromptStart);
+
+        terminal.vt_write(b"\x1bc\x1b]9;4;1;30\x07");
+        assert_eq!(
+            terminal.take_status_receipts(),
+            vec![
+                (NativeStatusSource::Osc, StatusUpdate::Clear { id: None }),
+                (
+                    NativeStatusSource::Progress,
+                    legacy_root(StatusState::Working, Some(30))
+                ),
+            ]
         );
     }
 

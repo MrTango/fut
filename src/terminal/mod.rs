@@ -39,6 +39,8 @@ pub use runtime::{
     spawn_terminal,
 };
 pub(crate) use status::NativeStatusBatch;
+#[cfg(test)]
+pub(crate) use status::NativeStatusSource;
 
 /// Benchmark-only access to the VT feed → snapshot path. Not part of the API.
 #[doc(hidden)]
