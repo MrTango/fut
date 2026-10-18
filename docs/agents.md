@@ -360,8 +360,9 @@ like lifecycle reports: `working`, `blocked`, and `idle` map directly, `done`
 and `error` become completion attention, and `clear` ends the reported
 activity. `app` becomes the integration `source`. Working, blocked, and idle
 reports belong to the foreground job and end when it exits; `done` and `error`
-remain until seen. Child records (reports with an `id`), `progress`, `kind`,
-and `msg` are accepted but not yet shown.
+remain until seen. Child records (reports with an `id`) roll up into the
+root's status, `progress` shows in the `tab.progress` and `workspace.progress`
+tokens, and `kind` and `msg` appear in the Agents sidebar and dialog.
 
 ## Event stream
 
