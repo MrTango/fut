@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep a tab and workspace working while an agent's sub-tasks are still running, instead of showing a completion as soon as the agent's own turn ends.
+
 ## 0.35
 
 - Any program that speaks OSC 7501 now shows its status in Fut without a plugin: working with progress, blocked with a reason, done, and error, rolled up into tabs, workspaces, the navigator, and the Agents sidebar. Agent integrations and Codex screen detection feed the same records, `fut agent report` accepts progress, message, kind, app, and record IDs, and new `tab.progress` and `workspace.progress` tokens show determinate progress.

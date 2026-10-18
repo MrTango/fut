@@ -132,10 +132,13 @@ Each listed agent includes an `unread` boolean, and the list result includes
 fut --json agent list | jq -r '.result.unread_count'
 ```
 
-Blocked, done, and error transitions become unread daemon-wide. Rendering that
-terminal in any attached client marks its observed attention read for every
-client and later CLI calls; a newer transition remains unread. Reading a done
-record quiets its completion indicator without changing its stored state.
+Blocked, done, and error transitions become unread daemon-wide. A done record
+waits while any record in the same terminal is still working, so an agent whose
+sub-tasks are running stays working until the last one settles or clears.
+Rendering that terminal in any attached client marks its observed attention
+read for every client and later CLI calls; a newer transition remains unread.
+Reading a done record quiets its completion indicator without changing its
+stored state.
 JSON includes `activity.records`, with app, title, message, kind, progress,
 and revision metadata, plus explicit `activity.source` provenance.
 

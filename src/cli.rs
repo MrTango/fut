@@ -4904,8 +4904,7 @@ fn status_marker<'a>(panes: impl IntoIterator<Item = &'a PaneSnapshot>) -> &'sta
     for pane in panes {
         for record in pane
             .activity
-            .records
-            .iter()
+            .attention_candidates()
             .filter(|record| record.attention_revision > pane.activity.read_revision)
         {
             unread_blocked |= record.state == StatusState::Blocked;

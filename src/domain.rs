@@ -641,16 +641,31 @@ impl ProgramStatus {
     }
 
     #[must_use]
-    pub fn attention(&self) -> Option<&StatusRecord> {
+    pub fn is_working(&self) -> bool {
         self.records
             .iter()
-            .filter(|record| {
-                record.attention_revision != 0
-                    && matches!(
-                        record.state,
-                        StatusState::Blocked | StatusState::Done | StatusState::Error
-                    )
+            .any(|record| record.state == StatusState::Working)
+    }
+
+    /// Records whose state can demand attention. A done result is deferred
+    /// while any record is still working: a root that finished its turn with
+    /// sub-tasks running has not completed as a whole, so its completion
+    /// surfaces once the last working record settles or clears.
+    pub fn attention_candidates(&self) -> impl Iterator<Item = &StatusRecord> {
+        let working = self.is_working();
+        self.records
+            .iter()
+            .filter(move |record| match record.state {
+                StatusState::Blocked | StatusState::Error => true,
+                StatusState::Done => !working,
+                StatusState::Idle | StatusState::Working => false,
             })
+    }
+
+    #[must_use]
+    pub fn attention(&self) -> Option<&StatusRecord> {
+        self.attention_candidates()
+            .filter(|record| record.attention_revision != 0)
             .max_by_key(|record| record.attention_revision)
     }
 
@@ -2032,6 +2047,11 @@ mod tests {
         );
         assert_eq!(status.attention_revision, 7);
         assert_eq!(status.summary_state(), StatusState::Working);
+        assert!(
+            status.attention().is_none(),
+            "a done sub-record waits for the working root"
+        );
+        assert!(!status.has_unread_attention());
 
         status.apply_updates(
             vec![StatusUpdate::Report(status_report(

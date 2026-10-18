@@ -81,25 +81,24 @@ pub(super) fn activity_priority(activity: ActivityIndicator) -> u8 {
     }
 }
 
-fn unread_attention(activity: &ProgramStatus) -> Option<&StatusRecord> {
+fn unread_attention(activity: &ProgramStatus) -> Option<(AgentNotificationKind, &StatusRecord)> {
     activity
-        .records
-        .iter()
+        .attention_candidates()
         .filter(|record| record.attention_revision > activity.read_revision)
-        .filter(|record| {
-            matches!(
-                record.state,
-                StatusState::Blocked | StatusState::Error | StatusState::Done
-            )
-        })
-        .max_by_key(|record| {
-            let priority = match record.state {
-                StatusState::Blocked => 3,
-                StatusState::Error => 2,
-                StatusState::Done => 1,
-                StatusState::Idle | StatusState::Working => 0,
+        .filter_map(|record| {
+            let kind = match record.state {
+                StatusState::Blocked => AgentNotificationKind::Blocked,
+                StatusState::Error => AgentNotificationKind::Error,
+                StatusState::Done => AgentNotificationKind::Done,
+                StatusState::Idle | StatusState::Working => return None,
             };
-            (priority, record.attention_revision)
+            Some((kind, record))
+        })
+        .max_by_key(|(kind, record)| {
+            (
+                notification_priority(NotificationKind::Agent(*kind)),
+                record.attention_revision,
+            )
         })
 }
 
@@ -197,14 +196,12 @@ impl NotificationState {
         };
 
         for pane in panes {
-            if let Some(attention) = unread_attention(&pane.activity) {
-                let indicator = match attention.state {
-                    StatusState::Blocked => ActivityIndicator::UnreadBlocked,
-                    StatusState::Done => ActivityIndicator::Completed,
-                    StatusState::Error => ActivityIndicator::UnreadError,
-                    StatusState::Idle | StatusState::Working => unreachable!("filtered above"),
-                };
-                consider(indicator);
+            if let Some((kind, _)) = unread_attention(&pane.activity) {
+                consider(match kind {
+                    AgentNotificationKind::Blocked => ActivityIndicator::UnreadBlocked,
+                    AgentNotificationKind::Done => ActivityIndicator::Completed,
+                    AgentNotificationKind::Error => ActivityIndicator::UnreadError,
+                });
             }
             if include_bells
                 && self
@@ -285,13 +282,7 @@ impl NotificationState {
                                 },
                             );
                         }
-                        if let Some(attention) = unread_attention(&pane.activity) {
-                            let kind = match attention.state {
-                                StatusState::Blocked => AgentNotificationKind::Blocked,
-                                StatusState::Done => AgentNotificationKind::Done,
-                                StatusState::Error => AgentNotificationKind::Error,
-                                StatusState::Idle | StatusState::Working => continue,
-                            };
+                        if let Some((kind, attention)) = unread_attention(&pane.activity) {
                             push(
                                 NotificationKind::Agent(kind),
                                 attention.updated_at_ms,
@@ -373,12 +364,7 @@ impl NotificationState {
     }
 
     pub(super) fn has_working(&self, snapshot: &ResourceSnapshot) -> bool {
-        open_panes(snapshot).any(|pane| {
-            pane.activity
-                .records
-                .iter()
-                .any(|record| record.state == StatusState::Working)
-        })
+        open_panes(snapshot).any(|pane| pane.activity.is_working())
     }
 }
 
@@ -1386,5 +1372,62 @@ mod tests {
             }) if terminal_id == pane.terminal_id
         ));
         assert_eq!(pane.activity.summary_state(), StatusState::Done);
+    }
+
+    #[test]
+    fn completion_waits_for_working_sub_records_before_notifying() {
+        let mut pane = status_pane(StatusState::Done, 5, 0);
+        pane.activity.records.push(StatusRecord {
+            id: "task-1".into(),
+            state: StatusState::Working,
+            kind: None,
+            progress: Some(40),
+            app: None,
+            title: None,
+            message: None,
+            revision: 106,
+            updated_at_ms: 16,
+            attention_revision: 0,
+        });
+        let notifications = NotificationState::default();
+        let snapshot = snapshot_with_panes(vec![pane.clone()]);
+
+        assert_eq!(
+            notifications.rollup(std::slice::from_ref(&pane)),
+            ActivityRollup {
+                indicator: Some(ActivityIndicator::Working),
+                progress: Some(40),
+            },
+            "a finished root with a working sub-task is still working"
+        );
+        assert!(notifications.waiting(&snapshot).is_empty());
+        assert!(!notifications.is_unseen(&pane));
+
+        pane.activity.records.pop();
+        let snapshot = snapshot_with_panes(vec![pane.clone()]);
+        assert_eq!(
+            notifications.indicator(std::slice::from_ref(&pane)),
+            Some(ActivityIndicator::Completed)
+        );
+        assert!(matches!(
+            notifications.waiting(&snapshot).as_slice(),
+            [WaitingTerminal {
+                kind: NotificationKind::Agent(AgentNotificationKind::Done),
+                ..
+            }]
+        ));
+
+        let mut blocked = status_pane(StatusState::Blocked, 5, 0);
+        blocked
+            .activity
+            .records
+            .push(pane.activity.records[0].clone());
+        blocked.activity.records[1].id = "task-1".into();
+        blocked.activity.records[1].state = StatusState::Working;
+        assert_eq!(
+            notifications.indicator(std::slice::from_ref(&blocked)),
+            Some(ActivityIndicator::UnreadBlocked),
+            "blockers still interrupt working sub-tasks"
+        );
     }
 }
