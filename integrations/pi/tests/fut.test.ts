@@ -7,31 +7,11 @@ type Handler = (event: any, context: any) => unknown;
 
 const originalSocket = process.env.FUT_SOCKET;
 const originalTerminalId = process.env.FUT_TERMINAL_ID;
-const originalIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-const originalWrite = process.stdout.write;
 
 afterEach(() => {
   restoreEnv("FUT_SOCKET", originalSocket);
   restoreEnv("FUT_TERMINAL_ID", originalTerminalId);
-  if (originalIsTTY) Object.defineProperty(process.stdout, "isTTY", originalIsTTY);
-  else delete (process.stdout as { isTTY?: boolean }).isTTY;
-  process.stdout.write = originalWrite;
 });
-
-// Pi's stdout is its terminal. Each test chooses whether it has one.
-function setTerminal(terminal: boolean): string[] {
-  Object.defineProperty(process.stdout, "isTTY", { value: terminal, configurable: true });
-  const written: string[] = [];
-  // The test runner reports over stdout too; capture only status reports.
-  process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
-    if (typeof chunk === "string" && chunk.startsWith("\x1b]7501;")) {
-      written.push(chunk);
-      return true;
-    }
-    return (originalWrite as (...args: unknown[]) => boolean).call(process.stdout, chunk, ...rest);
-  }) as typeof process.stdout.write;
-  return written;
-}
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name];
@@ -85,7 +65,6 @@ function harness(options: { failFirst?: boolean; blockFirst?: boolean } = {}) {
 }
 
 test("reports the complete lifecycle in native event order", async () => {
-  setTerminal(false);
   process.env.FUT_SOCKET = "/tmp/fut.sock";
   process.env.FUT_TERMINAL_ID = "terminal-42";
   const testHarness = harness();
@@ -117,7 +96,6 @@ test("reports the complete lifecycle in native event order", async () => {
 });
 
 test("does not infer lifecycle from unrelated or already-idle tool events", async () => {
-  setTerminal(false);
   process.env.FUT_SOCKET = "/tmp/fut.sock";
   process.env.FUT_TERMINAL_ID = "terminal-42";
   const testHarness = harness();
@@ -133,7 +111,6 @@ test("does not infer lifecycle from unrelated or already-idle tool events", asyn
 });
 
 test("contains command failures and continues the serialized report queue", async () => {
-  setTerminal(false);
   process.env.FUT_SOCKET = "/tmp/fut.sock";
   process.env.FUT_TERMINAL_ID = "terminal-42";
   const testHarness = harness({ failFirst: true });
@@ -149,7 +126,6 @@ test("contains command failures and continues the serialized report queue", asyn
 });
 
 test("serializes concurrent reports without reordering them", async () => {
-  setTerminal(false);
   process.env.FUT_SOCKET = "/tmp/fut.sock";
   process.env.FUT_TERMINAL_ID = "terminal-42";
   const testHarness = harness({ blockFirst: true });
@@ -165,41 +141,7 @@ test("serializes concurrent reports without reordering them", async () => {
   assert.deepEqual(testHarness.calls.map(({ args }) => args[2]), ["idle", "working"]);
 });
 
-test("reports over OSC 7501 on its terminal instead of the CLI", async () => {
-  for (const insideFut of [true, false]) {
-    if (insideFut) {
-      process.env.FUT_SOCKET = "/tmp/fut.sock";
-      process.env.FUT_TERMINAL_ID = "terminal-42";
-    } else {
-      delete process.env.FUT_SOCKET;
-      delete process.env.FUT_TERMINAL_ID;
-    }
-    const written = setTerminal(true);
-    const testHarness = harness();
-    testHarness.install();
-
-    await testHarness.emit("session_start", { reason: "startup" });
-    await testHarness.emit("agent_start");
-    await testHarness.emit("tool_execution_start", { toolName: "bash" });
-    await testHarness.emit("tool_execution_start", { toolName: "ask_user" });
-    await testHarness.emit("tool_execution_end", { toolName: "ask_user" });
-    await testHarness.emit("agent_settled");
-    await testHarness.emit("session_shutdown", { reason: "quit" });
-
-    assert.deepEqual(written, [
-      "\x1b]7501;state=idle:app=pi\x1b\\",
-      "\x1b]7501;state=working:app=pi\x1b\\",
-      "\x1b]7501;state=blocked:app=pi\x1b\\",
-      "\x1b]7501;state=working:app=pi\x1b\\",
-      "\x1b]7501;state=done:app=pi\x1b\\",
-      "\x1b]7501;state=clear\x1b\\",
-    ]);
-    assert.deepEqual(testHarness.calls, []);
-  }
-});
-
-test("is inert without a terminal outside Fut", () => {
-  setTerminal(false);
+test("is inert outside a Fut terminal", () => {
   delete process.env.FUT_SOCKET;
   delete process.env.FUT_TERMINAL_ID;
   const testHarness = harness();

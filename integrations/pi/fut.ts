@@ -2,31 +2,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 type Report = "idle" | "working" | "blocked" | "completed" | "exited";
 
-const OSC_REPORTS: Record<Report, string> = {
-  idle: "state=idle:app=pi",
-  working: "state=working:app=pi",
-  blocked: "state=blocked:app=pi",
-  completed: "state=done:app=pi",
-  exited: "state=clear",
-};
-
 export default function fut(pi: ExtensionAPI) {
-  // Pi's interactive TUI writes to stdout, so an OSC 7501 report there stays
-  // ordered with its rendering and reaches any terminal implementing the
-  // protocol, including over SSH. Without a terminal, fall back to the CLI.
-  const terminal = process.stdout.isTTY === true;
-  const insideFut = Boolean(process.env.FUT_SOCKET && process.env.FUT_TERMINAL_ID);
-  if (!terminal && !insideFut) return;
+  const terminalId = process.env.FUT_TERMINAL_ID;
+  if (!process.env.FUT_SOCKET || !terminalId) return;
 
   let pending = Promise.resolve();
   const report = (state: Report, ctx: ExtensionContext) => {
-    if (terminal) {
-      try {
-        process.stdout.write(`\x1b]7501;${OSC_REPORTS[state]}\x1b\\`);
-      } catch {}
-      return pending;
-    }
-
     const agentSessionId = ctx.sessionManager.getSessionId();
     const args = [
       "agent",
