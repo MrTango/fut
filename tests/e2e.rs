@@ -916,6 +916,142 @@ async fn interactive_client_reports_host_colors_to_the_child_without_forwarding_
     harness.shutdown().await;
 }
 
+fn status_client(harness: &Harness, terminal_id: fut::domain::TerminalId) -> PtyChild {
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach '{}'",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            terminal_id
+        ));
+    PtyChild::spawn(command)
+}
+
+fn report_status(harness: &Harness, terminal_id: fut::domain::TerminalId, arguments: &[&str]) {
+    let output = harness
+        .cli()
+        .args(["agent", "report", "--terminal-id", &terminal_id.to_string()])
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[tokio::test]
+async fn interactive_client_forwards_its_status_rollup_to_an_answering_host_and_clears_on_detach() {
+    let harness = Harness::start(
+        "printf INPUT_READY; IFS= read -r line; printf '%s' \"$line\" > keyboard-input; printf INPUT_DONE; sleep 600",
+    )
+    .await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let child = fut::domain::compact_id(terminal_id.uuid());
+    let mut client = status_client(&harness, terminal_id);
+    client.wait_for("\x1b]7501;?\x1b\\").await;
+    client.send(b"\x1b]7501;?:states=idle,working,done,blocked,error\x1b\\");
+    // The reply is consumed by the client, never typed into the terminal.
+    client.wait_for("INPUT_READY").await;
+    client.send(b"probe\r");
+    client.wait_for("INPUT_DONE").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/keyboard-input")).unwrap(),
+        b"probe"
+    );
+
+    report_status(
+        &harness,
+        terminal_id,
+        &[
+            "working",
+            "--app",
+            "demo",
+            "--message",
+            "building",
+            "--progress",
+            "40",
+        ],
+    );
+    client
+        .wait_for(&format!(
+            "\x1b]7501;state=working:id={child}:progress=40:app=demo:title="
+        ))
+        .await;
+    client
+        .wait_for("\x1b]7501;state=working:progress=40:app=fut:msg=")
+        .await;
+    let claim = client.text();
+    let first_clear = claim
+        .find("\x1b]7501;state=clear\x1b\\")
+        .expect("claim clear");
+    let first_report = claim.find("\x1b]7501;state=working").unwrap();
+    assert!(
+        first_clear < first_report,
+        "claims before reporting: {claim:?}"
+    );
+    assert!(claim.contains("YnVpbGRpbmc="), "base64 message: {claim:?}");
+
+    client.clear_output();
+    report_status(&harness, terminal_id, &["blocked", "--kind", "question"]);
+    client
+        .wait_for(&format!(
+            "\x1b]7501;state=blocked:id={child}:kind=question:title="
+        ))
+        .await;
+    client
+        .wait_for("\x1b]7501;state=blocked:kind=question:app=fut:msg=")
+        .await;
+
+    client.clear_output();
+    report_status(&harness, terminal_id, &["idle"]);
+    client.wait_for("\x1b]7501;state=clear\x1b\\").await;
+    assert!(
+        !client.text().contains("state=done"),
+        "an empty rollup clears instead of reporting done: {:?}",
+        client.text()
+    );
+
+    report_status(&harness, terminal_id, &["done", "--message", "ready"]);
+    client
+        .wait_for(&format!("\x1b]7501;state=done:id={child}:title="))
+        .await;
+    client.clear_output();
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert!(
+        client.text().contains("\x1b]7501;state=clear\x1b\\"),
+        "detach releases the host records: {:?}",
+        client.text()
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn interactive_client_sends_no_status_to_a_host_that_never_answers() {
+    let harness = Harness::start("sleep 600").await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let mut client = status_client(&harness, terminal_id);
+    client.wait_for("\x1b]7501;?\x1b\\").await;
+    report_status(&harness, terminal_id, &["working", "--message", "silent"]);
+    time::sleep(Duration::from_millis(500)).await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert!(
+        !client.text().contains("\x1b]7501;state"),
+        "no reports or clears without a capability reply: {:?}",
+        client.text()
+    );
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn terminal_uses_portable_term_when_daemon_has_no_term() {
     let harness = Harness::start(
