@@ -23,8 +23,9 @@ use fut::{
         TerminalSize,
     },
     protocol::{
-        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
-        decode_payload, encode_payload,
+        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage,
+        chunked::{Assembly, ScreenAssembler},
+        codec, decode_payload, encode_payload,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -34,7 +35,59 @@ use uuid::Uuid;
 
 const DEADLINE: Duration = Duration::from_secs(180);
 
-type Connection = Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>;
+/// A daemon connection that reassembles chunked screens, so a screen sent as
+/// a row-range chunk sequence counts as one frame.
+struct Connection {
+    framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    screens: ScreenAssembler,
+    /// The sequence in progress so far, kept across a cancelled read.
+    pending: Frame,
+}
+
+impl Connection {
+    /// The next message, with a chunk sequence's wire bytes and decode time
+    /// (including reassembly) summed. Cancel-safe.
+    async fn next_frame(&mut self) -> Option<anyhow::Result<Frame>> {
+        loop {
+            let frame = match self.framed.next().await? {
+                Ok(frame) => frame,
+                Err(error) => return Some(Err(error.into())),
+            };
+            let started = Instant::now();
+            let envelope: Envelope<ServerMessage> = match decode_payload(&frame) {
+                Ok(envelope) => envelope,
+                Err(error) => return Some(Err(error.into())),
+            };
+            let chunk = matches!(
+                envelope.message,
+                ServerMessage::ScreenBegin { .. }
+                    | ServerMessage::ScreenRows { .. }
+                    | ServerMessage::ScreenEnd { .. }
+            );
+            let assembled = self.screens.accept(envelope.message);
+            self.pending.decode += started.elapsed();
+            self.pending.wire_bytes += frame.len();
+            self.pending.largest_frame = self.pending.largest_frame.max(frame.len());
+            self.pending.frames += usize::from(chunk);
+            match assembled {
+                Assembly::Ready(message) => {
+                    let mut ready = std::mem::take(&mut self.pending);
+                    ready.envelope = Envelope {
+                        request_id: envelope.request_id,
+                        message,
+                    };
+                    return Some(Ok(ready));
+                }
+                Assembly::Pending => {}
+                Assembly::Discarded(discarded) => {
+                    return Some(Err(anyhow::anyhow!(
+                        "discarded chunked screens: {discarded:?}"
+                    )));
+                }
+            }
+        }
+    }
+}
 
 struct Args {
     socket: String,
@@ -81,29 +134,40 @@ async fn send(
         request_id,
         message,
     })?;
-    connection.send(payload.into()).await?;
+    connection.framed.send(payload.into()).await?;
     Ok(())
 }
 
-/// One decoded frame plus its wire size and decode cost.
+/// One decoded message plus its wire size and decode cost. A chunked screen
+/// is one message made of `frames` chunk frames.
 struct Frame {
     envelope: Envelope<ServerMessage>,
     wire_bytes: usize,
+    largest_frame: usize,
+    frames: usize,
     decode: Duration,
 }
 
+impl Default for Frame {
+    fn default() -> Self {
+        Self {
+            envelope: Envelope {
+                request_id: None,
+                message: ServerMessage::Detached,
+            },
+            wire_bytes: 0,
+            largest_frame: 0,
+            frames: 0,
+            decode: Duration::ZERO,
+        }
+    }
+}
+
 async fn receive(connection: &mut Connection) -> anyhow::Result<Frame> {
-    let frame = time::timeout(DEADLINE, connection.next())
+    time::timeout(DEADLINE, connection.next_frame())
         .await
         .context("timed out waiting for a daemon frame")?
-        .context("daemon closed the connection")??;
-    let started = Instant::now();
-    let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
-    Ok(Frame {
-        envelope,
-        wire_bytes: frame.len(),
-        decode: started.elapsed(),
-    })
+        .context("daemon closed the connection")?
 }
 
 fn screen_text(screen: &ScreenSnapshot) -> String {
@@ -167,6 +231,8 @@ impl MaterializedScreen {
 #[derive(Default)]
 struct FloodStats {
     snapshots: u64,
+    chunked: u64,
+    chunk_frames: u64,
     full_snapshots: u64,
     deltas: u64,
     wire_bytes: u64,
@@ -181,8 +247,13 @@ struct FloodStats {
 }
 
 impl FloodStats {
-    fn accept(&mut self, revision: u64, wire_bytes: usize, decode: Duration, is_delta: bool) {
+    fn accept(&mut self, revision: u64, frame: &Frame, is_delta: bool) {
+        let (wire_bytes, decode) = (frame.wire_bytes, frame.decode);
         self.snapshots += 1;
+        if frame.frames > 0 {
+            self.chunked += 1;
+            self.chunk_frames += frame.frames as u64;
+        }
         self.wire_bytes += wire_bytes as u64;
         if is_delta {
             self.deltas += 1;
@@ -193,7 +264,7 @@ impl FloodStats {
             self.full_wire_bytes += wire_bytes as u64;
             self.full_decode += decode;
         }
-        self.max_frame = self.max_frame.max(wire_bytes);
+        self.max_frame = self.max_frame.max(frame.largest_frame);
         self.decode_total += decode;
         self.first_revision.get_or_insert(revision);
         self.last_revision = revision;
@@ -236,6 +307,10 @@ impl FloodStats {
             self.full_wire_bytes as f64 / (1024.0 * 1024.0)
         );
         println!("largest frame        {:>10} bytes", self.max_frame);
+        println!(
+            "chunked screens      {:>10}  ({} frames)",
+            self.chunked, self.chunk_frames
+        );
         println!(
             "avg decode           {:>10.0} us",
             self.decode_total.as_micros() as f64 / self.snapshots.max(1) as f64
@@ -282,12 +357,13 @@ async fn flood(
     .await?;
     let mut stats = FloodStats::default();
     loop {
-        let frame = receive(connection).await?;
+        let mut frame = receive(connection).await?;
         let is_delta = matches!(frame.envelope.message, ServerMessage::SnapshotDelta { .. });
-        let Some(screen) = materialized.apply(terminal_id, frame.envelope.message) else {
+        let message = std::mem::replace(&mut frame.envelope.message, ServerMessage::Detached);
+        let Some(screen) = materialized.apply(terminal_id, message) else {
             continue;
         };
-        stats.accept(screen.revision, frame.wire_bytes, frame.decode, is_delta);
+        stats.accept(screen.revision, &frame, is_delta);
         if screen_text(screen).contains("PERF_DONE") {
             break;
         }
@@ -304,10 +380,9 @@ async fn verify_against_refresh(
     materialized: &mut MaterializedScreen,
 ) -> anyhow::Result<()> {
     while let Ok(Some(Ok(frame))) =
-        time::timeout(Duration::from_millis(300), connection.next()).await
+        time::timeout(Duration::from_millis(300), connection.next_frame()).await
     {
-        let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
-        materialized.apply(terminal_id, envelope.message);
+        materialized.apply(terminal_id, frame.envelope.message);
     }
     let Some(applied) = materialized.screen.clone() else {
         bail!("no materialized screen to verify");
@@ -368,10 +443,9 @@ async fn wheel(
         }
     }
     while let Ok(Some(Ok(frame))) =
-        time::timeout(Duration::from_millis(300), connection.next()).await
+        time::timeout(Duration::from_millis(300), connection.next_frame()).await
     {
-        let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
-        materialized.apply(terminal_id, envelope.message);
+        materialized.apply(terminal_id, frame.envelope.message);
     }
     let events = count.unwrap_or(60);
     for (label, direction) in [
@@ -407,19 +481,17 @@ async fn wheel(
             } else {
                 Duration::from_millis(300)
             };
-            let Ok(frame) = time::timeout(wait, connection.next()).await else {
+            let Ok(frame) = time::timeout(wait, connection.next_frame()).await else {
                 if sent < events {
                     continue;
                 }
                 break;
             };
-            let frame = frame.context("daemon closed the connection")??;
-            let decode_started = Instant::now();
-            let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
-            let decode = decode_started.elapsed();
-            let is_delta = matches!(envelope.message, ServerMessage::SnapshotDelta { .. });
-            if let Some(screen) = materialized.apply(terminal_id, envelope.message) {
-                stats.accept(screen.revision, frame.len(), decode, is_delta);
+            let mut frame = frame.context("daemon closed the connection")??;
+            let is_delta = matches!(frame.envelope.message, ServerMessage::SnapshotDelta { .. });
+            let message = std::mem::replace(&mut frame.envelope.message, ServerMessage::Detached);
+            if let Some(screen) = materialized.apply(terminal_id, message) {
+                stats.accept(screen.revision, &frame, is_delta);
             }
         }
         stats.report(label, started.elapsed());
@@ -517,7 +589,11 @@ async fn main() -> anyhow::Result<()> {
     let stream = UnixStream::connect(&args.socket)
         .await
         .with_context(|| format!("connecting to {}", args.socket))?;
-    let mut connection = Framed::new(stream, codec());
+    let mut connection = Connection {
+        framed: Framed::new(stream, codec()),
+        screens: ScreenAssembler::default(),
+        pending: Frame::default(),
+    };
     send(
         &mut connection,
         Some(Uuid::new_v4()),
@@ -567,10 +643,9 @@ async fn main() -> anyhow::Result<()> {
     let mut materialized = MaterializedScreen::default();
     time::sleep(Duration::from_millis(300)).await;
     while let Ok(Some(Ok(frame))) =
-        time::timeout(Duration::from_millis(100), connection.next()).await
+        time::timeout(Duration::from_millis(100), connection.next_frame()).await
     {
-        let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
-        materialized.apply(terminal_id, envelope.message);
+        materialized.apply(terminal_id, frame.envelope.message);
     }
 
     match args.scenario.as_str() {

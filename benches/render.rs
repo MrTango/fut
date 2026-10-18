@@ -6,8 +6,9 @@
 //!   frame
 //! - `clone`: the per-attached-client grid clone in the daemon fan-out
 //! - `scale`: the same per-frame costs at large-display grid sizes, up to
-//!   what a 5120x2160 display produces with small fonts. Sizes above
-//!   `MAX_VISIBLE_CELLS` are skipped so the file runs against older caps.
+//!   what a 5120x2160 display produces with small fonts and beyond. Screens
+//!   above `MAX_VISIBLE_CELLS` are encoded and decoded as the row-range chunk
+//!   sequences the daemon sends; sizes above the grid cap are skipped.
 //! - `graphics`: per-frame costs for a screen showing a Kitty image
 //! - `delta`: the daemon's per-connection choice between a delta and a full
 //!   screen plus its encode (`produce_*`), and the client's decode and apply
@@ -23,7 +24,11 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fut::{
     domain::{MAX_VISIBLE_CELLS, ScreenSnapshot, TerminalSize},
-    protocol::{Envelope, ServerMessage, decode_payload, encode_payload},
+    protocol::{
+        Envelope, ServerMessage,
+        chunked::{Assembly, ScreenAssembler, split_screen},
+        decode_payload, encode_payload,
+    },
     terminal::bench::VtBench,
 };
 
@@ -201,7 +206,7 @@ fn bench_wire(c: &mut Criterion) {
 
 /// Grid sizes a 5120x2160 display produces, from today's cell cap up to
 /// small fonts: (name, size).
-const SCALE_SIZES: [(&str, TerminalSize); 5] = [
+const SCALE_SIZES: [(&str, TerminalSize); 7] = [
     ("200x50", LARGE),
     (
         "250x200",
@@ -231,7 +236,50 @@ const SCALE_SIZES: [(&str, TerminalSize); 5] = [
             rows: 180,
         },
     ),
+    (
+        "508x320",
+        TerminalSize {
+            columns: 508,
+            rows: 320,
+        },
+    ),
+    (
+        "1000x300",
+        TerminalSize {
+            columns: 1000,
+            rows: 300,
+        },
+    ),
 ];
+
+/// Encode `message` as the daemon's writer does: one frame, or a row-range
+/// chunk sequence for screens above `MAX_VISIBLE_CELLS`.
+fn encode_frames(message: ServerMessage) -> Vec<Vec<u8>> {
+    split_screen(message, MAX_VISIBLE_CELLS)
+        .into_iter()
+        .map(|message| {
+            encode_payload(&Envelope {
+                request_id: None,
+                message,
+            })
+            .expect("encode frame")
+        })
+        .collect()
+}
+
+/// Decode frames as the client does, reassembling a chunk sequence.
+fn decode_frames(frames: &[Vec<u8>]) -> ServerMessage {
+    let mut screens = ScreenAssembler::default();
+    for frame in frames {
+        let envelope: Envelope<ServerMessage> = decode_payload(frame).expect("decode frame");
+        match screens.accept(envelope.message) {
+            Assembly::Ready(message) => return message,
+            Assembly::Pending => {}
+            Assembly::Discarded(discarded) => panic!("discarded {discarded:?}"),
+        }
+    }
+    panic!("frames ended mid-screen")
+}
 
 fn snapshot_envelope(screen: ScreenSnapshot) -> Envelope<ServerMessage> {
     Envelope {
@@ -248,8 +296,8 @@ fn bench_scale(c: &mut Criterion) {
     group.sample_size(20);
     for (name, size) in SCALE_SIZES {
         let cells = usize::from(size.columns) * usize::from(size.rows);
-        if cells > MAX_VISIBLE_CELLS {
-            eprintln!("scale/{name}: skipped, {cells} cells exceed cap {MAX_VISIBLE_CELLS}");
+        if let Err(error) = size.validate() {
+            eprintln!("scale/{name}: skipped, {error}");
             continue;
         }
         let frames: Vec<Vec<u8>> = (0..8).map(|phase| dense_frame(size, phase)).collect();
@@ -264,13 +312,22 @@ fn bench_scale(c: &mut Criterion) {
         });
 
         let envelope = snapshot_envelope(dense_snapshot(size, 1));
-        let encoded = encode_payload(&envelope).expect("encode snapshot");
-        eprintln!("scale/{name}: dense frame {} bytes", encoded.len());
+        let encoded = encode_frames(envelope.message.clone());
+        eprintln!(
+            "scale/{name}: dense screen {} bytes in {} frames, largest {}",
+            encoded.iter().map(Vec::len).sum::<usize>(),
+            encoded.len(),
+            encoded.iter().map(Vec::len).max().unwrap_or_default()
+        );
         group.bench_function(format!("encode_dense_{name}"), |b| {
-            b.iter(|| encode_payload(&envelope).expect("encode snapshot"))
+            b.iter_batched(
+                || envelope.message.clone(),
+                encode_frames,
+                BatchSize::LargeInput,
+            )
         });
         group.bench_function(format!("decode_dense_{name}"), |b| {
-            b.iter(|| decode_payload::<Envelope<ServerMessage>>(&encoded).expect("decode snapshot"))
+            b.iter(|| decode_frames(&encoded))
         });
         group.bench_function(format!("clone_dense_{name}"), |b| {
             b.iter(|| envelope.clone())
@@ -442,7 +499,7 @@ fn delta_cases(size: TerminalSize) -> Vec<(&'static str, ScreenSnapshot, ScreenS
     cases
 }
 
-fn screen_message(previous: &ScreenSnapshot, next: &ScreenSnapshot, shifts: bool) -> Vec<u8> {
+fn screen_message(previous: &ScreenSnapshot, next: &ScreenSnapshot, shifts: bool) -> Vec<Vec<u8>> {
     let terminal_id = fut::domain::TerminalId::new();
     let message = match next.delta_from(previous, shifts) {
         Some(delta) => ServerMessage::SnapshotDelta { terminal_id, delta },
@@ -451,16 +508,12 @@ fn screen_message(previous: &ScreenSnapshot, next: &ScreenSnapshot, shifts: bool
             screen: next.clone(),
         },
     };
-    encode_payload(&Envelope {
-        request_id: None,
-        message,
-    })
-    .expect("encode screen")
+    encode_frames(message)
 }
 
 fn bench_delta(c: &mut Criterion) {
     let mut group = c.benchmark_group("delta");
-    for (size_name, size) in [SCALE_SIZES[0], SCALE_SIZES[2]] {
+    for (size_name, size) in [SCALE_SIZES[0], SCALE_SIZES[2], SCALE_SIZES[5]] {
         for (case, previous, next) in delta_cases(size) {
             let name = format!("{case}_{size_name}");
             let encoded = screen_message(&previous, &next, true);
@@ -469,7 +522,11 @@ fn bench_delta(c: &mut Criterion) {
             } else {
                 "full"
             };
-            eprintln!("delta/{name}: {kind} frame {} bytes", encoded.len());
+            eprintln!(
+                "delta/{name}: {kind} screen {} bytes in {} frames",
+                encoded.iter().map(Vec::len).sum::<usize>(),
+                encoded.len()
+            );
             group.bench_function(format!("produce_{name}"), |b| {
                 b.iter(|| screen_message(&previous, &next, true))
             });
@@ -477,17 +534,13 @@ fn bench_delta(c: &mut Criterion) {
             group.bench_function(format!("produce_rows_{name}"), |b| {
                 b.iter(|| screen_message(&previous, &next, false))
             });
-            let apply = |mut screen: ScreenSnapshot| {
-                let envelope: Envelope<ServerMessage> =
-                    decode_payload(&encoded).expect("decode screen");
-                match envelope.message {
-                    ServerMessage::SnapshotDelta { delta, .. } => {
-                        screen.apply_delta(delta).expect("apply delta");
-                        screen
-                    }
-                    ServerMessage::Snapshot { screen, .. } => screen,
-                    _ => unreachable!(),
+            let apply = |mut screen: ScreenSnapshot| match decode_frames(&encoded) {
+                ServerMessage::SnapshotDelta { delta, .. } => {
+                    screen.apply_delta(delta).expect("apply delta");
+                    screen
                 }
+                ServerMessage::Snapshot { screen, .. } => screen,
+                _ => unreachable!(),
             };
             assert_eq!(apply(previous.clone()).cells, next.cells, "{name}");
             // The client applies in place; keep the base clone out of the timing.
