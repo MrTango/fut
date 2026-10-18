@@ -13,7 +13,8 @@ by similar projects (Zellij, tmux, Ghostty, mosh).
 - `mise run perf:e2e` — end-to-end scenarios (`scripts/perf/run`) against a
   disposable daemon using the headless protocol client
   (`examples/perf_client.rs`): `flood` (plain `seq`), `styled` (SGR-heavy
-  output), `latency` (keystroke echo p50/p95). Reports snapshots/sec, wire
+  output), `scroll` (paced log output, a few lines per burst), `wheel`
+  (scrollback wheel up and down), `latency` (keystroke echo p50/p95). Reports snapshots/sec, wire
   MiB/s, largest frame, decode cost, and revisions coalesced away.
 - `mise run perf:pager` — run a sanitized `less -X` in a fixed 200x50 PTY over
   a generated diff; measure input-to-first-byte and input-to-last-byte/quiet
@@ -39,8 +40,8 @@ VT thread drains up to 2 MiB per pass (`drain_output_batch`) and publishes at
 most once per 8 ms per observed terminal; terminals with no snapshot watchers
 keep parsing PTY output but defer snapshot construction until attachment →
 full-grid snapshot (`snapshot_current`) → tokio `watch` (drops stale) →
-per-client clone and row diff → compact
-MessagePack full snapshot or dirty-row delta → client apply → 16 ms paced draw
+per-client clone and row diff, with a row shift when the screen scrolled →
+compact MessagePack full snapshot or dirty-row delta → client apply → 16 ms paced draw
 with per-pane dirty revisions and CSI 2026 (`client/mod.rs`).
 
 Federation metadata uses one bounded control connection per enabled profile.
@@ -312,8 +313,78 @@ backpressure were not measured by these microbenchmarks.
 
 Scrolling shifts every row, so the current row diff falls back to full
 screens. The measured plain 508x160 screen is 163 KB and takes 1.9 ms to
-decode. Scroll-aware deltas and row-chunked screens remain follow-up work;
-their savings and client draw cost at these sizes are not yet measured.
+decode. Scroll-aware deltas followed in Round 8; row-chunked screens remain
+follow-up work, and client draw cost at these sizes is not yet measured.
+
+### Round 8 (2026-10-19): row-shift deltas (lsc-9ea8)
+
+Scrolling changes every row, so the row diff fell back to full screens. A
+delta may now carry a row shift (`x: {t, e, n}`): rows `t..e` of the base
+rotate up by `n` (down when negative) before the replacement rows apply.
+`ScreenSnapshot::delta_from` finds it by comparing screens, not by trusting VT
+scroll events: three anchor rows of the new screen propose candidate offsets by
+exact comparison against the previous screen (unequal rows fail within a few
+cells, so unrelated output costs almost nothing), then row hashes rank the
+candidates, and every retained row is verified exactly. The shift region is
+trimmed to the retained rows, so a pager's status line or a scroll region's
+margins stay in place. Detection runs only when 3+ rows changed, and the 60%
+fallback still applies to the rows left to send. Local clients get shifts with
+the next protocol version; remote peers only after negotiating
+`scroll-deltas.v1`, and older peers keep plain row diffs (e2e-tested both
+ways).
+
+Host: macOS/aarch64, 10 cores, release builds, `main` (45cc751, built from an
+exported tree with the branch's perf client) and the branch run back to back.
+Other agents' builds were running; load average was 12–21 for the numbers
+below (an earlier pass at load 40–90 gave the same frame counts and bytes,
+with noisier latency p95). Every run's materialized grid matched a fresh full
+refresh.
+
+`mise run perf:e2e`, frames and bytes the client received:
+
+| Scenario | Grid | main: delta / full, wire | branch: delta / full, wire | client decode total main → branch |
+| --- | --- | ---: | ---: | ---: |
+| flood (`seq 1 100000`) | 200x50 | 1 / 22, 0.4 MiB | 1 / 22, 0.4 MiB | 4.5 → 4.6 ms |
+| flood | 508x160 | 1 / 21, 3.3 MiB | 1 / 21, 3.3 MiB | 33.2 → 33.2 ms |
+| scroll (4 lines / ~12 ms) | 200x50 | 23 / 385, 7.5 MiB | 408 / 0, 0.7 MiB | 77 → 13 ms |
+| scroll | 508x160 | 53 / 356, 56.2 MiB | 406 / 0, 1.6 MiB | 559 → 21 ms |
+| wheel, each direction | 200x50 | 0 / 60, 1.2 MiB | 60 / 0, 0.08 MiB | 11.5 → 1.7 ms |
+| wheel, each direction | 508x160 | 0 / 60, 9.3 MiB | 60 / 0, 0.18 MiB | 92–107 → 2.7 ms |
+
+At 508x160 a scrolled frame is 4.2 KB and 53 µs to decode instead of 163 KB
+and 1.5 ms; a wheel step is 3.2 KB and 45 µs. Frame size now tracks the rows
+a frame exposes. The saturating flood is unchanged by design: `seq` writes
+about 4,500 lines per 8 ms publication, more than the grid holds, so every
+frame is new content and a full screen is the right message (lsc-78c8 covers
+chunking those). Latency at 200x50 was unchanged: typing p50/p95 0.5/0.6 ms on
+both, burst 8.5/8.8 ms (branch) vs 8.6/8.7 ms (main).
+
+`benches/render.rs` `delta` group, branch only (load ~11). `produce` builds
+and encodes the message a shift-capable peer gets; `produce_rows` is what an
+older peer gets (and what `main` sends):
+
+| Case | Frame | produce | produce_rows |
+| --- | --- | ---: | ---: |
+| type 508x160 | 1.1 KB delta | 353 µs | 353 µs |
+| flood 508x160 | 170 KB full | 1.02 ms | 0.96 ms |
+| scroll4 508x160 | 4.4 KB delta (full without shifts) | 0.92 ms | 0.98 ms |
+| pager half page 508x160 | 86 KB delta (full without shifts) | 1.22–1.24 ms | 0.95–0.98 ms |
+| scroll4 200x50 | 1.9 KB delta | 125 µs | 126 µs |
+
+The first version hashed both screens before looking for candidates, which
+cost the saturating flood 0.85 ms per frame at 508x160 (1.82 ms vs 0.97 ms);
+proposing candidates by exact comparison first removed that. Daemon-side
+detection still costs up to ~0.3 ms per half-page pager frame at 508x160, paid
+once per client; it saves the client a 1.5 ms full decode and 77 KB of wire.
+Client apply (an earlier run at load ~35) of a scroll4 delta at 508x160 is ~0.2 ms (the row rotation moves
+the whole grid's cells), against ~1.8 ms to decode and apply a full screen.
+
+A real client in a 200x50 PTY (pyte-rendered, compared row by row with the
+daemon's visible screen after each step; 19/19 matched on both builds):
+`less` `j`/`k` ×40 received 32–33 KiB on the branch vs 774–779 KiB on main,
+`vim` `ctrl+e`/`ctrl+y` ×30 38–42 KiB vs 588–590 KiB. Page jumps (`space`,
+`b`, `ctrl+f`, `ctrl+b`) and `seq` stay full screens on both. Copy-mode screens
+are still sent whole.
 
 ### External multiplexer baseline (2026-08-10)
 
