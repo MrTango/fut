@@ -233,6 +233,11 @@
           "type": "boolean",
           "default": false,
           "description": "Emit one BEL when a newly unseen terminal bell arrives."
+        },
+        "outer_terminal_status": {
+          "enum": ["auto", "always", "never"],
+          "default": "auto",
+          "description": "Forward the status rollup to the containing terminal as OSC 7501. auto waits for the terminal to answer the support query."
         }
       }
     },

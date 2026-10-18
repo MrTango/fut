@@ -1539,6 +1539,18 @@ impl Default for UiConfig {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AlertsConfig {
     pub(super) signal_outer_terminal: bool,
+    pub(super) outer_terminal_status: OuterTerminalStatus,
+}
+
+/// Whether the client forwards its program-status rollup to the terminal it
+/// runs in. `Auto` waits for a positive OSC 7501 capability reply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OuterTerminalStatus {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 impl UiConfig {

@@ -20,6 +20,7 @@ mod federation_transport;
 mod fuzzy;
 mod graphics;
 mod handoff;
+mod host_status;
 mod hotkey;
 mod image_path;
 pub(crate) mod input;
@@ -1321,6 +1322,11 @@ async fn run_loop(
     let mut view = ViewState::new(attachment.locality(), selected)?;
     let mut host_colors = colors::HostColors::default();
     colors::HostColors::start(&mut io::stdout())?;
+    let mut host_status =
+        host_status::HostStatus::new(host_status::HostStatus::own_terminal_from_env());
+    host_status.configure(ui.alerts.outer_terminal_status, &mut io::stdout())?;
+    let mut host_status_inputs = None;
+    let mut host_status_federation = None;
     let mut resources = ResourceState::default();
     resources.accept_alerts(alerts);
     let mut surface: Option<ClientSurface> = None;
@@ -1373,6 +1379,29 @@ async fn run_loop(
             )
             .await?;
         }
+        host_status.configure(ui.alerts.outer_terminal_status, &mut io::stdout())?;
+        let federation_state = federation.map(federation::Service::snapshot);
+        let inputs = (
+            resources.snapshot().map(|snapshot| snapshot.revision),
+            host_status.enabled(),
+            active_machine,
+        );
+        // Holding the previous federation state keeps pointer comparison sound.
+        let federation_changed = match (&host_status_federation, &federation_state) {
+            (Some(previous), Some(current)) => !std::sync::Arc::ptr_eq(previous, current),
+            (None, None) => false,
+            _ => true,
+        };
+        if host_status_inputs != Some(inputs) || federation_changed {
+            host_status_inputs = Some(inputs);
+            host_status_federation.clone_from(&federation_state);
+            host_status.observe(&host_status::sources(
+                resources.snapshot(),
+                federation_state.as_deref(),
+                active_machine,
+            ));
+        }
+        host_status.flush(&mut io::stdout())?;
         if let Attachment::Remote { capabilities, .. } = &attachment
             && let Some((id, message)) = health.check(time::Instant::now(), *capabilities)?
         {
@@ -2368,7 +2397,9 @@ async fn run_loop(
                 };
                 let event = event?;
                 if let Event::TerminalResponse(response) = &event {
-                    host_colors.receive(response, &mut io::stdout())?;
+                    if !host_status.receive(response) {
+                        host_colors.receive(response, &mut io::stdout())?;
+                    }
                     continue;
                 }
                 if !matches!(&event, Event::Mouse(_)) {
@@ -4042,6 +4073,7 @@ async fn run_loop(
                 cheatsheet_visible = true;
                 force_draw = true;
             }
+            _ = async { time::sleep_until(time::Instant::from_std(host_status.deadline().expect("deadline is set"))).await }, if host_status.deadline().is_some() => {}
             _ = async { time::sleep_until(toasts.deadline().expect("deadline is set")).await }, if toasts.deadline().is_some() => {
                 toasts.expire();
                 force_draw = true;
