@@ -2,9 +2,8 @@
 
 **Legacy fallback for status.** Pi 1.1.0 and later reports status to Fut
 natively over OSC 7501 and needs no lifecycle extension. The extension remains
-for older Pi versions and for setups where Pi never receives Fut's OSC 7501
-support reply, such as running inside tmux. The package also bundles the Fut
-skill, which is still worth installing.
+for older Pi versions. The package also bundles the Fut skill, which is still
+worth installing.
 
 This first-party Pi extension reports lifecycle state for the Pi session running
 in a Fut terminal. It is a one-way adapter: it does not create or change
@@ -36,9 +35,15 @@ extension and the bundled Fut skill. Restart Pi after installing it. The skill
 teaches Pi to inspect and control Fut resources without changing visual focus,
 including reading another agent pane's lifecycle state and terminal output.
 
-The adapter is inert unless both `FUT_SOCKET` and `FUT_TERMINAL_ID` are present,
-as they are for Pi started inside Fut. The `fut` binary must be on `PATH` and
-provide:
+When Pi's stdout is a terminal, the adapter writes OSC 7501 reports
+(`app=pi`; completed is `done`, exited is `clear`) to it, in order with Pi's
+own output. This works in any terminal that implements the protocol, including
+over SSH, and needs no `fut` binary.
+
+Without a terminal, such as in print or RPC mode with redirected output, the
+adapter falls back to the Fut CLI. That fallback is inert unless both
+`FUT_SOCKET` and `FUT_TERMINAL_ID` are present, as they are for Pi started
+inside Fut. The `fut` binary must be on `PATH` and provide:
 
 ```sh
 fut agent report STATE --source SOURCE \
@@ -49,7 +54,7 @@ The daemon validates the inherited terminal ID against the reporting process
 tree. Integrations omit `--terminal-id`; that option is reserved for external
 controllers intentionally reporting for another terminal.
 
-Reports are serialized in event order. Each CLI call has a two-second timeout,
+CLI reports are serialized in event order. Each CLI call has a two-second timeout,
 and command failures are swallowed so lifecycle reporting cannot fail a Pi
 event handler.
 
@@ -63,7 +68,7 @@ event handler.
 | `completed` | `agent_settled`, after retries, compaction retries, and queued continuations are exhausted |
 | `exited` | `session_shutdown` |
 
-Every report includes `source=pi`, the explicit Fut terminal ID, and Pi's
+Every CLI report includes `source=pi` and Pi's
 `SessionManager.getSessionId()` value as the agent session ID. Pi exposes a
 per-run numeric turn index only on turn start/end events, not a stable turn ID
 on lifecycle and tool events, so the adapter does not invent or forward one.
