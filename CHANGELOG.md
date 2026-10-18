@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep the navigator, notifications, and agents dialogs on the selected row and scroll position across updates when a remote machine is configured; remote rows and machine headers no longer snap back to the top.
+
 ## 0.36
 
 - Keep a tab and workspace working while an agent's sub-tasks are still running, instead of showing a completion as soon as the agent's own turn ends.

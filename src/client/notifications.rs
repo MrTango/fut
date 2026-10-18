@@ -421,6 +421,7 @@ pub(super) struct NotificationsDialog {
     rows: Vec<WaitingTerminal>,
     selected: usize,
     scroll: usize,
+    federated: bool,
 }
 
 pub(super) enum NotificationsAction {
@@ -436,6 +437,7 @@ impl NotificationsDialog {
             rows: notifications.waiting(snapshot),
             selected: 0,
             scroll: 0,
+            federated: false,
         }
     }
 
@@ -444,6 +446,11 @@ impl NotificationsDialog {
         snapshot: &ResourceSnapshot,
         notifications: &NotificationState,
     ) {
+        if self.federated {
+            // Federated rows carry machine labels and remote terminals; the
+            // federation state delivers local updates with them intact.
+            return;
+        }
         let selected = self.rows.get(self.selected).map(|row| row.terminal_id);
         self.rows = notifications.waiting(snapshot);
         self.selected = selected
@@ -466,6 +473,7 @@ impl NotificationsDialog {
         if state.registry.iter().count() <= 1 {
             return;
         }
+        self.federated = true;
         let selected = self
             .rows
             .get(self.selected)

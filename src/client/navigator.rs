@@ -139,6 +139,10 @@ pub(super) struct NavigatorState {
     presence: ClientPresenceSnapshot,
     current_session: Option<SessionId>,
     phase: NavigatorPhase,
+    /// Rows carry machine headers from a federated snapshot. Local-only
+    /// refreshes are skipped: the federation state includes local updates,
+    /// and rebuilding in the single-machine shape loses remote selections.
+    federated: bool,
 }
 
 pub(super) enum NavigatorAction {
@@ -168,6 +172,7 @@ impl NavigatorState {
             presence: ClientPresenceSnapshot::default(),
             current_session: None,
             phase: NavigatorPhase::Browsing,
+            federated: false,
         }
     }
 
@@ -297,14 +302,16 @@ impl NavigatorState {
         self.rows = rows;
         self.current_session = None;
         self.presence = ClientPresenceSnapshot::default();
-        self.filter = None;
         self.resource_revision = None;
+        self.federated = true;
         self.status = if self.rows.is_empty() {
             NavigatorStatus::Empty
         } else {
             NavigatorStatus::Ready
         };
+        let scroll = self.scroll;
         self.refilter();
+        self.scroll = scroll;
         self.selected = old_identity
             .and_then(|identity| {
                 self.rows
@@ -323,9 +330,10 @@ impl NavigatorState {
         history: &NavigationHistory,
         notifications: &NotificationState,
     ) -> bool {
-        if self
-            .resource_revision
-            .is_some_and(|revision| snapshot.revision <= revision)
+        if self.federated
+            || self
+                .resource_revision
+                .is_some_and(|revision| snapshot.revision <= revision)
         {
             return false;
         }
@@ -337,7 +345,9 @@ impl NavigatorState {
             (row.current && matches!(row.key, ResourceKey::Session(_))).then_some(row.session_id)
         });
         self.apply_presence();
+        let scroll = self.scroll;
         self.refilter();
+        self.scroll = scroll;
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
             status @ NavigatorStatus::Error { .. } => status,
@@ -2269,6 +2279,78 @@ mod tests {
                 &mut buffer,
             );
             assert!(nav.scroll <= nav.selected);
+        }
+    }
+
+    #[test]
+    fn federated_refreshes_keep_remote_and_header_selections_and_scroll() {
+        let (snapshot, current, _) = fixture();
+        let remote_id = Uuid::new_v4();
+        let generation = Generation {
+            supervisor: 7,
+            connection: 9,
+        };
+        let remote = EndpointSpec::Ssh(Machine {
+            id: remote_id,
+            label: "work".into(),
+            target: "work.example".into(),
+            enabled: true,
+        });
+        let state = FederationState::fixture(vec![
+            (
+                EndpointSpec::Local,
+                Status::Ready,
+                generation,
+                Some(snapshot.clone()),
+            ),
+            (remote, Status::Ready, generation, Some(snapshot.clone())),
+        ]);
+        let history = NavigationHistory::default();
+        let notifications = NotificationState::default();
+        let mut navigator = NavigatorState::open();
+        navigator.accept_resources_with_notifications(
+            &snapshot,
+            &current,
+            &history,
+            &notifications,
+        );
+        navigator.accept_federation(&state, MachineId::Local, &current, &history, &notifications);
+        let remote_header = navigator
+            .rows
+            .iter()
+            .position(|row| row.machine == MachineId::Ssh(remote_id) && row.machine_header)
+            .unwrap();
+        let mut next = snapshot.clone();
+        next.revision += 1;
+
+        for target in [remote_header, remote_header + 2] {
+            navigator.selected = target;
+            navigator.keep_visible(3);
+            let identity = row_identity(&navigator.rows[target]);
+            let scroll = navigator.scroll;
+            assert!(scroll > 0, "the selection sits below the first page");
+
+            // The client applies the direct local snapshot first and the
+            // federation snapshot that includes it afterwards.
+            assert!(!navigator.accept_resources_with_notifications(
+                &next,
+                &current,
+                &history,
+                &notifications
+            ));
+            assert_eq!(row_identity(&navigator.rows[navigator.selected]), identity);
+            navigator.accept_federation(
+                &state,
+                MachineId::Local,
+                &current,
+                &history,
+                &notifications,
+            );
+            assert_eq!(row_identity(&navigator.rows[navigator.selected]), identity);
+            assert_eq!(
+                navigator.scroll, scroll,
+                "a refresh keeps the scroll offset"
+            );
         }
     }
 }

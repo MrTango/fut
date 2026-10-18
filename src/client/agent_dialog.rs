@@ -28,6 +28,7 @@ pub(super) struct AgentsDialog {
     query: String,
     selected: usize,
     scroll: usize,
+    federated: bool,
 }
 
 pub(super) enum AgentsAction {
@@ -50,6 +51,7 @@ impl AgentsDialog {
             query: String::new(),
             selected,
             scroll: 0,
+            federated: false,
         };
         dialog.refilter();
         dialog
@@ -61,6 +63,11 @@ impl AgentsDialog {
         focused: &SelectedTarget,
         notifications: &NotificationState,
     ) {
+        if self.federated {
+            // Federated rows carry machine labels and remote agents; the
+            // federation state delivers local updates with them intact.
+            return;
+        }
         let selected = self.rows.get(self.selected).map(|row| row.terminal_id);
         self.rows = agents::items(snapshot, focused, notifications, AgentScope::Global);
         self.refilter();
@@ -85,6 +92,7 @@ impl AgentsDialog {
         if state.registry.iter().count() <= 1 {
             return;
         }
+        self.federated = true;
         let selected = self
             .rows
             .get(self.selected)
@@ -388,6 +396,7 @@ mod tests {
             query: String::new(),
             selected: 0,
             scroll: 0,
+            federated: false,
         };
         let host = Rect::new(0, 0, 80, 10);
         let mut buffer = Buffer::empty(host);
