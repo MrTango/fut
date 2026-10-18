@@ -43,7 +43,11 @@ fi
 perl -0pi -e "s/^version: \x22[^\x22]+\x22/version: \x22$version\x22/m" docs/_config.yml
 
 echo "Releasing $version"
-RUST_TEST_THREADS=4 mise run check
+# A laptop left idle mid-release naps between dark wakes, which stretches the
+# checks and trips wall-clock waits; keep it awake while they run.
+caffeinate=()
+command -v caffeinate >/dev/null && caffeinate=(caffeinate -i)
+RUST_TEST_THREADS=4 ${caffeinate[@]+"${caffeinate[@]}"} mise run check
 
 if ! git diff --quiet -- Cargo.toml Cargo.lock docs/_config.yml; then
   git add Cargo.toml Cargo.lock docs/_config.yml
