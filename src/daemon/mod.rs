@@ -7789,7 +7789,8 @@ mod tests {
 
     /// One random burst of terminal output: scrolling text, scroll regions,
     /// explicit scrolls in both directions, reverse index, line insertion and
-    /// deletion, overwrites, erases, styling, and hyperlinks.
+    /// deletion, overwrites, erases, styling, hyperlinks, and Kitty images
+    /// whose placements scroll with the text.
     fn random_output(rng: &mut Rng, size: TerminalSize) -> Vec<u8> {
         let rows = usize::from(size.rows);
         let columns = usize::from(size.columns);
@@ -7808,7 +7809,7 @@ mod tests {
             }
         };
         for _ in 0..1 + rng.below(3) {
-            match rng.below(12) {
+            match rng.below(13) {
                 0..=3 => {
                     for _ in 0..1 + rng.below(rows + rows / 2) {
                         text(rng, &mut out);
@@ -7850,6 +7851,17 @@ mod tests {
                     text(rng, &mut out);
                     out.push_str(["", "\x1b[K", "\x1b[1J", "\x1b[2K"][rng.below(4)]);
                 }
+                11 => {
+                    // A 1x1 PNG placed over a few cells at the cursor.
+                    out.push_str(&format!(
+                        "\x1b_Ga=T,f=100,q=2,c={},r={},i={};\
+                         iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA\
+                         DUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\",
+                        1 + rng.below(3),
+                        1 + rng.below(3),
+                        1 + rng.below(3)
+                    ));
+                }
                 _ => {
                     if rng.below(8) == 0 {
                         out.push_str(["\x1b[2J", "\x1b[?1049h", "\x1b[?1049l"][rng.below(3)]);
@@ -7869,6 +7881,7 @@ mod tests {
         let sizes = [(80, 24), (13, 7), (40, 12), (3, 2), (1, 5)];
         let mut checked = 0;
         let mut shifted = 0;
+        let mut shifted_images = 0;
         for seed in 1..=12_u64 {
             let (columns, rows) = sizes[seed as usize % sizes.len()];
             let size = TerminalSize { columns, rows };
@@ -7894,6 +7907,9 @@ mod tests {
                             "{context}: unnegotiated shift"
                         );
                         shifted += usize::from(delta.shift.is_some());
+                        shifted_images += usize::from(
+                            delta.shift.is_some() && !screen.graphics.placements.is_empty(),
+                        );
                         checked += 1;
                         let mut applied = base.clone();
                         applied.apply_delta(delta).unwrap();
@@ -7933,6 +7949,10 @@ mod tests {
         }
         // The workload must actually exercise both kinds of delta.
         assert!(shifted > 50, "only {shifted} shifted deltas");
+        assert!(
+            shifted_images > 5,
+            "only {shifted_images} shifted deltas with images"
+        );
         assert!(checked > 2 * shifted, "only {checked} deltas checked");
     }
 
