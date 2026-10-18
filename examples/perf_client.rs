@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use fut::{
-    domain::{ScreenDelta, ScreenSnapshot, TerminalId, TerminalSize},
+    domain::{
+        MouseEvent, MouseEventKind, MouseWheelDirection, ScreenDelta, ScreenSnapshot, TerminalId,
+        TerminalSize,
+    },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
@@ -63,7 +66,7 @@ fn parse_args() -> anyhow::Result<Args> {
     }
     if args.socket.is_empty() || args.scenario.is_empty() {
         bail!(
-            "usage: perf_client --socket PATH [--columns N] [--rows N] [--count N] flood|styled|dense|partial|latency"
+            "usage: perf_client --socket PATH [--columns N] [--rows N] [--count N] flood|styled|dense|partial|scroll|wheel|latency"
         );
     }
     Ok(args)
@@ -171,6 +174,8 @@ struct FloodStats {
     delta_wire_bytes: u64,
     max_frame: usize,
     decode_total: Duration,
+    full_decode: Duration,
+    delta_decode: Duration,
     first_revision: Option<u64>,
     last_revision: u64,
 }
@@ -182,9 +187,11 @@ impl FloodStats {
         if is_delta {
             self.deltas += 1;
             self.delta_wire_bytes += wire_bytes as u64;
+            self.delta_decode += decode;
         } else {
             self.full_snapshots += 1;
             self.full_wire_bytes += wire_bytes as u64;
+            self.full_decode += decode;
         }
         self.max_frame = self.max_frame.max(wire_bytes);
         self.decode_total += decode;
@@ -233,6 +240,20 @@ impl FloodStats {
             "avg decode           {:>10.0} us",
             self.decode_total.as_micros() as f64 / self.snapshots.max(1) as f64
         );
+        println!(
+            "  avg delta / full   {:>10.0} / {:.0} us",
+            self.delta_decode.as_micros() as f64 / self.deltas.max(1) as f64,
+            self.full_decode.as_micros() as f64 / self.full_snapshots.max(1) as f64
+        );
+        println!(
+            "  avg delta / full   {:>10.0} / {:.0} bytes",
+            self.delta_wire_bytes as f64 / self.deltas.max(1) as f64,
+            self.full_wire_bytes as f64 / self.full_snapshots.max(1) as f64
+        );
+        println!(
+            "decode total         {:>10.1} ms",
+            self.decode_total.as_secs_f64() * 1000.0
+        );
     }
 }
 
@@ -272,7 +293,138 @@ async fn flood(
         }
     }
     stats.report(label, started.elapsed());
-    Ok(())
+    verify_against_refresh(connection, terminal_id, materialized).await
+}
+
+/// Let output settle, then ask for a fresh full screen and check that the
+/// grid materialized from every delta so far matches it exactly.
+async fn verify_against_refresh(
+    connection: &mut Connection,
+    terminal_id: TerminalId,
+    materialized: &mut MaterializedScreen,
+) -> anyhow::Result<()> {
+    while let Ok(Some(Ok(frame))) =
+        time::timeout(Duration::from_millis(300), connection.next()).await
+    {
+        let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
+        materialized.apply(terminal_id, envelope.message);
+    }
+    let Some(applied) = materialized.screen.clone() else {
+        bail!("no materialized screen to verify");
+    };
+    send(
+        connection,
+        None,
+        ClientMessage::RefreshTerminal { terminal_id },
+    )
+    .await?;
+    loop {
+        let frame = receive(connection).await?;
+        if let ServerMessage::Snapshot {
+            terminal_id: id,
+            screen,
+        } = frame.envelope.message
+            && id == terminal_id
+        {
+            let matches = screen.cells == applied.cells
+                && screen.cursor == applied.cursor
+                && screen.hyperlinks == applied.hyperlinks;
+            println!(
+                "matches full refresh {:>10}",
+                if matches { "yes" } else { "NO" }
+            );
+            if !matches {
+                bail!("materialized grid diverged from a fresh full screen");
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Scrollback viewport scrolling: fill the scrollback, then wheel up and
+/// back down through it at a human-ish cadence. `count` is the number of
+/// wheel events in each direction (default 60).
+async fn wheel(
+    connection: &mut Connection,
+    terminal_id: TerminalId,
+    materialized: &mut MaterializedScreen,
+    count: Option<u64>,
+) -> anyhow::Result<()> {
+    let fill = "seq 1 5000; echo PERF_\\DONE\n";
+    send(
+        connection,
+        None,
+        ClientMessage::Input {
+            bytes: fill.as_bytes().to_vec(),
+        },
+    )
+    .await?;
+    loop {
+        let frame = receive(connection).await?;
+        if let Some(screen) = materialized.apply(terminal_id, frame.envelope.message)
+            && screen_text(screen).contains("PERF_DONE")
+        {
+            break;
+        }
+    }
+    while let Ok(Some(Ok(frame))) =
+        time::timeout(Duration::from_millis(300), connection.next()).await
+    {
+        let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
+        materialized.apply(terminal_id, envelope.message);
+    }
+    let events = count.unwrap_or(60);
+    for (label, direction) in [
+        ("wheel (scrollback up)", MouseWheelDirection::Up),
+        ("wheel (scrollback down)", MouseWheelDirection::Down),
+    ] {
+        let started = Instant::now();
+        let mut stats = FloodStats::default();
+        let mut next_event = Instant::now();
+        let mut sent = 0;
+        loop {
+            if sent < events && Instant::now() >= next_event {
+                send(
+                    connection,
+                    None,
+                    ClientMessage::MouseInput {
+                        terminal_id,
+                        event: MouseEvent {
+                            kind: MouseEventKind::Wheel { direction },
+                            column: 1,
+                            row: 1,
+                            modifiers: Default::default(),
+                            buttons: Default::default(),
+                        },
+                    },
+                )
+                .await?;
+                sent += 1;
+                next_event += Duration::from_millis(20);
+            }
+            let wait = if sent < events {
+                next_event.saturating_duration_since(Instant::now())
+            } else {
+                Duration::from_millis(300)
+            };
+            let Ok(frame) = time::timeout(wait, connection.next()).await else {
+                if sent < events {
+                    continue;
+                }
+                break;
+            };
+            let frame = frame.context("daemon closed the connection")??;
+            let decode_started = Instant::now();
+            let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
+            let decode = decode_started.elapsed();
+            let is_delta = matches!(envelope.message, ServerMessage::SnapshotDelta { .. });
+            if let Some(screen) = materialized.apply(terminal_id, envelope.message) {
+                stats.accept(screen.revision, frame.len(), decode, is_delta);
+            }
+        }
+        stats.report(label, started.elapsed());
+    }
+    verify_against_refresh(connection, terminal_id, materialized).await
 }
 
 /// Keystroke echo latency: send one character, wait for the snapshot in which
@@ -482,6 +634,24 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        "scroll" => {
+            // Paced output, like a build log or `tail -f`: four new lines
+            // per burst, so most of each screen is the previous one shifted
+            // up. `--count` is the number of bursts (default 400).
+            let bursts = args.count.unwrap_or(400).min(100_000);
+            let command = format!(
+                "i=0; while [ $i -lt {bursts} ]; do printf 'step %06d compiling crate fut-%d (lib) in the workspace\\n' $i $i $i $i $i $i $i $i; sleep 0.01; i=$((i+1)); done"
+            );
+            flood(
+                &mut connection,
+                terminal_id,
+                &mut materialized,
+                "scroll (paced output)",
+                &command,
+            )
+            .await?;
+        }
+        "wheel" => wheel(&mut connection, terminal_id, &mut materialized, args.count).await?,
         "latency" => latency(&mut connection, terminal_id, &mut materialized).await?,
         other => bail!("unknown scenario {other}"),
     }

@@ -6,20 +6,24 @@ set -euo pipefail
 # pane, then drives it with the headless perf client (examples/perf_client.rs)
 # and prints throughput/latency reports.
 #
-#   scripts/perf/run [flood|styled|latency|all]   (default: all)
+#   scripts/perf/run [flood|styled|dense|partial|scroll|wheel|latency|all]
 #
 # Each scenario gets a fresh daemon so measurements are independent.
 # FUT_PERF_COUNT overrides the workload size (lines for flood/styled,
 # frames for dense); each scenario has its own default otherwise.
+# FUT_PERF_COLUMNS / FUT_PERF_ROWS override the 200x50 pane size.
 
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PERF_ROOT="$PROJECT_ROOT/target/fut-perf"
+# FUT_PERF_ROOT relocates the disposable daemon's files, e.g. outside a
+# worktree whose project recipe has not been trusted.
+PERF_ROOT=${FUT_PERF_ROOT:-"$PROJECT_ROOT/target/fut-perf"}
 RUNTIME_DIR="$PERF_ROOT/runtime"
 SOCKET="$RUNTIME_DIR/fut.sock"
 DAEMON_LOG="$PERF_ROOT/daemon.log"
 FUT_BIN="$PROJECT_ROOT/target/release/fut"
 PERF_CLIENT="$PROJECT_ROOT/target/release/examples/perf_client"
 COUNT=${FUT_PERF_COUNT:-}
+SIZE_ARGS=(--columns "${FUT_PERF_COLUMNS:-200}" --rows "${FUT_PERF_ROWS:-50}")
 DAEMON_PID=""
 
 build() {
@@ -67,9 +71,9 @@ scenario() {
   local name=$1
   start_daemon
   if [[ -n "$COUNT" ]]; then
-    "$PERF_CLIENT" --socket "$SOCKET" --count "$COUNT" "$name"
+    "$PERF_CLIENT" --socket "$SOCKET" "${SIZE_ARGS[@]}" --count "$COUNT" "$name"
   else
-    "$PERF_CLIENT" --socket "$SOCKET" "$name"
+    "$PERF_CLIENT" --socket "$SOCKET" "${SIZE_ARGS[@]}" "$name"
   fi
   echo
 }
@@ -78,7 +82,7 @@ trap 'stop_daemon' EXIT INT TERM
 
 build
 case ${1:-all} in
-  flood | styled | dense | partial | latency)
+  flood | styled | dense | partial | scroll | wheel | latency)
     scenario "$1"
     ;;
   all)
@@ -86,10 +90,12 @@ case ${1:-all} in
     scenario styled
     scenario dense
     scenario partial
+    scenario scroll
+    scenario wheel
     scenario latency
     ;;
   *)
-    echo "Usage: scripts/perf/run [flood|styled|dense|partial|latency|all]" >&2
+    echo "Usage: scripts/perf/run [flood|styled|dense|partial|scroll|wheel|latency|all]" >&2
     exit 2
     ;;
 esac

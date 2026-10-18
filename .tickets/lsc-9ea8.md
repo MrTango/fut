@@ -18,3 +18,9 @@ Detect when the new grid equals the previous one shifted up by N rows within a r
 ## Acceptance Criteria
 
 perf:e2e flood at 508x160 shows wire bytes and client decode time scaling with new rows rather than grid size; deltas apply identically to full screens in tests; older remote peers keep the current behavior.
+
+## Notes
+
+**2026-10-18T19:48:02Z**
+
+Baseline (main e835589, release, host load avg 12-30 from parallel agents). Saturating flood (seq 1 100000) sends ~4,500 new lines per 8 ms publication, more than the grid has rows, so every frame is genuinely new content: 21/22 frames full at both sizes (200x50: 20,103 B, 200 us decode; 508x160: 162,668 B, 1.63 ms decode, 3.3 MiB/run). A shift delta cannot help that case. Added perf scenarios where it can: 'scroll' (paced log output, 4 lines per ~12 ms burst) and 'wheel' (60 scrollback wheel events each way at 20 ms). Baseline scroll 508x160: 359/406 full, 56.2 MiB, 1.56 ms avg full decode, 566-780 ms total decode over 6 s; 200x50: 388/405 full, 7.5 MiB, 80 ms decode. Wheel 508x160: 60/60 full each direction, 9.3 MiB, 1.6-2.6 ms decode each; 200x50: 60/60 full, 1.2 MiB. Latency 200x50: typing p50/p95 0.5/0.6 ms, burst 8.3/8.9 ms. All runs' materialized grids matched a fresh full refresh.
