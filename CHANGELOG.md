@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.37
+
 - Keep the navigator, notifications, and agents dialogs on the selected row and scroll position across updates when a remote machine is configured; remote rows and machine headers no longer snap back to the top.
 
 ## 0.36
