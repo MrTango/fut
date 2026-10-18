@@ -2075,8 +2075,12 @@ fn changed_rows(
 /// send, and those rows. `changed` lists the rows that differ in place,
 /// ascending and nonempty; only their span can move.
 ///
-/// Row hashes only propose and rank candidates. The returned rows come from
-/// exact comparison, so a hash collision costs bytes, never correctness.
+/// A few anchor rows of `next` propose candidate shifts by exact comparison
+/// against `previous`, which rejects most rows within their first cells, so
+/// output that shares no rows with the last screen costs a few hundred short
+/// comparisons. Only then are rows hashed to rank the candidates. The rows
+/// returned come from exact comparison, so a hash collision costs bytes, never
+/// correctness.
 fn find_shift(
     previous: &ScreenSnapshot,
     next: &ScreenSnapshot,
@@ -2085,12 +2089,6 @@ fn find_shift(
     let top = changed[0];
     let bottom = changed[changed.len() - 1] + 1;
     let span = bottom - top;
-    let old: &[u64] = &(top..bottom)
-        .map(|index| row_hash(previous.row(index)))
-        .collect::<Vec<_>>();
-    let new: &[u64] = &(top..bottom)
-        .map(|index| row_hash(next.row(index)))
-        .collect::<Vec<_>>();
 
     // Content that scrolled up by `by` sits at `anchor` now and at
     // `anchor + by` before; scrolling down puts it above.
@@ -2098,22 +2096,33 @@ fn find_shift(
     for anchor in
         (0..SHIFT_ANCHORS).map(|n| changed[n * (changed.len() - 1) / (SHIFT_ANCHORS - 1)] - top)
     {
-        let hash = new[anchor];
+        let row = next.row(top + anchor);
+        let matches = |source: &usize| previous.row(top + source) == row;
         let up = (anchor + 1..span)
-            .filter(|&source| old[source] == hash)
+            .filter(matches)
             .take(SHIFT_CANDIDATES_PER_ANCHOR)
             .map(|source| (source - anchor) as isize);
         let down = (0..anchor)
             .rev()
-            .filter(|&source| old[source] == hash)
+            .filter(matches)
             .take(SHIFT_CANDIDATES_PER_ANCHOR)
             .map(|source| -((anchor - source) as isize));
         for by in up.chain(down) {
-            if !candidates.contains(&by) {
+            if !candidates.contains(&by) && i16::try_from(by).is_ok() {
                 candidates.push(by);
             }
         }
     }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let old: &[u64] = &(top..bottom)
+        .map(|index| row_hash(previous.row(index)))
+        .collect::<Vec<_>>();
+    let new: &[u64] = &(top..bottom)
+        .map(|index| row_hash(next.row(index)))
+        .collect::<Vec<_>>();
     let retained = move |by: isize| {
         (0..span).filter(move |&index| {
             let source = index as isize + by;
@@ -2123,7 +2132,7 @@ fn find_shift(
     let by = candidates
         .into_iter()
         .map(|by| (retained(by).count(), by))
-        .filter(|&(count, by)| count > 0 && i16::try_from(by).is_ok())
+        .filter(|&(count, _)| count > 0)
         .max_by_key(|&(count, by)| (count, std::cmp::Reverse(by.unsigned_abs()), by > 0))?
         .1;
 
@@ -2150,23 +2159,34 @@ fn find_shift(
     Some((shift, remaining))
 }
 
-/// A fast, non-cryptographic fingerprint of a row's cells for proposing
-/// shifts; equal rows always hash equal.
+/// A fast, non-cryptographic fingerprint of a row's cells for ranking
+/// shifts; equal rows always hash equal. Each cell folds into the running
+/// hash with a single multiply, which bounds the cost on large screens.
 fn row_hash(cells: &[Cell]) -> u64 {
     const MULTIPLIER: u64 = 0xf135_7aea_2e62_a9c5;
+    const SPREAD: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut hash = 0_u64;
-    let mut mix = |word: u64| hash = (hash ^ word).wrapping_mul(MULTIPLIER).rotate_left(26);
     for cell in cells {
         let bytes = cell.contents.as_bytes();
-        for chunk in bytes.chunks(8) {
+        let mut chunks = bytes.chunks(8);
+        let word = |chunk: &[u8]| {
             let mut word = [0_u8; 8];
             word[..chunk.len()].copy_from_slice(chunk);
-            mix(u64::from_le_bytes(word));
+            u64::from_le_bytes(word)
+        };
+        let mut contents = chunks.next().map_or(0, word);
+        for chunk in chunks {
+            contents = (contents ^ word(chunk))
+                .wrapping_mul(SPREAD)
+                .rotate_left(31);
         }
-        mix(cell.style.0
+        let attributes = cell.style.0
             ^ ((bytes.len() as u64) << 57)
             ^ (u64::from(cell.selected) << 63)
-            ^ u64::from(cell.hyperlink.map_or(0, |index| u32::from(index) + 1)).rotate_left(29));
+            ^ u64::from(cell.hyperlink.map_or(0, |index| u32::from(index) + 1)).rotate_left(29);
+        hash = (hash ^ contents.wrapping_mul(SPREAD) ^ attributes)
+            .wrapping_mul(MULTIPLIER)
+            .rotate_left(26);
     }
     hash
 }
