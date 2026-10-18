@@ -1,6 +1,6 @@
 ---
 id: os-pcxw
-status: open
+status: closed
 deps: []
 links: [os-wtnt, os-g084, os-ypyk]
 created: 2026-10-16T14:37:27Z
@@ -38,3 +38,7 @@ Verified: mise run check exit 0 (875 unit incl. 9 host_status, 170 e2e incl. 2 n
 **2026-10-18T20:51:23Z**
 
 Combined verification on cb0ce58 (branch worktree-agent-ac47b632eb049bf9c): nested 9;4 -> outer root fut working/progress + 1 child; 7501 blocked replaces it; 7501 lockout and RIS reflected in outer; two-terminal precedence; 2000-update floods (1 outer revision burst, 11 revisions over a 5s sustained flood); SIGKILL leaves only done, next client sweeps; auto/always/never/auto+reply byte captures; live Ctrl-b R reload never->auto->never; self-attach skips own terminal with no feedback; --machine via fake ssh bridge forwards remote 9;4; real Pi 1.3.0 extension -> outer child app=pi done, /quit clears. Fixed a67b62f (9;4 children were forwarded with app=progress). Nit: when the root is error/done and exactly one other child is working, the root still carries progress=N; receivers normalize it away, harmless.
+
+**2026-10-18T22:04:31Z**
+
+Landed on main (aae3c61..28580ed) and verified together with OSC 9;4 mapping and the Pi work in a combined manual pass (nested Fut, config modes, floods, SIGKILL recovery, journeys). The one cross-feature gap found, a forwarding client locking out 9;4 in its host terminal until RIS, is fixed in b33568d.
