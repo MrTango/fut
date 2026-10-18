@@ -1977,6 +1977,55 @@ impl ScreenSnapshot {
         }
         Ok(())
     }
+
+    /// The delta that turns `previous` into this screen, or `None` when a
+    /// full screen is the better message: the sizes differ, or more than
+    /// [`DELTA_ROW_FALLBACK_THRESHOLD`] of the rows changed.
+    #[must_use]
+    pub fn delta_from(&self, previous: &ScreenSnapshot) -> Option<ScreenDelta> {
+        if previous.size != self.size {
+            return None;
+        }
+        let rows = changed_rows(previous, self)?;
+        Some(ScreenDelta {
+            revision: self.revision,
+            base_revision: previous.revision,
+            size: self.size,
+            rows,
+            hyperlinks: self.hyperlinks.clone(),
+            cursor: self.cursor,
+            scroll: self.scroll,
+            mouse_tracking: self.mouse_tracking,
+            graphics: (previous.graphics != self.graphics).then(|| self.graphics.clone()),
+        })
+    }
+}
+
+/// Rows changed exceeding this fraction of the grid fall back to a full
+/// snapshot: past this point the delta's per-row framing overhead outweighs
+/// what it saves over just resending everything.
+pub const DELTA_ROW_FALLBACK_THRESHOLD: f64 = 0.6;
+
+/// Rows that differ between same-sized `previous` and `next`, or `None` if
+/// that's more than [`DELTA_ROW_FALLBACK_THRESHOLD`] of all rows.
+fn changed_rows(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Option<Vec<DeltaRow>> {
+    let columns = usize::from(next.size.columns);
+    let rows = usize::from(next.size.rows);
+    let mut changed = Vec::new();
+    for row in 0..rows {
+        let start = row * columns;
+        let end = start + columns;
+        if previous.cells[start..end] != next.cells[start..end] {
+            changed.push(DeltaRow {
+                index: row as u16,
+                cells: next.cells[start..end].to_vec(),
+            });
+        }
+    }
+    if changed.len() as f64 > rows as f64 * DELTA_ROW_FALLBACK_THRESHOLD {
+        return None;
+    }
+    Some(changed)
 }
 
 /// One changed row of a [`ScreenDelta`]: its index within the grid plus a

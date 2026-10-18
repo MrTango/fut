@@ -45,7 +45,7 @@ use crate::{
     alerts::AlertStore,
     client::config as global_config,
     domain::{
-        BlockedKind, ClientId, CopyModeAction, CopyModeError, DeltaRow, MAX_AGENT_PROMPT_BYTES,
+        BlockedKind, ClientId, CopyModeAction, CopyModeError, MAX_AGENT_PROMPT_BYTES,
         MAX_TERMINAL_OUTPUT_PATTERN_BYTES, MAX_TERMINAL_OUTPUT_ROWS, PaneId, ProgramStatus,
         ScreenDelta, ScreenSnapshot, SessionId, SplitId, StatusReport, StatusSource, StatusState,
         StatusUpdate, TabId, TerminalId, TerminalOutput, TerminalOutputMatcher,
@@ -2857,11 +2857,6 @@ impl OutboundQueue {
 /// so a client that stopped reading cannot pin its writer task forever.
 const OUTBOUND_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Rows changed exceeding this fraction of the grid fall back to a full
-/// snapshot: past this point the delta's per-row framing overhead outweighs
-/// what it saves over just resending everything.
-const DELTA_ROW_FALLBACK_THRESHOLD: f64 = 0.6;
-
 /// Choose between a full snapshot and a delta against `last_sent`, the
 /// screen actually written to this connection last time — never against
 /// whatever the attachment layer last produced, since coalescing can drop
@@ -2875,20 +2870,8 @@ fn snapshot_message(
 ) -> ServerMessage {
     if !force_full
         && let Some(previous) = last_sent.get(&terminal_id)
-        && previous.size == screen.size
-        && let Some(rows) = diff_rows(previous, &screen)
+        && let Some(delta) = screen.delta_from(previous)
     {
-        let delta = ScreenDelta {
-            revision: screen.revision,
-            base_revision: previous.revision,
-            size: screen.size,
-            rows,
-            hyperlinks: screen.hyperlinks.clone(),
-            cursor: screen.cursor,
-            scroll: screen.scroll,
-            mouse_tracking: screen.mouse_tracking,
-            graphics: (previous.graphics != screen.graphics).then(|| screen.graphics.clone()),
-        };
         last_sent.insert(terminal_id, screen);
         return ServerMessage::SnapshotDelta { terminal_id, delta };
     }
@@ -2897,29 +2880,6 @@ fn snapshot_message(
         terminal_id,
         screen,
     }
-}
-
-/// Rows that differ between `previous` and `next`, or `None` if that's more
-/// than [`DELTA_ROW_FALLBACK_THRESHOLD`] of all rows. Callers must already
-/// know `previous.size == next.size`.
-fn diff_rows(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Option<Vec<DeltaRow>> {
-    let columns = usize::from(next.size.columns);
-    let rows = usize::from(next.size.rows);
-    let mut changed = Vec::new();
-    for row in 0..rows {
-        let start = row * columns;
-        let end = start + columns;
-        if previous.cells[start..end] != next.cells[start..end] {
-            changed.push(DeltaRow {
-                index: row as u16,
-                cells: next.cells[start..end].to_vec(),
-            });
-        }
-    }
-    if changed.len() as f64 > rows as f64 * DELTA_ROW_FALLBACK_THRESHOLD {
-        return None;
-    }
-    Some(changed)
 }
 
 /// Kitty images a client holds, per terminal, when screens reference

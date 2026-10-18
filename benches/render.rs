@@ -9,6 +9,9 @@
 //!   what a 5120x2160 display produces with small fonts. Sizes above
 //!   `MAX_VISIBLE_CELLS` are skipped so the file runs against older caps.
 //! - `graphics`: per-frame costs for a screen showing a Kitty image
+//! - `delta`: the daemon's per-connection choice between a delta and a full
+//!   screen plus its encode (`produce_*`), and the client's decode and apply
+//!   (`apply_*`), for typing, scrolling output, and pager-style scroll regions
 //!
 //! Run with `mise run perf:bench` (or `cargo bench --bench render`).
 //! Compare runs with `critcmp` or criterion's built-in baseline diffing:
@@ -17,7 +20,7 @@
 use std::fmt::Write;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fut::{
     domain::{MAX_VISIBLE_CELLS, ScreenSnapshot, TerminalSize},
     protocol::{Envelope, ServerMessage, decode_payload, encode_payload},
@@ -377,5 +380,121 @@ fn bench_graphics(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_feed, bench_wire, bench_scale, bench_graphics);
+/// `count` numbered log lines, CRLF-terminated like a PTY with `onlcr`.
+fn log_lines(start: usize, count: usize) -> Vec<u8> {
+    let mut out = String::new();
+    for line in start..start + count {
+        write!(
+            out,
+            "\x1b[32m{line:>8}\x1b[0m compiling crate fut-{line} (lib) in the workspace\r\n"
+        )
+        .unwrap();
+    }
+    out.into_bytes()
+}
+
+/// Screens before and after one update, for each delta workload.
+fn delta_cases(size: TerminalSize) -> Vec<(&'static str, ScreenSnapshot, ScreenSnapshot)> {
+    let rows = usize::from(size.rows);
+    let snapshot = |vt: &mut VtBench, bytes: &[u8]| {
+        vt.feed(bytes)
+            .expect("feed bench terminal")
+            .expect("snapshot is published")
+    };
+    let mut cases = Vec::new();
+
+    let mut vt = VtBench::new(size).expect("create bench terminal");
+    let before = snapshot(&mut vt, &log_lines(0, rows * 2));
+    let after = snapshot(&mut vt, b"x");
+    cases.push(("type", before, after));
+
+    let mut vt = VtBench::new(size).expect("create bench terminal");
+    let before = snapshot(&mut vt, &log_lines(0, rows * 2));
+    let after = snapshot(&mut vt, &log_lines(rows * 2, 4));
+    cases.push(("scroll4", before, after));
+
+    // A pager: a scroll region above a status line, paged down then up.
+    let mut vt = VtBench::new(size).expect("create bench terminal");
+    let mut setup = format!("\x1b[1;{}r", rows - 1).into_bytes();
+    setup.extend(log_lines(0, rows * 2));
+    setup.extend(format!("\x1b[{rows};1H:\x1b[{};1H", rows - 1).into_bytes());
+    let before = snapshot(&mut vt, &setup);
+    let mut forward = format!("\x1b[{};1H", rows - 1).into_bytes();
+    forward.extend(log_lines(rows * 2, rows / 2));
+    forward.extend(format!("\x1b[{rows};1H:").into_bytes());
+    let after = snapshot(&mut vt, &forward);
+    cases.push(("pager_down", before, after.clone()));
+    let mut back = b"\x1b[1;1H".to_vec();
+    for line in (0..rows / 2).rev() {
+        back.extend(b"\x1bM");
+        back.extend(log_lines(line, 1).strip_suffix(b"\r\n").unwrap());
+        back.extend(b"\r");
+    }
+    back.extend(format!("\x1b[{rows};1H:").into_bytes());
+    let back = snapshot(&mut vt, &back);
+    cases.push(("pager_up", after, back));
+    cases
+}
+
+fn screen_message(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Vec<u8> {
+    let terminal_id = fut::domain::TerminalId::new();
+    let message = match next.delta_from(previous) {
+        Some(delta) => ServerMessage::SnapshotDelta { terminal_id, delta },
+        None => ServerMessage::Snapshot {
+            terminal_id,
+            screen: next.clone(),
+        },
+    };
+    encode_payload(&Envelope {
+        request_id: None,
+        message,
+    })
+    .expect("encode screen")
+}
+
+fn bench_delta(c: &mut Criterion) {
+    let mut group = c.benchmark_group("delta");
+    for (size_name, size) in [SCALE_SIZES[0], SCALE_SIZES[2]] {
+        for (case, previous, next) in delta_cases(size) {
+            let name = format!("{case}_{size_name}");
+            let encoded = screen_message(&previous, &next);
+            let kind = if next.delta_from(&previous).is_some() {
+                "delta"
+            } else {
+                "full"
+            };
+            eprintln!("delta/{name}: {kind} frame {} bytes", encoded.len());
+            group.bench_function(format!("produce_{name}"), |b| {
+                b.iter(|| screen_message(&previous, &next))
+            });
+            let apply = |mut screen: ScreenSnapshot| {
+                let envelope: Envelope<ServerMessage> =
+                    decode_payload(&encoded).expect("decode screen");
+                match envelope.message {
+                    ServerMessage::SnapshotDelta { delta, .. } => {
+                        screen.apply_delta(delta).expect("apply delta");
+                        screen
+                    }
+                    ServerMessage::Snapshot { screen, .. } => screen,
+                    _ => unreachable!(),
+                }
+            };
+            assert_eq!(apply(previous.clone()).cells, next.cells, "{name}");
+            // The client applies in place; keep the base clone out of the timing.
+            group.bench_function(format!("apply_{name}"), |b| {
+                b.iter_batched(|| previous.clone(), apply, BatchSize::LargeInput)
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_feed,
+    bench_wire,
+    bench_scale,
+    bench_graphics,
+    bench_delta
+);
 criterion_main!(benches);
