@@ -39,15 +39,27 @@ pub fn parse_id(value: &str) -> Result<Uuid, IdParseError> {
     (compact_id(id) == value).then_some(id).ok_or(IdParseError)
 }
 
-/// Upper bound for the number of cells in a terminal's visible grid.
-///
-/// This is deliberately independent of the transport frame limit: validating
-/// dimensions before constructing a grid prevents hostile `u16` dimensions
-/// from driving multi-gigabyte allocations. The bound is also sized so the
-/// worst-case screen still fits one frame: at most about 50 bytes per fully
-/// styled, selected, hyperlinked cell, plus [`MAX_SCREEN_HYPERLINK_BYTES`]
-/// and [`MAX_KITTY_PLACEMENTS`] worth of image references. Kitty image
-/// pixels travel in their own frames, so they do not share this budget.
+/// Largest terminal width and height. Like Ghostty, whose cell coordinates
+/// are 16-bit, each dimension is bounded only by the `u16` that carries it;
+/// [`MAX_GRID_CELLS`] bounds memory separately. Screens larger than one frame
+/// travel as row-range chunks, and one maximal row of worst-case cells still
+/// fits a frame, so no dimension depends on the transport.
+pub const MAX_TERMINAL_COLUMNS: u16 = u16::MAX;
+pub const MAX_TERMINAL_ROWS: u16 = u16::MAX;
+/// Upper bound for the number of cells in a terminal's visible grid: a
+/// memory bound, not a transport one. Validating dimensions before
+/// constructing a grid prevents hostile `u16` dimensions from driving
+/// multi-gigabyte allocations. At 2^20 cells, an in-memory screen copy is
+/// 40 MiB; an 8K display (7680x4320) at 4x8-pixel cells is 1920x540, or
+/// 1,036,800 cells.
+pub const MAX_GRID_CELLS: usize = 1 << 20;
+/// Largest grid one screen frame holds, and the bound for remote peers that
+/// did not negotiate `chunked-screens.v1`. Screens with more cells than this
+/// travel as row-range chunks. A worst-case screen still fits one frame: at
+/// most about 50 bytes per fully styled, selected, hyperlinked cell, plus
+/// [`MAX_SCREEN_HYPERLINK_BYTES`] and [`MAX_KITTY_PLACEMENTS`] worth of image
+/// references. Kitty image pixels travel in their own frames, so they do not
+/// share this budget.
 pub const MAX_VISIBLE_CELLS: usize = 150_000;
 /// Visible-cell bound for remote peers that did not negotiate
 /// `large-screens.v1`. Generation-1 screens embed Kitty image pixels and were
@@ -61,7 +73,8 @@ pub const MAX_KITTY_PLACEMENTS: usize = 1024;
 /// Cell contents are also constrained to one control-free grapheme, and the
 /// wire format (MessagePack) stores strings as raw length-prefixed bytes
 /// with no escaping overhead. At 32 bytes, [`MAX_VISIBLE_CELLS`] fully
-/// styled, selected, hyperlinked cells still fit below the protocol's
+/// styled, selected, hyperlinked cells (and so any one screen chunk, or one
+/// row of [`MAX_TERMINAL_COLUMNS`] cells) still fit below the protocol's
 /// eight-MiB limit, while ordinary emoji clusters remain exact. Pathological
 /// combining sequences are represented by a fixed marker.
 pub const MAX_CELL_CONTENT_BYTES: usize = 32;
@@ -1315,7 +1328,7 @@ impl TerminalSize {
     }
 
     pub fn cell_count(self) -> Result<usize, TerminalSizeError> {
-        self.cell_count_within(MAX_VISIBLE_CELLS)
+        self.cell_count_within(MAX_GRID_CELLS)
     }
 
     fn cell_count_within(self, maximum: usize) -> Result<usize, TerminalSizeError> {
@@ -1324,10 +1337,10 @@ impl TerminalSize {
         }
 
         let count = usize::from(self.columns) * usize::from(self.rows);
-        if count > maximum.min(MAX_VISIBLE_CELLS) {
+        if count > maximum.min(MAX_GRID_CELLS) {
             return Err(TerminalSizeError::TooLarge {
                 actual: count,
-                maximum: maximum.min(MAX_VISIBLE_CELLS),
+                maximum: maximum.min(MAX_GRID_CELLS),
             });
         }
         Ok(count)
@@ -1994,6 +2007,34 @@ impl ScreenSnapshot {
     fn row(&self, index: usize) -> &[Cell] {
         let columns = usize::from(self.size.columns);
         &self.cells[index * columns..(index + 1) * columns]
+    }
+
+    /// Keep only the top-left corner that holds at most `max_cells` cells,
+    /// for a peer that cannot receive this whole grid. The stand-in drops
+    /// Kitty graphics and hides a cursor that falls outside it.
+    pub fn crop_to(&mut self, max_cells: usize) {
+        if self.cells.len() <= max_cells || max_cells == 0 {
+            return;
+        }
+        let old_columns = usize::from(self.size.columns);
+        let columns = old_columns.min(max_cells);
+        let rows = (max_cells / columns).min(usize::from(self.size.rows));
+        self.cells = self
+            .cells
+            .chunks_exact(old_columns)
+            .take(rows)
+            .flat_map(|row| row[..columns].iter().cloned())
+            .collect();
+        self.size = TerminalSize {
+            columns: columns as u16,
+            rows: rows as u16,
+        };
+        if usize::from(self.cursor.column) >= columns || usize::from(self.cursor.row) >= rows {
+            self.cursor.visible = false;
+            self.cursor.column = self.cursor.column.min(self.size.columns - 1);
+            self.cursor.row = self.cursor.row.min(self.size.rows - 1);
+        }
+        self.graphics = KittyGraphics::default();
     }
 
     /// The delta that turns `previous` into this screen, or `None` when a
@@ -2855,10 +2896,103 @@ mod tests {
                 },
             ),
             Err(SnapshotError::InvalidSize(TerminalSizeError::TooLarge {
-                maximum: MAX_VISIBLE_CELLS,
+                maximum: MAX_GRID_CELLS,
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn grids_are_bounded_by_memory_not_by_one_frame() {
+        let size = |columns, rows| TerminalSize { columns, rows };
+        // The per-dimension limits are the wire type's.
+        assert_eq!(MAX_TERMINAL_COLUMNS, u16::MAX);
+        assert_eq!(MAX_TERMINAL_ROWS, u16::MAX);
+        assert_eq!(size(508, 320).cell_count(), Ok(162_560));
+        assert_eq!(size(1920, 540).cell_count(), Ok(1_036_800));
+        assert_eq!(size(u16::MAX, 16).cell_count(), Ok(1_048_560));
+        assert_eq!(size(1024, 1024).cell_count(), Ok(MAX_GRID_CELLS));
+        assert_eq!(
+            size(1025, 1024).cell_count(),
+            Err(TerminalSizeError::TooLarge {
+                actual: 1025 * 1024,
+                maximum: MAX_GRID_CELLS,
+            })
+        );
+        // Older peers keep their bounds.
+        assert!(size(500, 300).validate_within(MAX_VISIBLE_CELLS).is_ok());
+        assert!(size(508, 320).validate_within(MAX_VISIBLE_CELLS).is_err());
+        assert!(
+            size(508, 160)
+                .validate_within(LEGACY_MAX_VISIBLE_CELLS)
+                .is_err()
+        );
+        // One in-memory copy of the largest grid stays within 40 MiB.
+        assert!(MAX_GRID_CELLS * std::mem::size_of::<Cell>() <= 40 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cropping_keeps_the_top_left_corner_within_a_bound() {
+        let size = TerminalSize {
+            columns: 10,
+            rows: 6,
+        };
+        let cells = (0..60)
+            .map(|index| Cell {
+                contents: format!("{}", index % 10).into(),
+                ..Cell::default()
+            })
+            .collect();
+        let cursor = Cursor {
+            column: 2,
+            row: 1,
+            visible: true,
+            shape: Default::default(),
+            blinking: false,
+        };
+        let mut screen = ScreenSnapshot::new(3, size, cells, cursor).unwrap();
+        screen.graphics.placements.push(KittyPlacement {
+            image_id: 1,
+            placement_id: 1,
+            column: 0,
+            row: 0,
+            columns: 1,
+            rows: 1,
+            source_x: 0,
+            source_y: 0,
+            source_width: 1,
+            source_height: 1,
+            z: 0,
+        });
+        let original = screen.clone();
+        screen.crop_to(60);
+        assert_eq!(screen, original, "a screen within the bound is unchanged");
+
+        screen.crop_to(25);
+        assert_eq!(
+            screen.size,
+            TerminalSize {
+                columns: 10,
+                rows: 2
+            }
+        );
+        assert_eq!(screen.cells[..], original.cells[..20]);
+        assert_eq!(screen.cursor, cursor);
+        assert!(screen.graphics.is_empty());
+
+        // A bound narrower than one row also crops columns.
+        let mut narrow = original.clone();
+        narrow.crop_to(4);
+        assert_eq!(
+            narrow.size,
+            TerminalSize {
+                columns: 4,
+                rows: 1
+            }
+        );
+        assert_eq!(narrow.cells[..], original.cells[..4]);
+        assert!(!narrow.cursor.visible, "the cursor fell outside the corner");
+        assert!(narrow.cursor.column < 4 && narrow.cursor.row < 1);
     }
 
     fn delta_snapshot() -> ScreenSnapshot {

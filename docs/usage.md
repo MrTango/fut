@@ -356,6 +356,11 @@ changes the pane topology during a drag, Fut cancels the stale drag and shows
 `Layout changed in another client`. Attached clients also share terminal input
 and output, and shared PTYs use the smallest attached client's dimensions.
 
+A terminal may be up to 65,535 columns or rows and 1,048,576 cells in all, enough
+for an 8K display at a 4x8-pixel font (1920x540). The cell bound is a memory
+bound: one copy of the largest grid is 40 MiB. Remote machines running Fut 0.37
+or earlier keep their own limit of 150,000 cells (50,000 before 0.35).
+
 ## Terminal alerts
 
 Fut reports real BEL characters as terminal-native attention without

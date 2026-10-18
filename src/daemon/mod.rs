@@ -2719,7 +2719,6 @@ struct OutboundState {
     failed: bool,
 }
 
-#[derive(Default)]
 struct OutboundQueue {
     state: std::sync::Mutex<OutboundState>,
     ready: Notify,
@@ -2730,6 +2729,24 @@ struct OutboundQueue {
     /// Set for remote peers without `scroll-deltas.v1`: their frozen delta
     /// format has no row shift, so scrolling falls back to row diffs.
     unshifted_deltas: std::sync::atomic::AtomicBool,
+    /// The largest screen this peer may receive: its negotiated visible-cell
+    /// bound. Screens above [`crate::domain::MAX_VISIBLE_CELLS`] go out as
+    /// row-range chunks, so peers without `chunked-screens.v1` keep a lower
+    /// bound; a larger terminal shared with another client reaches them
+    /// cropped until their own resize shrinks it.
+    max_screen_cells: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for OutboundQueue {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            ready: Default::default(),
+            embed_images: Default::default(),
+            unshifted_deltas: Default::default(),
+            max_screen_cells: crate::domain::MAX_GRID_CELLS.into(),
+        }
+    }
 }
 
 impl ClientConnection {
@@ -2756,11 +2773,11 @@ impl ClientConnection {
         self.reader.next().await
     }
 
-    /// Largest grid this connection's client may request; remote peers
-    /// without `large-screens.v1` keep the generation-1 bound.
+    /// Largest grid this connection's client may request; remote peers keep
+    /// the bound of the screen formats they negotiated.
     fn max_visible_cells(&self) -> usize {
         self.remote.map_or(
-            crate::domain::MAX_VISIBLE_CELLS,
+            crate::domain::MAX_GRID_CELLS,
             Capabilities::max_visible_cells,
         )
     }
@@ -2957,6 +2974,11 @@ async fn write_outbound(
 ) {
     let mut last_sent: HashMap<TerminalId, ScreenSnapshot> = HashMap::new();
     let mut sent_images = SentImages::default();
+    let max_screen_cells = || {
+        queue
+            .max_screen_cells
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
     loop {
         let Some(item) = queue.pop() else {
             if queue.is_finished() {
@@ -2974,13 +2996,17 @@ async fn write_outbound(
             }
             Outbound::Snapshot {
                 terminal_id,
-                screen,
+                mut screen,
                 force_full,
             } => (
                 None,
                 snapshot_message(
                     terminal_id,
-                    screen,
+                    {
+                        // Before diffing, so `last_sent` is what the peer has.
+                        screen.crop_to(max_screen_cells());
+                        screen
+                    },
                     force_full,
                     !queue
                         .unshifted_deltas
@@ -2990,8 +3016,16 @@ async fn write_outbound(
             ),
             Outbound::Message {
                 request_id,
-                message,
+                mut message,
             } => {
+                match &mut *message {
+                    ServerMessage::CopyModeSnapshot { screen, .. }
+                    | ServerMessage::CopyModeFinalized { screen, .. }
+                    | ServerMessage::CopyModeCancelled { screen, .. } => {
+                        screen.crop_to(max_screen_cells());
+                    }
+                    _ => {}
+                }
                 match &*message {
                     ServerMessage::TargetSelected { selected } => {
                         let visible: HashSet<_> =
@@ -3026,13 +3060,23 @@ async fn write_outbound(
                 }
             }
         }
-        let payload = encode_payload(&Envelope {
-            request_id,
-            message,
-        })
-        .map(Bytes::from);
-        if !send_outbound(&mut sink, &queue, payload).await {
-            return;
+        // Split only here, after coalescing: the queue holds whole screens,
+        // and a sequence goes out contiguously before anything else.
+        let frames = if max_screen_cells() > crate::domain::MAX_VISIBLE_CELLS {
+            crate::protocol::chunked::split_screen(message, crate::domain::MAX_VISIBLE_CELLS)
+        } else {
+            vec![message]
+        };
+        let last = frames.len() - 1;
+        for (index, message) in frames.into_iter().enumerate() {
+            let payload = encode_payload(&Envelope {
+                request_id: request_id.filter(|_| index == last),
+                message,
+            })
+            .map(Bytes::from);
+            if !send_outbound(&mut sink, &queue, payload).await {
+                return;
+            }
         }
     }
 }
@@ -3127,6 +3171,10 @@ async fn handle_connection(
                     );
                     connection.outbound.unshifted_deltas.store(
                         !capabilities.contains(Capability::ScrollDeltas),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    connection.outbound.max_screen_cells.store(
+                        capabilities.max_visible_cells(),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
@@ -7873,79 +7921,143 @@ mod tests {
         out.into_bytes()
     }
 
+    /// Send `message` the way the writer does, split into chunks of at most
+    /// `max_cells` cells, encode and decode every frame, and reassemble.
+    fn over_the_wire(
+        message: ServerMessage,
+        max_cells: usize,
+        screens: &mut crate::protocol::chunked::ScreenAssembler,
+    ) -> (ServerMessage, usize) {
+        use crate::protocol::chunked::{Assembly, split_screen};
+        let frames = split_screen(message, max_cells);
+        let count = frames.len();
+        let mut assembled = None;
+        for frame in frames {
+            let payload = crate::protocol::encode_payload(&Envelope {
+                request_id: None,
+                message: frame,
+            })
+            .unwrap();
+            assert!(payload.len() <= crate::protocol::MAX_FRAME_LEN);
+            let envelope: Envelope<ServerMessage> = decode_payload(&payload).unwrap();
+            match screens.accept(envelope.message) {
+                Assembly::Ready(message) => {
+                    assert!(assembled.is_none(), "one message per sequence");
+                    assembled = Some(message);
+                }
+                Assembly::Pending => {}
+                Assembly::Discarded(discarded) => panic!("discarded {discarded:?}"),
+            }
+        }
+        (assembled.expect("the sequence completed"), count)
+    }
+
+    /// Feed random VT output through `snapshot_message` and the wire, with
+    /// some snapshots coalesced away, and check that the client's grid equals
+    /// every screen it was sent. Returns counts of deltas checked, shifted,
+    /// shifted with images, and full screens and deltas sent in chunks.
+    fn random_round_trip(
+        seed: u64,
+        size: TerminalSize,
+        steps: usize,
+        max_cells: impl Fn(&mut Rng) -> usize,
+        bases: usize,
+    ) -> [usize; 5] {
+        let mut counts = [0; 5];
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut vt = crate::terminal::bench::VtBench::with_scrollback(size, 4096).unwrap();
+        let terminal_id = TerminalId::new();
+        let mut last_sent = HashMap::new();
+        let mut screens = crate::protocol::chunked::ScreenAssembler::default();
+        let mut client: Option<ScreenSnapshot> = None;
+        let mut history: Vec<ScreenSnapshot> = Vec::new();
+        for step in 0..steps {
+            let Some(screen) = vt.feed(&random_output(&mut rng, size)).unwrap() else {
+                continue;
+            };
+            let context = format!("seed {seed} step {step}");
+            for _ in 0..bases.min(history.len()) {
+                let base = &history[rng.below(history.len())];
+                for shifts in [true, false] {
+                    let Some(delta) = screen.delta_from(base, shifts) else {
+                        continue;
+                    };
+                    assert!(
+                        shifts || delta.shift.is_none(),
+                        "{context}: unnegotiated shift"
+                    );
+                    counts[1] += usize::from(delta.shift.is_some());
+                    counts[2] += usize::from(
+                        delta.shift.is_some() && !screen.graphics.placements.is_empty(),
+                    );
+                    counts[0] += 1;
+                    let mut applied = base.clone();
+                    applied.apply_delta(delta).unwrap();
+                    assert_eq!(applied, screen, "{context} shifts {shifts}");
+                }
+            }
+            history.push(screen.clone());
+            // Coalescing drops snapshots the writer never sends.
+            if rng.below(4) == 0 {
+                continue;
+            }
+            let force_full = rng.below(40) == 0;
+            let message = snapshot_message(
+                terminal_id,
+                screen.clone(),
+                force_full,
+                true,
+                &mut last_sent,
+            );
+            // Survive the wire, as a client receives it.
+            let (message, frames) = over_the_wire(message, max_cells(&mut rng), &mut screens);
+            match message {
+                ServerMessage::Snapshot { screen, .. } => {
+                    counts[3] += usize::from(frames > 1);
+                    client = Some(screen);
+                }
+                ServerMessage::SnapshotDelta { delta, .. } => {
+                    counts[4] += usize::from(frames > 1);
+                    client
+                        .as_mut()
+                        .expect("a delta follows a full screen")
+                        .apply_delta(delta)
+                        .unwrap_or_else(|error| panic!("{context}: {error}"));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(client.as_ref(), Some(&screen), "{context}");
+            assert_eq!(last_sent.get(&terminal_id), Some(&screen), "{context}");
+        }
+        counts
+    }
+
     #[test]
     fn deltas_from_random_vt_output_apply_to_exactly_the_full_screen() {
         // Test builds keep Ghostty's integrity checks, which make each feed
         // cost milliseconds; every screen is therefore also checked against
-        // several earlier bases, which costs no further VT work.
+        // several earlier bases, which costs no further VT work. Messages are
+        // also split into small chunks, as larger screens are.
         let sizes = [(80, 24), (13, 7), (40, 12), (3, 2), (1, 5)];
         let mut checked = 0;
         let mut shifted = 0;
         let mut shifted_images = 0;
+        let mut chunked = 0;
         for seed in 1..=12_u64 {
             let (columns, rows) = sizes[seed as usize % sizes.len()];
             let size = TerminalSize { columns, rows };
-            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let mut vt = crate::terminal::bench::VtBench::with_scrollback(size, 4096).unwrap();
-            let terminal_id = TerminalId::new();
-            let mut last_sent = HashMap::new();
-            let mut client: Option<ScreenSnapshot> = None;
-            let mut history: Vec<ScreenSnapshot> = Vec::new();
-            for step in 0..50 {
-                let Some(screen) = vt.feed(&random_output(&mut rng, size)).unwrap() else {
-                    continue;
-                };
-                let context = format!("seed {seed} step {step}");
-                for _ in 0..4.min(history.len()) {
-                    let base = &history[rng.below(history.len())];
-                    for shifts in [true, false] {
-                        let Some(delta) = screen.delta_from(base, shifts) else {
-                            continue;
-                        };
-                        assert!(
-                            shifts || delta.shift.is_none(),
-                            "{context}: unnegotiated shift"
-                        );
-                        shifted += usize::from(delta.shift.is_some());
-                        shifted_images += usize::from(
-                            delta.shift.is_some() && !screen.graphics.placements.is_empty(),
-                        );
-                        checked += 1;
-                        let mut applied = base.clone();
-                        applied.apply_delta(delta).unwrap();
-                        assert_eq!(applied, screen, "{context} shifts {shifts}");
-                    }
-                }
-                history.push(screen.clone());
-                // Coalescing drops snapshots the writer never sends.
-                if rng.below(4) == 0 {
-                    continue;
-                }
-                let force_full = rng.below(40) == 0;
-                match snapshot_message(
-                    terminal_id,
-                    screen.clone(),
-                    force_full,
-                    true,
-                    &mut last_sent,
-                ) {
-                    ServerMessage::Snapshot { screen, .. } => client = Some(screen),
-                    ServerMessage::SnapshotDelta { delta, .. } => {
-                        // Survive the wire, as a client receives it.
-                        let delta = crate::protocol::decode_payload(
-                            &crate::protocol::encode_payload(&delta).unwrap(),
-                        )
-                        .unwrap();
-                        client
-                            .as_mut()
-                            .expect("a delta follows a full screen")
-                            .apply_delta(delta)
-                            .unwrap_or_else(|error| panic!("{context}: {error}"));
-                    }
-                    other => panic!("unexpected {other:?}"),
-                }
-                assert_eq!(client.as_ref(), Some(&screen), "{context}");
-            }
+            let cells = usize::from(columns) * usize::from(rows);
+            let [deltas, shifts, shifted_with_images, full, split] = random_round_trip(
+                seed,
+                size,
+                50,
+                |rng| [usize::MAX, cells / 3, usize::from(columns), 1][rng.below(4)],
+                4,
+            );
+            checked += deltas;
+            shifted += shifts;
+            shifted_images += shifted_with_images;
+            chunked += full + split;
         }
         // The workload must actually exercise both kinds of delta.
         assert!(shifted > 50, "only {shifted} shifted deltas");
@@ -7954,6 +8066,30 @@ mod tests {
             "only {shifted_images} shifted deltas with images"
         );
         assert!(checked > 2 * shifted, "only {checked} deltas checked");
+        assert!(chunked > 100, "only {chunked} chunked messages");
+    }
+
+    #[test]
+    fn random_vt_output_beyond_one_frame_round_trips_through_chunks() {
+        // Above MAX_VISIBLE_CELLS: full screens split with the daemon's real
+        // chunk budget, and a smaller one so that deltas split too.
+        let size = TerminalSize {
+            columns: 520,
+            rows: 300,
+        };
+        assert!(size.cell_count().unwrap() > crate::domain::MAX_VISIBLE_CELLS);
+        // Ghostty's integrity checks in test builds make some bursts (hundreds
+        // of reverse indexes) take a minute at this size; this seed avoids
+        // them and still splits both kinds of message.
+        let [_, _, _, full, deltas] = random_round_trip(
+            13,
+            size,
+            14,
+            |rng| [crate::domain::MAX_VISIBLE_CELLS, 2_000][rng.below(2)],
+            0,
+        );
+        assert!(full >= 2, "only {full} chunked full screens");
+        assert!(deltas >= 2, "only {deltas} chunked deltas");
     }
 
     #[tokio::test]
@@ -8013,6 +8149,273 @@ mod tests {
             } else {
                 assert!(shifts > 0);
             }
+            queue.finish();
+            writer.await.unwrap();
+        }
+    }
+
+    /// A screen whose rows all differ from any other revision's.
+    fn numbered_screen(revision: u64, size: TerminalSize) -> ScreenSnapshot {
+        use crate::domain::{Cell, Cursor};
+        let columns = usize::from(size.columns);
+        let cells = (0..columns * usize::from(size.rows))
+            .map(|index| Cell {
+                contents: if index % columns == 0 {
+                    format!("{revision}").into()
+                } else {
+                    char::from_u32(0x4e00 + ((index as u64 + revision) % 20_000) as u32)
+                        .unwrap()
+                        .to_string()
+                        .into()
+                },
+                ..Cell::default()
+            })
+            .collect();
+        let cursor = Cursor {
+            column: size.columns - 1,
+            row: size.rows - 1,
+            visible: true,
+            shape: Default::default(),
+            blinking: false,
+        };
+        ScreenSnapshot::new(revision, size, cells, cursor).unwrap()
+    }
+
+    /// Read frames until `done` matches one, checking that chunk sequences
+    /// are contiguous and complete, and return the messages they stand for
+    /// with the number of chunk frames seen.
+    async fn read_assembled(
+        reader: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+        done: impl Fn(&ServerMessage) -> bool,
+    ) -> (Vec<ServerMessage>, usize) {
+        use crate::protocol::chunked::{Assembly, ScreenAssembler};
+        let mut screens = ScreenAssembler::default();
+        let mut messages = Vec::new();
+        let mut chunk_frames = 0;
+        loop {
+            let frame = timeout(Duration::from_secs(10), reader.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(frame.len() <= crate::protocol::MAX_FRAME_LEN);
+            let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
+            let chunk = matches!(
+                envelope.message,
+                ServerMessage::ScreenBegin { .. }
+                    | ServerMessage::ScreenRows { .. }
+                    | ServerMessage::ScreenEnd { .. }
+            );
+            chunk_frames += usize::from(chunk);
+            assert!(
+                chunk || !screens.in_progress(),
+                "{:?} interleaved with a chunk sequence",
+                envelope.message
+            );
+            match screens.accept(envelope.message) {
+                Assembly::Ready(message) => {
+                    let finished = done(&message);
+                    messages.push(message);
+                    if finished {
+                        return (messages, chunk_frames);
+                    }
+                }
+                Assembly::Pending => {}
+                Assembly::Discarded(discarded) => panic!("discarded {discarded:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_sends_large_screens_as_whole_sequences_and_coalesces_only_whole_screens() {
+        let size = TerminalSize {
+            columns: 520,
+            rows: 320,
+        };
+        let terminal_id = TerminalId::new();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (sink, _) = Framed::new(server, codec()).split();
+        let mut reader = Framed::new(client, codec());
+        let queue = Arc::new(OutboundQueue::default());
+        let writer = tokio::spawn(write_outbound(sink, Arc::clone(&queue)));
+        let snapshot = |screen| Outbound::Snapshot {
+            terminal_id,
+            screen,
+            force_full: false,
+        };
+        queue.push(snapshot(numbered_screen(1, size))).unwrap();
+        // The writer is now mid-sequence: a screen this size is far larger
+        // than the socket buffer.
+        let first = timeout(Duration::from_secs(10), reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let first: Envelope<ServerMessage> = decode_payload(&first).unwrap();
+        let ServerMessage::ScreenBegin { begin, .. } = first.message else {
+            panic!("expected a chunked screen, received {:?}", first.message);
+        };
+        assert_eq!(begin.rows, 320);
+        // Revision 2 is replaced by 3 while 1 is still being written, and an
+        // ordered frame follows.
+        queue.push(snapshot(numbered_screen(2, size))).unwrap();
+        queue.push(snapshot(numbered_screen(3, size))).unwrap();
+        queue
+            .push(Outbound::Frame(Bytes::from(
+                encode_payload(&Envelope {
+                    request_id: None,
+                    message: ServerMessage::Pong { daemon_pid: 1 },
+                })
+                .unwrap(),
+            )))
+            .unwrap();
+        let mut rest = numbered_screen(1, size);
+        let mut screens = crate::protocol::chunked::ScreenAssembler::default();
+        // Finish revision 1 from the frames after its begin.
+        assert!(matches!(
+            screens.accept(ServerMessage::ScreenBegin { terminal_id, begin }),
+            crate::protocol::chunked::Assembly::Pending
+        ));
+        let mut received = Vec::new();
+        loop {
+            let frame = timeout(Duration::from_secs(10), reader.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
+            match screens.accept(envelope.message) {
+                crate::protocol::chunked::Assembly::Ready(ServerMessage::Snapshot {
+                    screen,
+                    ..
+                }) => {
+                    received.push(screen);
+                    break;
+                }
+                crate::protocol::chunked::Assembly::Pending => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let (messages, chunk_frames) = read_assembled(&mut reader, |message| {
+            matches!(message, ServerMessage::Pong { .. })
+        })
+        .await;
+        assert!(chunk_frames >= 4);
+        for message in messages {
+            match message {
+                ServerMessage::Snapshot { screen, .. } => received.push(screen),
+                ServerMessage::Pong { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(
+            received
+                .iter()
+                .map(|screen| screen.revision)
+                .collect::<Vec<_>>(),
+            [1, 3],
+            "revision 2 was coalesced away whole"
+        );
+        assert_eq!(received[0], rest);
+        assert_eq!(received[1], numbered_screen(3, size));
+
+        // The writer's base is the screen the client assembled: a one-row
+        // change is a delta against revision 3.
+        rest = numbered_screen(3, size);
+        rest.revision = 4;
+        rest.cells[7].contents = "z".into();
+        queue.push(snapshot(rest.clone())).unwrap();
+        let (messages, chunk_frames) = read_assembled(&mut reader, |_| true).await;
+        assert_eq!(chunk_frames, 0, "a small delta fits one frame");
+        let [ServerMessage::SnapshotDelta { delta, .. }] = &messages[..] else {
+            panic!("expected a delta, received {messages:?}");
+        };
+        let mut applied = received.pop().unwrap();
+        applied.apply_delta(delta.clone()).unwrap();
+        assert_eq!(applied, rest);
+        queue.finish();
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writers_for_peers_without_chunked_screens_send_only_screens_within_their_bound() {
+        let large = TerminalSize {
+            columns: 520,
+            rows: 320,
+        };
+        for (max_cells, embed_images) in [
+            (crate::domain::MAX_VISIBLE_CELLS, false),
+            (crate::domain::LEGACY_MAX_VISIBLE_CELLS, true),
+        ] {
+            let terminal_id = TerminalId::new();
+            let (server, client) = UnixStream::pair().unwrap();
+            let (sink, _) = Framed::new(server, codec()).split();
+            let mut reader = Framed::new(client, codec());
+            let queue = Arc::new(OutboundQueue::default());
+            // As the remote handshake records an older peer.
+            queue
+                .max_screen_cells
+                .store(max_cells, std::sync::atomic::Ordering::Relaxed);
+            queue
+                .embed_images
+                .store(embed_images, std::sync::atomic::Ordering::Relaxed);
+            let writer = tokio::spawn(write_outbound(sink, Arc::clone(&queue)));
+            // A terminal shared with a larger client, before this peer's own
+            // resize shrinks it: the peer sees the corner it can hold.
+            queue
+                .push(Outbound::Snapshot {
+                    terminal_id,
+                    screen: numbered_screen(1, large),
+                    force_full: false,
+                })
+                .unwrap();
+            queue
+                .push(Outbound::Message {
+                    request_id: Some(uuid::Uuid::new_v4()),
+                    message: Box::new(ServerMessage::CopyModeSnapshot {
+                        terminal_id,
+                        screen: numbered_screen(2, large),
+                    }),
+                })
+                .unwrap();
+            let small = TerminalSize {
+                columns: 200,
+                rows: 50,
+            };
+            queue
+                .push(Outbound::Snapshot {
+                    terminal_id,
+                    screen: numbered_screen(3, small),
+                    force_full: false,
+                })
+                .unwrap();
+            let (messages, chunk_frames) = read_assembled(&mut reader, |message| {
+                matches!(message, ServerMessage::Snapshot { screen, .. } if screen.revision == 3)
+            })
+            .await;
+            assert_eq!(chunk_frames, 0, "an older peer received chunks");
+            let [
+                ServerMessage::Snapshot { screen: live, .. },
+                ServerMessage::CopyModeSnapshot { screen: copy, .. },
+                ServerMessage::Snapshot { screen: last, .. },
+            ] = &messages[..]
+            else {
+                panic!("unexpected {messages:?}");
+            };
+            for (screen, revision) in [(live, 1), (copy, 2)] {
+                assert!(screen.cells.len() <= max_cells);
+                assert_eq!(screen.size.columns, 520);
+                assert_eq!(usize::from(screen.size.rows), max_cells / 520);
+                assert!(!screen.cursor.visible, "the cursor was outside the corner");
+                let mut expected = numbered_screen(revision, large);
+                expected.crop_to(max_cells);
+                assert_eq!(*screen, expected);
+                assert_eq!(
+                    screen.cells[..520],
+                    numbered_screen(revision, large).cells[..520]
+                );
+            }
+            assert_eq!(*last, numbered_screen(3, small));
             queue.finish();
             writer.await.unwrap();
         }

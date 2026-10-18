@@ -1,6 +1,7 @@
 //! Private local messages and bounded MessagePack framing. The independently
 //! versioned remote contract reuses an explicit subset; see [`remote`].
 
+pub mod chunked;
 pub mod remote;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -26,7 +27,8 @@ use crate::{
 pub const PROTOCOL_VERSION: u16 = parse_protocol_version(env!("CARGO_PKG_VERSION_MINOR"));
 /// Enough for a worst-case screen of [`crate::domain::MAX_VISIBLE_CELLS`]
 /// cells, or one Kitty image, while remaining a firm pre-allocation bound for
-/// the length-delimited transport.
+/// the length-delimited transport. Larger screens travel as row-range chunks
+/// ([`chunked`]), each within this bound.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 /// Maximum encoded PNG size for a clipboard attachment.
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
@@ -710,6 +712,24 @@ pub enum ServerMessage {
     CopyModeSnapshot {
         terminal_id: TerminalId,
         screen: ScreenSnapshot,
+    },
+    /// Opens a screen too large for one frame: everything but its rows. The
+    /// [`Self::ScreenRows`] and [`Self::ScreenEnd`] of the same revision
+    /// follow contiguously; see [`chunked`].
+    ScreenBegin {
+        terminal_id: TerminalId,
+        begin: chunked::ScreenBegin,
+    },
+    ScreenRows {
+        terminal_id: TerminalId,
+        revision: u64,
+        rows: Vec<crate::domain::DeltaRow>,
+    },
+    /// Completes the screen; only now may the receiver present it. Carries the
+    /// request ID of a correlated copy-mode screen.
+    ScreenEnd {
+        terminal_id: TerminalId,
+        revision: u64,
     },
     CopyModePrepared {
         terminal_id: TerminalId,

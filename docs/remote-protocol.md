@@ -25,7 +25,8 @@ Recipe validation and trust remain on the daemon host.
 Both handshake and session use a four-byte big-endian unsigned length prefix,
 followed by MessagePack **named maps**, codec `msgpack-map-v1`. The payload must
 be nonempty and at most 8 MiB (`MAX_FRAME_LEN`); the transport rejects oversized
-lengths before buffering the body. Handshakes reject invalid MessagePack,
+lengths before buffering the body. Screens larger than one frame holds travel as
+row-range chunks after `chunked-screens.v1`; no single frame exceeds the limit. Handshakes reject invalid MessagePack,
 missing/unknown handshake DTO fields, duplicate fields, and trailing bytes. Ordinary
 session traffic retains the existing bounded slice decoder.
 
@@ -86,6 +87,7 @@ are common to every negotiated connection.
 | `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-2 metadata payloads are unchanged |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
 | `large-screens.v1` | Interactive screens up to 150,000 visible cells; Kitty images arrive once per generation in `kitty_image` messages, and screen images carry an empty `d` as a reference to those pixels | Screens embed image pixels and stay within 50,000 visible cells; larger hello or resize sizes are rejected |
+| `chunked-screens.v1` | Requires `large-screens.v1`. Interactive screens up to 1,048,576 visible cells (65,535 columns or rows at most). A full screen, copy-mode screen, or delta whose rows hold more than 150,000 cells is sent as `screen_begin` (`begin`: `n`, the row count that follows, and `f`, the message it stands for with its `c` cells or `d` rows empty), one or more `screen_rows` (`revision`, `rows` as delta rows: a full screen's rows in order from 0, a delta's in ascending order), and `screen_end` (`revision`, and the request ID of a correlated copy-mode screen). The frames of one revision are contiguous; the receiver presents the screen only at `screen_end`, discards a partial screen when a newer one begins, and asks for a fresh screen after a malformed sequence | Screens stay within 150,000 visible cells; larger hello or resize sizes are rejected, and a larger terminal shared with another client is shown as its top-left corner until this peer's resize shrinks it |
 | `scroll-deltas.v1` | Screen deltas may carry `x`, a row shift `{t, e, n}` applied before their rows: rows `t` up to (not including) `e` rotate up by `n` rows, or down when `n` is negative, so scrolling sends only the rows it exposed | Deltas carry only replacement rows; scrolling that changes most rows sends a full screen |
 | `terminal-colors.v1` | Interactive `terminal_colors` updates with host foreground, background, and 16 ANSI palette colors | Child applications retain the emulator’s last known colors; host color updates are not sent |
 | `attachments.v1` | Interactive `attachment_begin`, `attachment_chunk`, `attachment_commit`, `attachment_cancel`; upload a PNG and paste its daemon-local path into the original terminal | Clipboard image paste is unavailable |

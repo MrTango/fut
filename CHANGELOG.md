@@ -5,6 +5,7 @@
 - Forward Fut's status rollup to the terminal Fut runs in as OSC 7501, so Ghostty or an outer Fut shows working, blocked, done, and error status for every Fut terminal. Fut sends it only after the terminal answers the support query, clears it on detach, and can be forced on or off with `alerts.outer_terminal_status`.
 - Show progress from programs that only emit ConEmu-style OSC 9;4 progress as working or error status in tabs and workspaces. Explicit OSC 7501 and agent reports always take precedence, and legacy progress is ignored while a program that speaks OSC 7501 is running.
 - Scroll more cheaply on large screens and over SSH: scrolling output, pagers, and scrollback now send only the newly exposed rows instead of a full screen.
+- Support terminals beyond 150,000 cells, up to 1,048,576 (an 8K display with a small font). Screens too large for one protocol frame are sent in row chunks; remote machines running older Fut keep their limits.
 
 ## 0.37
 

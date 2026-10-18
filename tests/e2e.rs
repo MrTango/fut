@@ -28,7 +28,9 @@ use fut::{
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PresentationTokenPublishAction,
-        RenameSelector, SelectedTarget, ServerMessage, codec, decode_payload, encode_payload,
+        RenameSelector, SelectedTarget, ServerMessage,
+        chunked::{Assembly, ScreenAssembler},
+        codec, decode_payload, encode_payload,
     },
     resources::{
         PresentationTokenAction, PresentationTokenTarget, SessionSelector, TargetSelector,
@@ -100,15 +102,22 @@ impl ChaosRng {
 type RawConnection = Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>;
 
 /// A client connection plus the materialized per-terminal grids it has
-/// received. [`receive_envelope`] folds `Snapshot`/`SnapshotDelta` frames
-/// into `grids` and hands callers back a synthesized `Snapshot` either way,
-/// so every existing assertion can keep matching on `ServerMessage::Snapshot`
-/// without knowing which one arrived on the wire.
+/// received. [`receive_envelope`] reassembles chunked screens, folds
+/// `Snapshot`/`SnapshotDelta` frames into `grids` and hands callers back a
+/// synthesized `Snapshot` either way, so every existing assertion can keep
+/// matching on `ServerMessage::Snapshot` without knowing which one arrived on
+/// the wire.
 struct Connection {
     raw: RawConnection,
     grids: HashMap<TerminalId, ScreenSnapshot>,
+    screens: ScreenAssembler,
     /// Deltas received that moved retained rows.
     shifted_deltas: usize,
+    /// Screens received as row-range chunk sequences, and their frames.
+    chunked_screens: usize,
+    chunk_frames: usize,
+    /// Largest frame received.
+    largest_frame: usize,
 }
 
 impl Connection {
@@ -116,7 +125,39 @@ impl Connection {
         Self {
             raw: Framed::new(stream, codec()),
             grids: HashMap::new(),
+            screens: ScreenAssembler::default(),
             shifted_deltas: 0,
+            chunked_screens: 0,
+            chunk_frames: 0,
+            largest_frame: 0,
+        }
+    }
+
+    /// Decode one frame and reassemble chunked screens: `None` while a
+    /// chunked screen is still arriving. The harness talks to one
+    /// well-behaved daemon, so a discarded sequence is a protocol bug.
+    fn assemble(&mut self, frame: &[u8]) -> Option<Envelope<ServerMessage>> {
+        self.largest_frame = self.largest_frame.max(frame.len());
+        let envelope: Envelope<ServerMessage> = decode_payload(frame).expect("decode server frame");
+        let chunk = matches!(
+            envelope.message,
+            ServerMessage::ScreenBegin { .. }
+                | ServerMessage::ScreenRows { .. }
+                | ServerMessage::ScreenEnd { .. }
+        );
+        self.chunk_frames += usize::from(chunk);
+        match self.screens.accept(envelope.message) {
+            Assembly::Ready(message) => {
+                self.chunked_screens += usize::from(chunk);
+                Some(Envelope {
+                    request_id: envelope.request_id,
+                    message: track_screen(self, message),
+                })
+            }
+            Assembly::Pending => None,
+            Assembly::Discarded(discarded) => {
+                panic!("test harness discarded chunked screens: {discarded:?}")
+            }
         }
     }
 }
@@ -2436,13 +2477,14 @@ done
         }
     }
 
+    // Above the grid's memory bound.
     send(
         &mut client,
         ClientMessage::Resize {
             terminal_id,
             size: TerminalSize {
-                columns: 1000,
-                rows: 200,
+                columns: 1025,
+                rows: 1024,
             },
         },
     )
@@ -2454,6 +2496,184 @@ done
     .await;
 
     harness.detach(&mut client).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn screens_beyond_one_frame_arrive_in_chunks_and_older_peers_keep_their_bounds() {
+    use fut::protocol::remote::RemoteHello;
+    let script = r#"
+printf 'READY\r\n'
+while IFS= read -r line; do
+  case "$line" in
+    fill)
+      i=0
+      while [ $i -lt 400 ]; do printf 'row %s %0480d\r\n' $i $i; i=$((i+1)); done
+      printf 'FILLED\r\n' ;;
+    *) printf 'ECHO %s\r\n' "$line" ;;
+  esac
+done
+"#;
+    let large = TerminalSize {
+        columns: 508,
+        rows: 320,
+    };
+    let mut harness = Harness::start(script).await;
+    let (mut client, terminal_id, _) = harness.interactive().await;
+    snapshot_containing(&mut client, terminal_id, "READY").await;
+
+    // 162,560 cells: more than one frame holds.
+    send(
+        &mut client,
+        ClientMessage::Resize {
+            terminal_id,
+            size: large,
+        },
+    )
+    .await;
+    receive_matching(&mut client, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id: id, screen } if *id == terminal_id && screen.size == large)
+    })
+    .await;
+    assert!(client.chunked_screens > 0, "a large screen fit one frame");
+
+    // Scrolling output, then the grid built from every chunk and delta
+    // against a fresh full screen.
+    send(
+        &mut client,
+        ClientMessage::Input {
+            bytes: b"fill\n".to_vec(),
+        },
+    )
+    .await;
+    let filled = snapshot_containing(&mut client, terminal_id, "FILLED").await;
+    assert_eq!(filled.size, large);
+    assert!(snapshot_text(&filled).contains(&format!("row 399 {:0480}", 399)));
+    while let Ok(Some(Ok(frame))) = time::timeout(Duration::from_millis(300), client.next()).await {
+        client.assemble(&frame);
+    }
+    let applied = client.grids[&terminal_id].clone();
+    let chunked = client.chunked_screens;
+    send_uncorrelated(&mut client, ClientMessage::RefreshTerminal { terminal_id }).await;
+    let ServerMessage::Snapshot { screen, .. } = receive_matching(&mut client, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id: id, .. } if *id == terminal_id)
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(screen.cells, applied.cells);
+    assert!(
+        client.chunked_screens > chunked,
+        "the refresh fit one frame"
+    );
+
+    // Copy-mode screens take the same path and keep their correlation.
+    let begin = copy_command(&mut client, terminal_id, CopyModeAction::Begin).await;
+    let ServerMessage::CopyModeSnapshot { screen, .. } = begin.message else {
+        panic!("expected a copy-mode screen, received {:?}", begin.message);
+    };
+    assert_eq!(screen.size, large);
+    assert!(snapshot_text(&screen).contains("FILLED"));
+    copy_command(&mut client, terminal_id, CopyModeAction::Cancel).await;
+    assert!(
+        client.largest_frame <= fut::protocol::MAX_FRAME_LEN,
+        "a {} byte frame",
+        client.largest_frame
+    );
+    harness.detach(&mut client).await;
+
+    // Remote peers: the current client attaches at the large size and
+    // receives chunks; a peer without `chunked-screens.v1` keeps the
+    // single-frame bound, and one without `large-screens.v1` the
+    // generation-1 bound.
+    async fn hello(
+        harness: &Harness,
+        size: TerminalSize,
+        without: &[&str],
+    ) -> (Connection, ServerMessage) {
+        let mut client = harness.connect().await.unwrap();
+        let mut offer = RemoteHello::new(interactive_mode_with_size(None, size), "0.38.0");
+        offer
+            .optional
+            .retain(|name| !without.contains(&name.as_str()));
+        send(&mut client, ClientMessage::RemoteHello(offer)).await;
+        let reply = receive(&mut client).await.expect("remote handshake reply");
+        (client, reply)
+    }
+    let rejected = |reply: &ServerMessage| {
+        matches!(
+            reply,
+            ServerMessage::EndpointError {
+                error: fut::protocol::remote::EndpointError::InvalidHandshake
+            }
+        )
+    };
+
+    let (mut remote, reply) = hello(&harness, large, &[]).await;
+    let ServerMessage::RemoteWelcome(welcome) = reply else {
+        panic!("expected a remote welcome, received {reply:?}");
+    };
+    assert!(
+        welcome
+            .capabilities
+            .iter()
+            .any(|name| name == "chunked-screens.v1")
+    );
+    receive_matching(&mut remote, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id: id, screen } if *id == terminal_id && screen.size == large)
+    })
+    .await;
+    assert!(remote.chunked_screens > 0);
+    harness.detach(&mut remote).await;
+
+    let (_, reply) = hello(&harness, large, &["chunked-screens.v1"]).await;
+    assert!(rejected(&reply), "{reply:?}");
+    let (mut older, reply) = hello(&harness, SIZE, &["chunked-screens.v1"]).await;
+    let ServerMessage::RemoteWelcome(welcome) = reply else {
+        panic!("expected a remote welcome, received {reply:?}");
+    };
+    assert!(
+        !welcome
+            .capabilities
+            .iter()
+            .any(|name| name == "chunked-screens.v1")
+    );
+    send(
+        &mut older,
+        ClientMessage::Resize {
+            terminal_id,
+            size: large,
+        },
+    )
+    .await;
+    receive_matching(
+        &mut older,
+        |message| matches!(message, ServerMessage::Error { code, .. } if code == "invalid_size"),
+    )
+    .await;
+    send(
+        &mut older,
+        ClientMessage::Input {
+            bytes: b"older\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut older, terminal_id, "ECHO older").await;
+    assert_eq!(older.chunk_frames, 0, "an older peer received chunks");
+    harness.detach(&mut older).await;
+
+    let generation_one = TerminalSize {
+        columns: 250,
+        rows: 201,
+    };
+    let (_, reply) = hello(
+        &harness,
+        generation_one,
+        &["large-screens.v1", "scroll-deltas.v1"],
+    )
+    .await;
+    assert!(rejected(&reply), "{reply:?}");
     harness.shutdown().await;
 }
 
@@ -2489,8 +2709,7 @@ done
         while let Ok(Some(Ok(frame))) =
             time::timeout(Duration::from_millis(200), client.next()).await
         {
-            let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
-            track_screen(client, envelope.message);
+            client.assemble(&frame);
         }
         let applied = client.grids[&terminal_id].clone();
         send_uncorrelated(client, ClientMessage::RefreshTerminal { terminal_id }).await;
@@ -16545,16 +16764,15 @@ async fn receive(connection: &mut Connection) -> Option<ServerMessage> {
 }
 
 async fn receive_envelope(connection: &mut Connection) -> Option<Envelope<ServerMessage>> {
-    let frame = time::timeout(DEADLINE, connection.next())
-        .await
-        .expect("protocol receive timed out")?
-        .expect("read server frame")
-        .to_vec();
-    let envelope: Envelope<ServerMessage> = decode_payload(&frame).expect("decode server frame");
-    Some(Envelope {
-        request_id: envelope.request_id,
-        message: track_screen(connection, envelope.message),
-    })
+    loop {
+        let frame = time::timeout(DEADLINE, connection.next())
+            .await
+            .expect("protocol receive timed out")?
+            .expect("read server frame");
+        if let Some(envelope) = connection.assemble(&frame) {
+            return Some(envelope);
+        }
+    }
 }
 
 async fn select_response(connection: &mut Connection, selector: TargetSelector) -> SelectedTarget {

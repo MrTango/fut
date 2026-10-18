@@ -145,7 +145,9 @@ use crate::{
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
-        SelectionExpectation, ServerMessage, codec, decode_payload, encode_payload,
+        SelectionExpectation, ServerMessage,
+        chunked::{Assembly, ScreenAssembler},
+        codec, decode_payload, encode_payload,
     },
     resources::{
         PresentationTokenAction, PresentationTokenTarget, ResourceSnapshot, TargetSelector,
@@ -954,6 +956,7 @@ async fn stage_machine_view(
     time::timeout(Duration::from_secs(10), async {
         let mut resources = ResourceState::default();
         resources.accept_alerts(prepared.alerts.clone());
+        let mut screens = ScreenAssembler::default();
         let mut geometry_applied = false;
         loop {
             let frame = prepared.framed.next().await.ok_or_else(|| {
@@ -965,7 +968,14 @@ async fn stage_machine_view(
             {
                 return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
             }
-            match envelope.message {
+            // Chunk sequences are contiguous, so this loop never returns
+            // with one half read.
+            let Some(message) =
+                assemble_screen(&mut prepared.framed, &mut screens, envelope.message).await?
+            else {
+                continue;
+            };
+            match message {
                 ServerMessage::Snapshot {
                     terminal_id,
                     screen,
@@ -1361,6 +1371,7 @@ async fn run_loop(
     let mut backoff = connection::Backoff::default();
     'attachment: loop {
         let mut health = connection::Health::default();
+        let mut screens = ScreenAssembler::default();
         let result: anyhow::Result<()> = async {
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
@@ -1623,7 +1634,12 @@ async fn run_loop(
                 }
                 health.receive(envelope.request_id, &envelope.message);
                 let request_id = envelope.request_id;
-                match envelope.message {
+                let Some(message) =
+                    assemble_screen(framed, &mut screens, envelope.message).await?
+                else {
+                    continue;
+                };
+                match message {
                     ServerMessage::Snapshot { terminal_id, screen } => {
                         let accepted = view.accept(terminal_id, screen);
                         let switching_completed = accepted
@@ -2376,6 +2392,10 @@ async fn run_loop(
                     | ServerMessage::TokenPublished { .. } => {
                         bail!("unexpected control response on interactive connection")
                     }
+                    // Reassembled above.
+                    ServerMessage::ScreenBegin { .. }
+                    | ServerMessage::ScreenRows { .. }
+                    | ServerMessage::ScreenEnd { .. } => {}
                 }
             }
             event = events.next(), if accepts_client_input(
@@ -6388,6 +6408,26 @@ async fn send(
     message: ClientMessage,
 ) -> anyhow::Result<()> {
     send_request(framed, None, message).await
+}
+
+/// The message `message` completes once chunked screens are reassembled, or
+/// `None` while a screen is still arriving. A discarded screen is refreshed,
+/// as for a delta that does not apply.
+async fn assemble_screen(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    screens: &mut ScreenAssembler,
+    message: ServerMessage,
+) -> anyhow::Result<Option<ServerMessage>> {
+    match screens.accept(message) {
+        Assembly::Ready(message) => Ok(Some(message)),
+        Assembly::Pending => Ok(None),
+        Assembly::Discarded(discarded) => {
+            for (terminal_id, _error) in discarded {
+                send(framed, ClientMessage::RefreshTerminal { terminal_id }).await?;
+            }
+            Ok(None)
+        }
+    }
 }
 
 async fn acknowledge_attention(

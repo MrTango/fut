@@ -72,10 +72,11 @@ pub enum Capability {
     Attachments,
     LargeScreens,
     ScrollDeltas,
+    ChunkedScreens,
 }
 
 impl Capability {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -88,6 +89,7 @@ impl Capability {
         Self::Attachments,
         Self::LargeScreens,
         Self::ScrollDeltas,
+        Self::ChunkedScreens,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -104,6 +106,7 @@ impl Capability {
             Self::Attachments => "attachments.v1",
             Self::LargeScreens => "large-screens.v1",
             Self::ScrollDeltas => "scroll-deltas.v1",
+            Self::ChunkedScreens => "chunked-screens.v1",
         }
     }
 }
@@ -132,9 +135,18 @@ impl Capabilities {
         self.contains(Capability::LargeScreens)
     }
 
+    /// Whether screens larger than one frame may arrive as row-range chunks.
+    /// Chunk headers carry image references, so this also needs separate
+    /// images.
+    pub fn chunked_screens(self) -> bool {
+        self.contains(Capability::ChunkedScreens) && self.separate_images()
+    }
+
     /// Largest visible grid this peer may request or receive.
     pub fn max_visible_cells(self) -> usize {
-        if self.contains(Capability::LargeScreens) {
+        if self.chunked_screens() {
+            crate::domain::MAX_GRID_CELLS
+        } else if self.contains(Capability::LargeScreens) {
             crate::domain::MAX_VISIBLE_CELLS
         } else {
             crate::domain::LEGACY_MAX_VISIBLE_CELLS
@@ -205,6 +217,9 @@ impl Capabilities {
                 return self.contains(Capability::Interactive)
                     && self.contains(Capability::ScrollDeltas);
             }
+            ScreenBegin { .. } | ScreenRows { .. } | ScreenEnd { .. } => {
+                return self.contains(Capability::Interactive) && self.chunked_screens();
+            }
             ExtensionCatalog { .. } | ExtensionCatalogChanged { .. } => {
                 Capability::ExtensionCatalog
             }
@@ -272,6 +287,7 @@ impl RemoteHello {
             optional.push(Capability::Attachments.name().into());
             optional.push(Capability::LargeScreens.name().into());
             optional.push(Capability::ScrollDeltas.name().into());
+            optional.push(Capability::ChunkedScreens.name().into());
         }
         Self {
             generation: GENERATION,
@@ -789,10 +805,7 @@ mod tests {
         let selected = offer.negotiate(Capabilities::ALL).unwrap();
         assert!(selected.separate_images());
         assert!(selected.allows_server(&image));
-        assert_eq!(
-            selected.max_visible_cells(),
-            crate::domain::MAX_VISIBLE_CELLS
-        );
+        assert_eq!(selected.max_visible_cells(), crate::domain::MAX_GRID_CELLS);
 
         // A daemon that predates the capability ignores the optional offer.
         let older_daemon = Capabilities::from_names(
@@ -893,6 +906,90 @@ mod tests {
             assert!(selected.allows_server(&plain));
             assert!(!selected.allows_server(&shifted));
         }
+    }
+
+    #[test]
+    fn chunked_screens_are_optional_and_older_peers_keep_their_single_frame_bound() {
+        use crate::domain::{TerminalId, TerminalSize};
+        let interactive = |columns, rows| ClientMode::Interactive {
+            size: TerminalSize { columns, rows },
+            selector: None,
+        };
+        let terminal_id = TerminalId::new();
+        let chunks = [
+            ServerMessage::ScreenRows {
+                terminal_id,
+                revision: 1,
+                rows: Vec::new(),
+            },
+            ServerMessage::ScreenEnd {
+                terminal_id,
+                revision: 1,
+            },
+        ];
+        assert!(
+            !RemoteHello::new(ClientMode::Control, "0.38.0")
+                .optional
+                .iter()
+                .any(|name| name == "chunked-screens.v1")
+        );
+
+        // 508x320 is above the single-frame bound.
+        let offer = RemoteHello::new(interactive(508, 320), "0.38.0");
+        assert!(
+            offer
+                .optional
+                .iter()
+                .any(|name| name == "chunked-screens.v1")
+        );
+        let selected = offer.negotiate(Capabilities::ALL).unwrap();
+        assert!(selected.chunked_screens());
+        assert!(chunks.iter().all(|chunk| selected.allows_server(chunk)));
+        assert_eq!(selected.max_visible_cells(), crate::domain::MAX_GRID_CELLS);
+        let without = |name: &str| {
+            Capabilities::from_names(
+                &Capabilities::ALL
+                    .names()
+                    .into_iter()
+                    .filter(|selected| selected != name)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // A daemon that predates the capability ignores the optional offer,
+        // so the larger hello is rejected as before.
+        assert_eq!(
+            offer.negotiate(without("chunked-screens.v1")),
+            Err(EndpointError::InvalidHandshake)
+        );
+
+        // An older client never offers it and keeps the single-frame bound.
+        let mut old = RemoteHello::new(interactive(500, 300), "0.37.0");
+        old.optional.retain(|name| name != "chunked-screens.v1");
+        let selected = old.negotiate(Capabilities::ALL).unwrap();
+        assert!(!selected.chunked_screens());
+        assert!(!chunks.iter().any(|chunk| selected.allows_server(chunk)));
+        assert_eq!(
+            selected.max_visible_cells(),
+            crate::domain::MAX_VISIBLE_CELLS
+        );
+        old.mode = interactive(508, 320);
+        assert_eq!(
+            old.negotiate(Capabilities::ALL),
+            Err(EndpointError::InvalidHandshake)
+        );
+
+        // Chunk headers reference separately sent images, so chunking also
+        // needs `large-screens.v1`; without it the generation-1 bound holds.
+        let mut no_large = RemoteHello::new(interactive(250, 200), "0.38.0");
+        no_large.optional.retain(|name| name != "large-screens.v1");
+        let selected = no_large.negotiate(Capabilities::ALL).unwrap();
+        assert!(selected.contains(Capability::ChunkedScreens));
+        assert!(!selected.chunked_screens());
+        assert!(!chunks.iter().any(|chunk| selected.allows_server(chunk)));
+        assert_eq!(
+            selected.max_visible_cells(),
+            crate::domain::LEGACY_MAX_VISIBLE_CELLS
+        );
     }
 
     #[test]
