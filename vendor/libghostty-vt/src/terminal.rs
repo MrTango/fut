@@ -61,6 +61,30 @@ pub enum ProgramStatusKind {
     Auth,
 }
 
+/// A ConEmu-style progress report (OSC 9;4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgressReport {
+    /// Literal state sent by the program.
+    pub state: ProgressState,
+    /// Percentage from 0 through 100, or `None` when omitted.
+    pub progress: Option<u8>,
+}
+
+/// OSC 9;4 progress states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressState {
+    /// Remove the progress indication (state 0).
+    Remove,
+    /// Determinate progress (state 1).
+    Set,
+    /// Failed progress (state 2).
+    Error,
+    /// Indeterminate progress (state 3).
+    Indeterminate,
+    /// Paused progress (state 4).
+    Pause,
+}
+
 /// Shell command lifecycle step (OSC 133).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticPromptKind {
@@ -1700,6 +1724,39 @@ handlers! {
         });
     }
 
+    /// Receive OSC 9;4 progress reports.
+    pub fn on_progress_report(
+        &mut self,
+        tag = PROGRESS_REPORT,
+        from = GhosttyTerminalProgressReportFn(report: *const ffi::TerminalProgressReport),
+        to = ProgressReportFn(ProgressReport),
+    ) |term, func| {
+        // SAFETY: libghostty lends a valid report for this callback.
+        let report = unsafe { &*report };
+        let state = match report.state {
+            ffi::TerminalProgressState::REMOVE => ProgressState::Remove,
+            ffi::TerminalProgressState::SET => ProgressState::Set,
+            ffi::TerminalProgressState::ERROR => ProgressState::Error,
+            ffi::TerminalProgressState::INDETERMINATE => ProgressState::Indeterminate,
+            ffi::TerminalProgressState::PAUSE => ProgressState::Pause,
+            _ => return,
+        };
+        func(term, ProgressReport {
+            state,
+            progress: u8::try_from(report.progress).ok().filter(|progress| *progress <= 100),
+        });
+    }
+
+    /// Call the given function after the program performs a full reset (RIS).
+    pub fn on_reset(
+        &mut self,
+        tag = RESET,
+        from = GhosttyTerminalResetFn(),
+        to = ResetFn(),
+    ) |term, func| {
+        func(&term);
+    }
+
     /// Receive shell lifecycle steps, independently of screen contents.
     pub fn on_semantic_prompt(
         &mut self,
@@ -1935,6 +1992,53 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[1].state, ProgramStatusState::Clear);
         assert!(reports[1].id.is_empty());
+    }
+
+    #[test]
+    fn progress_reports_and_reset_follow_parser_order() {
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Progress(ProgressReport),
+            Status(ProgramStatusState),
+            Reset,
+        }
+        let events = RefCell::new(Vec::new());
+        let mut terminal = Terminal::new(Options {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        terminal
+            .on_progress_report(|_, report| events.borrow_mut().push(Event::Progress(report)))
+            .unwrap()
+            .on_program_status(|_, report| events.borrow_mut().push(Event::Status(report.state)))
+            .unwrap()
+            .on_reset(|_| events.borrow_mut().push(Event::Reset))
+            .unwrap();
+        terminal.vt_write(b"\x1b]9;4;1;40\x07\x1b]9;4;3\x1b\\");
+        for byte in b"\x1b]9;4;2;75\x1b\\" {
+            terminal.vt_write(&[*byte]);
+        }
+        terminal.vt_write(b"\x1b]9;4;4\x07\x1b]7501;state=working\x07\x1b]9;4;0\x07");
+        terminal.vt_write(b"\x1bc");
+        let report = |state, progress| Event::Progress(ProgressReport { state, progress });
+        let events = events.borrow();
+        assert_eq!(
+            &events[..6],
+            [
+                report(ProgressState::Set, Some(40)),
+                report(ProgressState::Indeterminate, None),
+                report(ProgressState::Error, Some(75)),
+                report(ProgressState::Pause, None),
+                Event::Status(ProgramStatusState::Working),
+                report(ProgressState::Remove, None),
+            ]
+        );
+        // RIS: any progress callback and the program-status clear come
+        // before the reset callback.
+        assert_eq!(events.last(), Some(&Event::Reset));
+        assert!(events[6..].contains(&Event::Status(ProgramStatusState::Clear)));
     }
 
     #[inline(never)]
