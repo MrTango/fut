@@ -51,6 +51,8 @@ def test_plugin_shape_and_mapping():
 
 
 def invoke(reporter, state, payload, env):
+    # Claude Code runs hooks in a new session without a controlling terminal.
+    # Match that, so a hook can never reach the terminal running the tests.
     return subprocess.run(
         [str(reporter), state],
         input=payload,
@@ -60,6 +62,7 @@ def invoke(reporter, state, payload, env):
         stderr=subprocess.PIPE,
         timeout=3,
         check=False,
+        start_new_session=True,
     )
 
 

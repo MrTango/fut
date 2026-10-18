@@ -47,6 +47,8 @@ class AdapterTests(unittest.TestCase):
 
             stdin = event if isinstance(event, str) else json.dumps(event)
             command = [sys.executable, str(ADAPTER), mode]
+            # Codex runs hooks in a new session without a controlling terminal.
+            # Match that, so a hook can never reach the terminal running the tests.
             result = subprocess.run(
                 command,
                 input=stdin,
@@ -54,6 +56,7 @@ class AdapterTests(unittest.TestCase):
                 capture_output=True,
                 env=environment,
                 check=False,
+                start_new_session=True,
             )
             arguments = json.loads(log.read_text()) if log.exists() else []
             return result, arguments
