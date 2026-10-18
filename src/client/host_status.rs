@@ -605,6 +605,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_progress_children_inherit_the_fut_app() {
+        let mut progress = record("", StatusState::Working, 1);
+        progress.progress = Some(40);
+        let mut legacy = pane(vec![progress]);
+        legacy.activity.source = Some(StatusSource::legacy_progress());
+        let snapshot = resources_with(vec![legacy]);
+        let records = derive(&local(&snapshot), None);
+        let child = &records[&compact_id(terminal(&snapshot, 0).uuid())];
+        assert_eq!(child.progress, Some(40));
+        assert_eq!(child.app, None, "OSC 9;4 does not name a program");
+    }
+
+    #[test]
     fn skips_its_own_terminal_closing_panes_and_caps_children() {
         let mut panes: Vec<_> = (0..MAX_CHILDREN + 5)
             .map(|index| pane(vec![record("", StatusState::Working, index as u64)]))

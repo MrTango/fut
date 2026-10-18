@@ -452,6 +452,11 @@ impl StatusSource {
         }
     }
 
+    /// OSC 9;4 does not say which program is running, so it names no app.
+    fn is_legacy_progress(&self) -> bool {
+        matches!(self, Self::Detection { agent, rule } if agent == "progress" && rule == "osc_9_4")
+    }
+
     fn is_explicit(&self) -> bool {
         !matches!(self, Self::Detection { .. })
     }
@@ -722,8 +727,12 @@ impl ProgramStatus {
                 Some(StatusSource::Report { source, .. }) => {
                     source.as_deref().filter(|source| !source.is_empty())
                 }
-                Some(StatusSource::Detection { agent, .. }) => Some(agent.as_str()),
-                Some(StatusSource::Osc) | None => None,
+                Some(source @ StatusSource::Detection { agent, .. })
+                    if !source.is_legacy_progress() =>
+                {
+                    Some(agent.as_str())
+                }
+                Some(StatusSource::Osc | StatusSource::Detection { .. }) | None => None,
             })
     }
 
@@ -2255,6 +2264,18 @@ mod tests {
         );
         assert!(!detected.is_reporting());
         assert_eq!(detected.label(), Some("codex"));
+
+        let mut legacy = ProgramStatus::default();
+        legacy.apply_updates(
+            vec![StatusUpdate::Report(status_report(
+                "",
+                StatusState::Working,
+            ))],
+            StatusSource::legacy_progress(),
+            1,
+            1,
+        );
+        assert_eq!(legacy.label(), None, "OSC 9;4 names no program");
     }
 
     #[test]
