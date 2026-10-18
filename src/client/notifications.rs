@@ -253,49 +253,43 @@ impl NotificationState {
                         if pane.closing {
                             continue;
                         }
-                        let mut push = |kind, occurred_at_ms, acknowledgement| {
-                            waiting.push(WaitingTerminal {
-                                machine: MachineId::Local,
-                                generation: Generation::default(),
-                                machine_label: None,
-                                selectable: true,
-                                session_id: session.id,
-                                pane_id: pane.id,
-                                terminal_id: pane.terminal_id,
-                                session: session.name.clone(),
-                                workspace: workspace.name.clone(),
-                                tab: tab.name.clone(),
-                                kind,
-                                occurred_at_ms,
-                                acknowledgement,
+                        // One row per terminal: a program that rings the bell
+                        // and reports attention is still one terminal waiting.
+                        // The row carries the stronger kind and clears both.
+                        let bell = self
+                            .terminal_alert(pane.terminal_id)
+                            .filter(|alert| alert.unseen())
+                            .map(|alert| (NotificationKind::Bell, alert.state.last_bell_at_ms));
+                        let agent = unread_attention(&pane.activity).map(|(kind, attention)| {
+                            (NotificationKind::Agent(kind), attention.updated_at_ms)
+                        });
+                        let Some((kind, occurred_at_ms)) = [agent, bell]
+                            .into_iter()
+                            .flatten()
+                            .max_by_key(|(kind, occurred_at_ms)| {
+                                (notification_priority(*kind), *occurred_at_ms)
                             })
+                        else {
+                            continue;
                         };
-                        if let Some(alert) = self.terminal_alert(pane.terminal_id)
-                            && alert.unseen()
-                        {
-                            push(
-                                NotificationKind::Bell,
-                                alert.state.last_bell_at_ms,
-                                AttentionAcknowledgement::Alert {
-                                    terminal_id: pane.terminal_id,
-                                    observed: alert.state.cursor(),
-                                },
-                            );
-                        }
-                        if let Some((kind, attention)) = unread_attention(&pane.activity) {
-                            push(
-                                NotificationKind::Agent(kind),
-                                attention.updated_at_ms,
-                                AttentionAcknowledgement::Agent {
-                                    terminal_id: pane.terminal_id,
-                                    event_revision: pane
-                                        .activity
-                                        .attention()
-                                        .expect("unread attention has a latest record")
-                                        .attention_revision,
-                                },
-                            );
-                        }
+                        waiting.push(WaitingTerminal {
+                            machine: MachineId::Local,
+                            generation: Generation::default(),
+                            machine_label: None,
+                            selectable: true,
+                            session_id: session.id,
+                            pane_id: pane.id,
+                            terminal_id: pane.terminal_id,
+                            session: session.name.clone(),
+                            workspace: workspace.name.clone(),
+                            tab: tab.name.clone(),
+                            kind,
+                            occurred_at_ms,
+                            acknowledgements: [
+                                self.agent_acknowledgement(pane),
+                                self.alert_acknowledgement(pane),
+                            ],
+                        });
                     }
                 }
             }
@@ -382,7 +376,7 @@ pub(super) struct WaitingTerminal {
     pub tab: String,
     pub kind: NotificationKind,
     pub occurred_at_ms: u64,
-    pub acknowledgement: AttentionAcknowledgement,
+    pub acknowledgements: [Option<AttentionAcknowledgement>; 2],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,7 +427,7 @@ pub(super) enum NotificationsAction {
     Stay,
     Close,
     Select(NavigatorSelection),
-    Acknowledge(MachineId, Generation, AttentionAcknowledgement),
+    Acknowledge(MachineId, Generation, [Option<AttentionAcknowledgement>; 2]),
 }
 
 impl NotificationsDialog {
@@ -550,7 +544,7 @@ impl NotificationsDialog {
                         NotificationsAction::Acknowledge(
                             row.machine,
                             row.generation,
-                            row.acknowledgement,
+                            row.acknowledgements,
                         )
                     });
             }
@@ -829,10 +823,12 @@ mod tests {
             }],
         });
 
-        // Agent completion and BEL remain independently represented; BEL wins
-        // the single ancestry marker.
+        // Agent completion and BEL fold into one waiting terminal; BEL wins
+        // the row kind and the single ancestry marker.
         let waiting = notifications.waiting(&snapshot_with_panes(vec![pane.clone()]));
-        assert_eq!(waiting.len(), 2);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].kind, NotificationKind::Bell);
+        assert!(waiting[0].acknowledgements.iter().all(Option::is_some));
         assert_eq!(
             notifications.indicator(&[pane]),
             Some(ActivityIndicator::Bell)
@@ -926,22 +922,56 @@ mod tests {
         );
         let snapshot = snapshot_with_panes(vec![pane.clone()]);
         let waiting = notifications.waiting(&snapshot);
-        assert!(matches!(
-            waiting.as_slice(),
-            [
-                WaitingTerminal {
+        assert!(
+            matches!(
+                waiting.as_slice(),
+                [WaitingTerminal {
                     kind: NotificationKind::Agent(AgentNotificationKind::Blocked),
-                    acknowledgement: AttentionAcknowledgement::Agent {
+                    acknowledgements: [
+                        Some(AttentionAcknowledgement::Agent {
+                            event_revision: 5,
+                            ..
+                        }),
+                        Some(AttentionAcknowledgement::Alert { .. }),
+                    ],
+                    ..
+                }]
+            ),
+            "a terminal with attention and a bell is one waiting terminal"
+        );
+        assert_eq!(notifications.waiting_count(&snapshot), 1);
+        let mut dialog = NotificationsDialog::open(&snapshot, &notifications);
+        assert!(matches!(
+            dialog.key(
+                KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE),
+                10
+            ),
+            NotificationsAction::Acknowledge(
+                _,
+                _,
+                [
+                    Some(AttentionAcknowledgement::Agent {
                         event_revision: 5,
                         ..
-                    },
-                    ..
-                },
-                WaitingTerminal {
-                    kind: NotificationKind::Bell,
-                    ..
-                }
-            ]
+                    }),
+                    Some(AttentionAcknowledgement::Alert { .. }),
+                ]
+            )
+        ));
+
+        pane.activity.read_revision = 5;
+        let snapshot = snapshot_with_panes(vec![pane.clone()]);
+        assert_eq!(
+            notifications.indicator(std::slice::from_ref(&pane)),
+            Some(ActivityIndicator::Bell)
+        );
+        assert!(matches!(
+            notifications.waiting(&snapshot).as_slice(),
+            [WaitingTerminal {
+                kind: NotificationKind::Bell,
+                acknowledgements: [None, Some(AttentionAcknowledgement::Alert { .. })],
+                ..
+            }]
         ));
         let mut dialog = NotificationsDialog::open(&snapshot, &notifications);
         assert!(matches!(
@@ -952,26 +982,8 @@ mod tests {
             NotificationsAction::Acknowledge(
                 _,
                 _,
-                AttentionAcknowledgement::Agent {
-                    event_revision: 5,
-                    ..
-                }
+                [None, Some(AttentionAcknowledgement::Alert { .. })]
             )
-        ));
-
-        pane.activity.read_revision = 5;
-        let snapshot = snapshot_with_panes(vec![pane.clone()]);
-        assert_eq!(
-            notifications.indicator(std::slice::from_ref(&pane)),
-            Some(ActivityIndicator::Bell)
-        );
-        let mut dialog = NotificationsDialog::open(&snapshot, &notifications);
-        assert!(matches!(
-            dialog.key(
-                KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE),
-                10
-            ),
-            NotificationsAction::Acknowledge(_, _, AttentionAcknowledgement::Alert { .. })
         ));
 
         notifications.accept_alerts(ClientAlertSnapshot {
@@ -1162,20 +1174,16 @@ mod tests {
             .unwrap()
             .generation = generation;
         dialog.accept_federation(&state, MachineId::Local, &notifications);
-        assert_eq!(dialog.rows.len(), 2);
-        assert!(
-            dialog
-                .rows
-                .iter()
-                .any(|row| row.kind == NotificationKind::Bell)
-        );
+        assert_eq!(dialog.rows.len(), 1, "the bell joins the terminal's row");
+        assert_eq!(dialog.rows[0].kind, NotificationKind::Bell);
+        assert!(dialog.rows[0].acknowledgements.iter().all(Option::is_some));
         assert!(dialog.rows.iter().all(|row| row.selectable));
 
         let metadata = state.fixture_metadata_mut(remote);
         metadata.resources.as_mut().unwrap().generation = previous;
         metadata.alerts.as_mut().unwrap().generation = previous;
         dialog.accept_federation(&state, MachineId::Local, &notifications);
-        assert_eq!(dialog.rows.len(), 2);
+        assert_eq!(dialog.rows.len(), 1);
         assert!(
             dialog.rows.iter().all(
                 |row| !row.selectable && row.machine_label.as_deref() == Some("remote · stale")
@@ -1194,10 +1202,13 @@ mod tests {
             waiting.as_slice(),
             [WaitingTerminal {
                 kind: NotificationKind::Agent(AgentNotificationKind::Error),
-                acknowledgement: AttentionAcknowledgement::Agent {
-                    terminal_id,
-                    event_revision: 7,
-                },
+                acknowledgements: [
+                    Some(AttentionAcknowledgement::Agent {
+                        terminal_id,
+                        event_revision: 7,
+                    }),
+                    None,
+                ],
                 ..
             }] if *terminal_id == pane.terminal_id
         ));
@@ -1366,12 +1377,48 @@ mod tests {
 
         assert!(matches!(
             dialog.key(KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE), 10),
-            NotificationsAction::Acknowledge(_, _, AttentionAcknowledgement::Agent {
-                terminal_id,
-                event_revision: 1,
-            }) if terminal_id == pane.terminal_id
+            NotificationsAction::Acknowledge(
+                _,
+                _,
+                [
+                    Some(AttentionAcknowledgement::Agent {
+                        terminal_id,
+                        event_revision: 1,
+                    }),
+                    None,
+                ]
+            ) if terminal_id == pane.terminal_id
         ));
         assert_eq!(pane.activity.summary_state(), StatusState::Done);
+    }
+
+    #[test]
+    fn dialog_keeps_its_selection_across_refreshes_of_a_terminal_with_a_bell() {
+        let first = status_pane(StatusState::Blocked, 3, 0);
+        let second = status_pane(StatusState::Done, 2, 0);
+        let mut notifications = NotificationState::default();
+        notifications.accept_alerts(ClientAlertSnapshot {
+            revision: 1,
+            terminals: vec![TerminalAlertSnapshot {
+                terminal_id: second.terminal_id,
+                state: crate::alerts::TerminalAlertState {
+                    bell_count: 1,
+                    last_bell_at_ms: 30,
+                },
+                seen: crate::alerts::AlertCursor::default(),
+            }],
+        });
+        let snapshot = snapshot_with_panes(vec![first.clone(), second.clone()]);
+        let mut dialog = NotificationsDialog::open(&snapshot, &notifications);
+        assert_eq!(dialog.rows.len(), 2);
+        dialog.key(
+            KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE),
+            10,
+        );
+        assert_eq!(dialog.rows[dialog.selected].terminal_id, second.terminal_id);
+
+        dialog.accept_resources(&snapshot, &notifications);
+        assert_eq!(dialog.selected, 1, "a refresh keeps the selected terminal");
     }
 
     #[test]

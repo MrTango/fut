@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Keep a tab and workspace working while an agent's sub-tasks are still running, instead of showing a completion as soon as the agent's own turn ends.
+- Count a terminal that both rings the bell and reports attention once in the notifications bell, list it once in the waiting dialog, and clear both with one keypress; the dialog also keeps its selection across refreshes.
 
 ## 0.35
 

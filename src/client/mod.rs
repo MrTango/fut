@@ -2766,7 +2766,7 @@ async fn run_loop(
                                 }
                                 force_draw = true;
                             }
-                            NotificationsAction::Acknowledge(machine, generation, acknowledgement) => {
+                            NotificationsAction::Acknowledge(machine, generation, acknowledgements) => {
                                 let current = if machine == active_machine
                                     && generation == federation::Generation::default()
                                 {
@@ -2785,7 +2785,9 @@ async fn run_loop(
                                     force_draw = true;
                                     continue;
                                 }
-                                acknowledge_attention(framed, acknowledgement).await?;
+                                for acknowledgement in acknowledgements.into_iter().flatten() {
+                                    acknowledge_attention(framed, acknowledgement).await?;
+                                }
                                 force_draw = true;
                             }
                         }

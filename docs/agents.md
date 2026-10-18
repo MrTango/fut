@@ -290,9 +290,10 @@ work, native replacements, and done/error results.
 Done, blocked, and error transitions create daemon-wide unread attention. A
 changed blocked kind, title, or message also marks a new request unread;
 progress-only updates do not. Use `Ctrl-b u`
-to list waiting terminals and `Ctrl-b Ctrl-b` to jump to the next one. Rendering a
-terminal marks its current attention as read for every attached client and later CLI
-calls.
+to list waiting terminals and `Ctrl-b Ctrl-b` to jump to the next one. A terminal
+that both rings the bell and reports attention is listed and counted once, under
+its stronger kind, and clearing it clears both. Rendering a terminal marks its
+current attention as read for every attached client and later CLI calls.
 
 ## Program status (OSC 7501)
 
