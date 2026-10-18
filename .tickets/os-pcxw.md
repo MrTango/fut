@@ -30,3 +30,7 @@ Design (resolved before coding). Context: client writes to host via stdout betwe
 **2026-10-18T20:04:36Z**
 
 Gap reproduced on main e835589 with real isolated daemons: inner client attached inside an outer Fut terminal (FUT_ALLOW_NESTED=1), inner agent report working/native OSC blocked -> outer agent get showed no records, and the client sent no OSC 7501 query. Implemented in src/client/host_status.rs (derive/diff/coalesce, Drop clears) wired into run_loop; reply consumed before HostColors. Docs: docs/agents.md 'Forward status to the outer terminal', docs/configuration.md alerts.outer_terminal_status, docs/decisions/outer-terminal-status.md.
+
+**2026-10-18T20:11:22Z**
+
+Verified: mise run check exit 0 (875 unit incl. 9 host_status, 170 e2e incl. 2 new, 7 upgrade, aux adapters, 17 run smoke). Manual nested check (two isolated daemons, inner client attached in an outer Fut terminal via terminal run, isolated HOME/runtime): 15/15 pass. Outer gets root app=fut + child per inner terminal (progress 40, app demo, title location), native inner OSC blocked -> outer root blocked/permission, 400-update progress flood -> 1-2 outer revisions, Ctrl-b d clears outer, SIGKILL leaves done (documented), next client reclaims, plain PTY host without reply gets only the query. Ticket left open for review/merge.
