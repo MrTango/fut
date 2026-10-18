@@ -22,7 +22,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() {
+  echo "FAIL: $*" >&2
+  {
+    echo "--- processes"
+    ps -axo pid,ppid,pgid,stat,etime,command | grep -E "runctl|$MARKER" | grep -v grep
+    for dir in "$FUT_RUN_STATE_DIR"/*/*/; do
+      [ -d "$dir" ] || continue
+      echo "--- $dir"
+      cat "$dir/state.json" 2>/dev/null
+      cat "$dir/run.log" 2>/dev/null
+    done
+    echo "--- last tokens"; tail -10 "$TOKENS" | tr '\037' ' '
+  } >&2
+  exit 1
+}
 ok() { PASS=$((PASS + 1)); echo "ok $PASS - $*"; }
 
 # --- stub fut binary that records token publishes -----------------------------
@@ -103,10 +117,16 @@ run() { # <workspace-id> <config-json> <subcommand> [starter-pane-id]
       FUT_EXTENSION_CONFIG="$cfg" "$RUNCTL" "$cmd"
 }
 
+# Timing counts awake time, never the wall clock. A laptop that naps between
+# dark wakes mid-test must not expire a wait or inflate a measured duration;
+# runctl's own deadlines use the monotonic clock, which pauses during sleep.
+monotonic_ms() { python3 -c 'import time; print(int(time.monotonic() * 1000))'; }
+
 wait_for() { # <seconds> <command...>
-  local deadline=$((SECONDS + $1)); shift
+  local tries=$(( $1 * 10 )); shift
   until "$@"; do
-    [ "$SECONDS" -lt "$deadline" ] || return 1
+    tries=$((tries - 1))
+    [ "$tries" -ge 0 ] || return 1
     sleep 0.1
   done
 }
@@ -293,9 +313,10 @@ PIDS6="$TMP/pids-w6"; : > "$PIDS6"
 CFG6=$(printf '{"command":["sh","-c","trap : TERM; echo $$ >> %s; while :; do sleep 1; done","%s"],"grace_seconds":1}' "$PIDS6" "$MARKER")
 run w6 "$CFG6" restart || fail "w6 restart failed"
 wait_for 5 lines_at_least "$PIDS6" 1 || fail "w6 never started"
-START=$SECONDS
+START=$(monotonic_ms)
 run w6 '{"grace_seconds":1}' stop || fail "w6 stop failed"
-[ $((SECONDS - START)) -le 8 ] || fail "w6 stop took $((SECONDS - START))s"
+ELAPSED=$(( ($(monotonic_ms) - START) / 1000 ))
+[ "$ELAPSED" -le 8 ] || fail "w6 stop took ${ELAPSED}s"
 wait_for 3 pid_dead "$(cat "$PIDS6")" || fail "w6 TERM-ignoring child survived"
 token_is w6 cross || fail "w6 escalation token"
 grep -q "escalating to SIGKILL" "$(state_dir w6)"/run.log* || fail "missing escalation separator"
@@ -372,9 +393,10 @@ ok "creation hooks pause manual commands and auto-start once per project session
 PIDS10="$TMP/pids-w10"; : > "$PIDS10"
 run w10 "$(sleeper_cfg "$PIDS10")" restart || fail "w10 restart failed"
 D10=$(state_dir w10)
-START=$SECONDS
+START=$(monotonic_ms)
 hook w10 workspace.closed "$TMP/roots/w10" || fail "closed hook failed"
-[ $((SECONDS - START)) -lt 4 ] || fail "closed hook took $((SECONDS - START))s"
+ELAPSED=$(( ($(monotonic_ms) - START) / 1000 ))
+[ "$ELAPSED" -lt 4 ] || fail "closed hook took ${ELAPSED}s"
 pid_dead "$(cat "$PIDS10")" || fail "w10 child survived close"
 [ ! -d "$D10" ] || fail "w10 state dir not removed"
 ok "closed hook finishes under 4s, stops the runner, and removes workspace state"
