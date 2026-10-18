@@ -408,6 +408,12 @@ fn delta_cases(size: TerminalSize) -> Vec<(&'static str, ScreenSnapshot, ScreenS
     let after = snapshot(&mut vt, b"x");
     cases.push(("type", before, after));
 
+    // Saturating output replaces every row; shift detection finds nothing.
+    let mut vt = VtBench::new(size).expect("create bench terminal");
+    let before = snapshot(&mut vt, &log_lines(0, rows * 2));
+    let after = snapshot(&mut vt, &log_lines(rows * 2, rows * 30));
+    cases.push(("flood", before, after));
+
     let mut vt = VtBench::new(size).expect("create bench terminal");
     let before = snapshot(&mut vt, &log_lines(0, rows * 2));
     let after = snapshot(&mut vt, &log_lines(rows * 2, 4));
@@ -436,9 +442,9 @@ fn delta_cases(size: TerminalSize) -> Vec<(&'static str, ScreenSnapshot, ScreenS
     cases
 }
 
-fn screen_message(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Vec<u8> {
+fn screen_message(previous: &ScreenSnapshot, next: &ScreenSnapshot, shifts: bool) -> Vec<u8> {
     let terminal_id = fut::domain::TerminalId::new();
-    let message = match next.delta_from(previous, true) {
+    let message = match next.delta_from(previous, shifts) {
         Some(delta) => ServerMessage::SnapshotDelta { terminal_id, delta },
         None => ServerMessage::Snapshot {
             terminal_id,
@@ -457,7 +463,7 @@ fn bench_delta(c: &mut Criterion) {
     for (size_name, size) in [SCALE_SIZES[0], SCALE_SIZES[2]] {
         for (case, previous, next) in delta_cases(size) {
             let name = format!("{case}_{size_name}");
-            let encoded = screen_message(&previous, &next);
+            let encoded = screen_message(&previous, &next, true);
             let kind = if next.delta_from(&previous, true).is_some() {
                 "delta"
             } else {
@@ -465,7 +471,11 @@ fn bench_delta(c: &mut Criterion) {
             };
             eprintln!("delta/{name}: {kind} frame {} bytes", encoded.len());
             group.bench_function(format!("produce_{name}"), |b| {
-                b.iter(|| screen_message(&previous, &next))
+                b.iter(|| screen_message(&previous, &next, true))
+            });
+            // Row diffs only, as sent to peers without row shifts.
+            group.bench_function(format!("produce_rows_{name}"), |b| {
+                b.iter(|| screen_message(&previous, &next, false))
             });
             let apply = |mut screen: ScreenSnapshot| {
                 let envelope: Envelope<ServerMessage> =
