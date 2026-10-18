@@ -1962,7 +1962,20 @@ impl ScreenSnapshot {
                 row: delta.cursor.row,
             });
         }
+        if let Some(shift) = delta.shift
+            && !shift.fits(self.size.rows)
+        {
+            return Err(ScreenDeltaError::ShiftOutOfBounds {
+                shift,
+                rows: self.size.rows,
+            });
+        }
 
+        if let Some(shift) = delta.shift {
+            let region = &mut self.cells
+                [usize::from(shift.top) * columns..usize::from(shift.bottom) * columns];
+            region.rotate_left(shift.rotation() * columns);
+        }
         for row in delta.rows {
             let start = usize::from(row.index) * columns;
             self.cells[start..start + columns].clone_from_slice(&row.cells);
@@ -1978,19 +1991,29 @@ impl ScreenSnapshot {
         Ok(())
     }
 
+    fn row(&self, index: usize) -> &[Cell] {
+        let columns = usize::from(self.size.columns);
+        &self.cells[index * columns..(index + 1) * columns]
+    }
+
     /// The delta that turns `previous` into this screen, or `None` when a
     /// full screen is the better message: the sizes differ, or more than
-    /// [`DELTA_ROW_FALLBACK_THRESHOLD`] of the rows changed.
+    /// [`DELTA_ROW_FALLBACK_THRESHOLD`] of the rows still need sending.
+    ///
+    /// With `shifts`, a delta may also move retained rows ([`RowShift`]) so
+    /// scrolling output carries only the rows it exposed. Peers that predate
+    /// shifts must be sent deltas produced without them.
     #[must_use]
-    pub fn delta_from(&self, previous: &ScreenSnapshot) -> Option<ScreenDelta> {
+    pub fn delta_from(&self, previous: &ScreenSnapshot, shifts: bool) -> Option<ScreenDelta> {
         if previous.size != self.size {
             return None;
         }
-        let rows = changed_rows(previous, self)?;
+        let (shift, rows) = changed_rows(previous, self, shifts)?;
         Some(ScreenDelta {
             revision: self.revision,
             base_revision: previous.revision,
             size: self.size,
+            shift,
             rows,
             hyperlinks: self.hyperlinks.clone(),
             cursor: self.cursor,
@@ -2006,26 +2029,187 @@ impl ScreenSnapshot {
 /// what it saves over just resending everything.
 pub const DELTA_ROW_FALLBACK_THRESHOLD: f64 = 0.6;
 
-/// Rows that differ between same-sized `previous` and `next`, or `None` if
-/// that's more than [`DELTA_ROW_FALLBACK_THRESHOLD`] of all rows.
-fn changed_rows(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Option<Vec<DeltaRow>> {
-    let columns = usize::from(next.size.columns);
+/// Fewest changed rows worth looking for a shift behind: typing and cursor
+/// movement change one or two rows, and a shift cannot save anything there.
+const SHIFT_MIN_CHANGED_ROWS: usize = 3;
+/// Rows of the new screen whose old positions propose candidate shifts, and
+/// the nearest matches kept for each anchor and direction. Repeated rows
+/// (`yes`, blank lines) match many offsets; nearer ones are tried first.
+const SHIFT_ANCHORS: usize = 3;
+const SHIFT_CANDIDATES_PER_ANCHOR: usize = 4;
+
+/// Rows of `next` to send, with an optional shift of `previous`'s rows applied
+/// first, or `None` if that's more than [`DELTA_ROW_FALLBACK_THRESHOLD`] of all
+/// rows. Callers must already know `previous.size == next.size`.
+fn changed_rows(
+    previous: &ScreenSnapshot,
+    next: &ScreenSnapshot,
+    shifts: bool,
+) -> Option<(Option<RowShift>, Vec<DeltaRow>)> {
     let rows = usize::from(next.size.rows);
-    let mut changed = Vec::new();
-    for row in 0..rows {
-        let start = row * columns;
-        let end = start + columns;
-        if previous.cells[start..end] != next.cells[start..end] {
-            changed.push(DeltaRow {
-                index: row as u16,
-                cells: next.cells[start..end].to_vec(),
-            });
-        }
-    }
-    if changed.len() as f64 > rows as f64 * DELTA_ROW_FALLBACK_THRESHOLD {
+    let changed: Vec<usize> = (0..rows)
+        .filter(|&index| previous.row(index) != next.row(index))
+        .collect();
+    let shifted = (shifts && changed.len() >= SHIFT_MIN_CHANGED_ROWS)
+        .then(|| find_shift(previous, next, &changed))
+        .flatten()
+        .filter(|(_, remaining)| remaining.len() < changed.len());
+    let (shift, send) = match shifted {
+        Some((shift, remaining)) => (Some(shift), remaining),
+        None => (None, changed),
+    };
+    if send.len() as f64 > rows as f64 * DELTA_ROW_FALLBACK_THRESHOLD {
         return None;
     }
-    Some(changed)
+    let rows = send
+        .into_iter()
+        .map(|index| DeltaRow {
+            index: index as u16,
+            cells: next.row(index).to_vec(),
+        })
+        .collect();
+    Some((shift, rows))
+}
+
+/// The shift of `previous`'s rows that leaves the fewest rows of `next` to
+/// send, and those rows. `changed` lists the rows that differ in place,
+/// ascending and nonempty; only their span can move.
+///
+/// Row hashes only propose and rank candidates. The returned rows come from
+/// exact comparison, so a hash collision costs bytes, never correctness.
+fn find_shift(
+    previous: &ScreenSnapshot,
+    next: &ScreenSnapshot,
+    changed: &[usize],
+) -> Option<(RowShift, Vec<usize>)> {
+    let top = changed[0];
+    let bottom = changed[changed.len() - 1] + 1;
+    let span = bottom - top;
+    let old: &[u64] = &(top..bottom)
+        .map(|index| row_hash(previous.row(index)))
+        .collect::<Vec<_>>();
+    let new: &[u64] = &(top..bottom)
+        .map(|index| row_hash(next.row(index)))
+        .collect::<Vec<_>>();
+
+    // Content that scrolled up by `by` sits at `anchor` now and at
+    // `anchor + by` before; scrolling down puts it above.
+    let mut candidates: Vec<isize> = Vec::new();
+    for anchor in
+        (0..SHIFT_ANCHORS).map(|n| changed[n * (changed.len() - 1) / (SHIFT_ANCHORS - 1)] - top)
+    {
+        let hash = new[anchor];
+        let up = (anchor + 1..span)
+            .filter(|&source| old[source] == hash)
+            .take(SHIFT_CANDIDATES_PER_ANCHOR)
+            .map(|source| (source - anchor) as isize);
+        let down = (0..anchor)
+            .rev()
+            .filter(|&source| old[source] == hash)
+            .take(SHIFT_CANDIDATES_PER_ANCHOR)
+            .map(|source| -((anchor - source) as isize));
+        for by in up.chain(down) {
+            if !candidates.contains(&by) {
+                candidates.push(by);
+            }
+        }
+    }
+    let retained = move |by: isize| {
+        (0..span).filter(move |&index| {
+            let source = index as isize + by;
+            (0..span as isize).contains(&source) && new[index] == old[source as usize]
+        })
+    };
+    let by = candidates
+        .into_iter()
+        .map(|by| (retained(by).count(), by))
+        .filter(|&(count, by)| count > 0 && i16::try_from(by).is_ok())
+        .max_by_key(|&(count, by)| (count, std::cmp::Reverse(by.unsigned_abs()), by > 0))?
+        .1;
+
+    // Move only the region that holds retained rows and the rows they
+    // expose, so unchanged rows around a scroll region stay put.
+    let first = retained(by).next()?;
+    let last = retained(by).next_back()?;
+    let (start, end) = if by > 0 {
+        (first, last + by as usize + 1)
+    } else {
+        (first - by.unsigned_abs(), last + 1)
+    };
+    let shift = RowShift {
+        top: (top + start) as u16,
+        bottom: (top + end) as u16,
+        by: by as i16,
+    };
+    let remaining = (top..bottom)
+        .filter(|&index| {
+            let source = shift.source(index);
+            !(new[index - top] == old[source - top] && next.row(index) == previous.row(source))
+        })
+        .collect();
+    Some((shift, remaining))
+}
+
+/// A fast, non-cryptographic fingerprint of a row's cells for proposing
+/// shifts; equal rows always hash equal.
+fn row_hash(cells: &[Cell]) -> u64 {
+    const MULTIPLIER: u64 = 0xf135_7aea_2e62_a9c5;
+    let mut hash = 0_u64;
+    let mut mix = |word: u64| hash = (hash ^ word).wrapping_mul(MULTIPLIER).rotate_left(26);
+    for cell in cells {
+        let bytes = cell.contents.as_bytes();
+        for chunk in bytes.chunks(8) {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            mix(u64::from_le_bytes(word));
+        }
+        mix(cell.style.0
+            ^ ((bytes.len() as u64) << 57)
+            ^ (u64::from(cell.selected) << 63)
+            ^ u64::from(cell.hyperlink.map_or(0, |index| u32::from(index) + 1)).rotate_left(29));
+    }
+    hash
+}
+
+/// Rows of a [`ScreenDelta`]'s base that moved: rows `top..bottom` rotate up
+/// by `by` rows (down when negative) before the delta's replacement rows
+/// apply. The rows a shift exposes hold whatever rotated into them until
+/// those replacements arrive, so scrolling output carries only new rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RowShift {
+    #[serde(rename = "t")]
+    pub top: u16,
+    /// Exclusive.
+    #[serde(rename = "e")]
+    pub bottom: u16,
+    #[serde(rename = "n")]
+    pub by: i16,
+}
+
+impl RowShift {
+    /// A nonempty region within `rows` that the shift actually moves.
+    fn fits(self, rows: u16) -> bool {
+        self.top < self.bottom
+            && self.bottom <= rows
+            && self.by != 0
+            && self.by.unsigned_abs() < self.bottom - self.top
+    }
+
+    /// Rows `top..bottom` rotate left by this many rows. Requires [`Self::fits`].
+    fn rotation(self) -> usize {
+        let span = i32::from(self.bottom - self.top);
+        i32::from(self.by).rem_euclid(span) as usize
+    }
+
+    /// Row of the base grid that lands at `row`. Requires [`Self::fits`].
+    fn source(self, row: usize) -> usize {
+        let top = usize::from(self.top);
+        let bottom = usize::from(self.bottom);
+        if !(top..bottom).contains(&row) {
+            return row;
+        }
+        top + (row - top + self.rotation()) % (bottom - top)
+    }
 }
 
 /// One changed row of a [`ScreenDelta`]: its index within the grid plus a
@@ -2050,6 +2234,10 @@ pub struct ScreenDelta {
     pub base_revision: u64,
     #[serde(rename = "s")]
     pub size: TerminalSize,
+    /// Moves retained rows before `rows` apply. Only sent to peers that
+    /// understand it: local clients and remote `scroll-deltas.v1`.
+    #[serde(rename = "x", default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<RowShift>,
     #[serde(rename = "d")]
     pub rows: Vec<DeltaRow>,
     #[serde(rename = "h", default, skip_serializing_if = "Vec::is_empty")]
@@ -2090,6 +2278,8 @@ pub enum ScreenDeltaError {
     },
     #[error("delta cursor ({column}, {row}) is outside the snapshot")]
     CursorOutOfBounds { column: u16, row: u16 },
+    #[error("delta shift {shift:?} does not fit the {rows}-row snapshot")]
+    ShiftOutOfBounds { shift: RowShift, rows: u16 },
 }
 
 #[cfg(test)]
@@ -2696,6 +2886,7 @@ mod tests {
                 columns: 2,
                 rows: 2,
             },
+            shift: None,
             rows: vec![DeltaRow {
                 index: 1,
                 cells: vec![
@@ -2875,6 +3066,277 @@ mod tests {
             assert!(snapshot.apply_delta(delta).is_err());
             assert_eq!(snapshot, before);
         }
+    }
+
+    /// A 2-column screen whose rows read `lines`, one label per row.
+    fn rows_snapshot(revision: u64, lines: &[&str]) -> ScreenSnapshot {
+        let cells = lines
+            .iter()
+            .flat_map(|line| {
+                let mut chars = line.chars();
+                [chars.next(), chars.next()].map(|ch| Cell {
+                    contents: ch.unwrap_or(' ').to_string().into(),
+                    ..Cell::default()
+                })
+            })
+            .collect();
+        ScreenSnapshot::new(
+            revision,
+            TerminalSize {
+                columns: 2,
+                rows: lines.len() as u16,
+            },
+            cells,
+            Cursor {
+                column: 0,
+                row: 0,
+                visible: true,
+                shape: CursorShape::Block,
+                blinking: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn row_labels(screen: &ScreenSnapshot) -> Vec<String> {
+        screen
+            .cells
+            .chunks(usize::from(screen.size.columns))
+            .map(|row| row.iter().map(|cell| cell.contents.as_str()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn scrolled_screens_shift_retained_rows_and_carry_only_exposed_ones() {
+        let base = rows_snapshot(1, &["a ", "b ", "c ", "d ", "e ", "f "]);
+        let cases: [(&[&str], RowShift, &[u16]); 4] = [
+            // Output scrolled the whole screen up by two lines.
+            (
+                &["c ", "d ", "e ", "f ", "g ", "h "],
+                RowShift {
+                    top: 0,
+                    bottom: 6,
+                    by: 2,
+                },
+                &[4, 5],
+            ),
+            // A pager's reverse index scrolled down above a status line.
+            (
+                &["y ", "z ", "a ", "b ", "c ", "f "],
+                RowShift {
+                    top: 0,
+                    bottom: 5,
+                    by: -2,
+                },
+                &[0, 1],
+            ),
+            // A scroll region in the middle, plus an edit to the first row.
+            (
+                &["A ", "c ", "d ", "e ", "q ", "f "],
+                RowShift {
+                    top: 1,
+                    bottom: 5,
+                    by: 1,
+                },
+                &[0, 4],
+            ),
+            // Lines deleted below the cursor pull the rest up.
+            (
+                &["a ", "b ", "e ", "f ", "  ", "  "],
+                RowShift {
+                    top: 2,
+                    bottom: 6,
+                    by: 2,
+                },
+                &[4, 5],
+            ),
+        ];
+        for (lines, shift, rows) in cases {
+            let next = rows_snapshot(2, lines);
+            let delta = next.delta_from(&base, true).expect("shifted delta");
+            assert_eq!(delta.shift, Some(shift), "{lines:?}");
+            assert_eq!(
+                delta.rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+                rows,
+                "{lines:?}"
+            );
+            let mut applied = base.clone();
+            applied.apply_delta(delta).unwrap();
+            assert_eq!(applied, next, "{lines:?}");
+
+            // Without shifts the same scroll is a row diff or a full screen.
+            match next.delta_from(&base, false) {
+                Some(delta) => {
+                    assert_eq!(delta.shift, None);
+                    let mut applied = base.clone();
+                    applied.apply_delta(delta).unwrap();
+                    assert_eq!(applied, next);
+                }
+                None => assert!(rows.len() < 4),
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_rows_prefer_the_smallest_verified_shift() {
+        // `yes`-like rows match many offsets; only one of them retains most rows.
+        let base = rows_snapshot(1, &["1 ", "y ", "y ", "2 ", "y ", "y ", "3 ", "y "]);
+        let next = rows_snapshot(2, &["y ", "y ", "2 ", "y ", "y ", "3 ", "y ", "y "]);
+        let delta = next.delta_from(&base, true).unwrap();
+        assert_eq!(
+            delta.shift,
+            Some(RowShift {
+                top: 0,
+                bottom: 7,
+                by: 1
+            })
+        );
+        assert_eq!(
+            delta.rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+            [6]
+        );
+        let mut applied = base.clone();
+        applied.apply_delta(delta).unwrap();
+        assert_eq!(row_labels(&applied), row_labels(&next));
+    }
+
+    #[test]
+    fn small_edits_never_shift() {
+        let base = rows_snapshot(1, &["a ", "b ", "c ", "d "]);
+        let next = rows_snapshot(2, &["a ", "bx", "c ", "d "]);
+        let delta = next.delta_from(&base, true).unwrap();
+        assert_eq!(delta.shift, None);
+        assert_eq!(delta.rows.len(), 1);
+    }
+
+    #[test]
+    fn shift_wire_field_is_omitted_unless_present() {
+        let base = rows_snapshot(1, &["a ", "b ", "c ", "d ", "e "]);
+        let unshifted = rows_snapshot(2, &["a ", "bx", "c ", "d ", "e "])
+            .delta_from(&base, true)
+            .unwrap();
+        let json = serde_json::to_value(&unshifted).unwrap();
+        assert!(json.get("x").is_none());
+        let shifted = rows_snapshot(2, &["b ", "c ", "d ", "e ", "f "])
+            .delta_from(&base, true)
+            .unwrap();
+        let json = serde_json::to_value(&shifted).unwrap();
+        assert_eq!(json["x"], serde_json::json!({"t": 0, "e": 5, "n": 1}));
+        assert_eq!(
+            serde_json::from_value::<ScreenDelta>(json).unwrap(),
+            shifted
+        );
+    }
+
+    #[test]
+    fn random_scrolls_and_edits_round_trip_through_deltas() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut below = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        // Few distinct labels, so rows repeat and hashes match many offsets.
+        let label = |n: usize| ["a ", "b ", "y ", "  ", "zz", "y "][n % 6];
+        let mut shifted = 0;
+        for _ in 0..4000 {
+            let rows = 1 + below(12);
+            let lines: Vec<&str> = (0..rows).map(|_| label(below(6))).collect();
+            let base = rows_snapshot(1, &lines);
+            let mut next_lines = lines.clone();
+            if rows > 1 {
+                let top = below(rows - 1);
+                let bottom = top + 2 + below(rows - top - 1);
+                let by = 1 + below(bottom - top - 1);
+                let region = &mut next_lines[top..bottom];
+                if below(2) == 0 {
+                    region.rotate_left(by);
+                    for line in &mut region[bottom - top - by..] {
+                        *line = label(below(6));
+                    }
+                } else {
+                    region.rotate_right(by);
+                    for line in &mut region[..by] {
+                        *line = label(below(6));
+                    }
+                }
+            }
+            for _ in 0..below(3) {
+                next_lines[below(rows)] = label(below(6));
+            }
+            let next = rows_snapshot(2, &next_lines);
+            for shifts in [true, false] {
+                let Some(delta) = next.delta_from(&base, shifts) else {
+                    continue;
+                };
+                shifted += usize::from(delta.shift.is_some());
+                let mut applied = base.clone();
+                applied.apply_delta(delta).unwrap();
+                assert_eq!(applied, next, "{lines:?} -> {next_lines:?}");
+            }
+        }
+        assert!(shifted > 500, "only {shifted} shifted deltas");
+    }
+
+    #[test]
+    fn malformed_shifts_are_rejected_without_changing_the_snapshot() {
+        for shift in [
+            RowShift {
+                top: 0,
+                bottom: 3,
+                by: 1,
+            },
+            RowShift {
+                top: 1,
+                bottom: 1,
+                by: 1,
+            },
+            RowShift {
+                top: 1,
+                bottom: 0,
+                by: 1,
+            },
+            RowShift {
+                top: 0,
+                bottom: 2,
+                by: 0,
+            },
+            RowShift {
+                top: 0,
+                bottom: 2,
+                by: 2,
+            },
+            RowShift {
+                top: 0,
+                bottom: 2,
+                by: -2,
+            },
+            RowShift {
+                top: 0,
+                bottom: 2,
+                by: i16::MIN,
+            },
+        ] {
+            let mut delta = valid_delta(11);
+            delta.shift = Some(shift);
+            let mut snapshot = delta_snapshot();
+            let before = snapshot.clone();
+            assert_eq!(
+                snapshot.apply_delta(delta),
+                Err(ScreenDeltaError::ShiftOutOfBounds { shift, rows: 2 })
+            );
+            assert_eq!(snapshot, before);
+        }
+        let mut delta = valid_delta(11);
+        delta.shift = Some(RowShift {
+            top: 0,
+            bottom: 2,
+            by: -1,
+        });
+        let mut snapshot = delta_snapshot();
+        snapshot.apply_delta(delta).unwrap();
+        assert_eq!(row_labels(&snapshot), ["cd", "xy"]);
     }
 
     #[test]

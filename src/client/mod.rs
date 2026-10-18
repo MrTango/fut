@@ -8741,6 +8741,7 @@ mod tests {
                     revision: 2,
                     base_revision: 1,
                     size,
+                    shift: None,
                     rows: Vec::new(),
                     hyperlinks: Vec::new(),
                     cursor: Cursor {
@@ -8832,6 +8833,7 @@ mod tests {
             revision: 3,
             base_revision: 2,
             size: current.size,
+            shift: None,
             rows: Vec::new(),
             hyperlinks: current.hyperlinks.clone(),
             cursor: current.cursor,
@@ -8853,6 +8855,7 @@ mod tests {
             revision: 4,
             base_revision: 0,
             size: current.size,
+            shift: None,
             rows: Vec::new(),
             hyperlinks: current.hyperlinks.clone(),
             cursor: current.cursor,

@@ -71,10 +71,11 @@ pub enum Capability {
     ProjectOpen,
     Attachments,
     LargeScreens,
+    ScrollDeltas,
 }
 
 impl Capability {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -86,6 +87,7 @@ impl Capability {
         Self::ProjectOpen,
         Self::Attachments,
         Self::LargeScreens,
+        Self::ScrollDeltas,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -101,6 +103,7 @@ impl Capability {
             Self::ProjectOpen => "project-open.v1",
             Self::Attachments => "attachments.v1",
             Self::LargeScreens => "large-screens.v1",
+            Self::ScrollDeltas => "scroll-deltas.v1",
         }
     }
 }
@@ -198,6 +201,10 @@ impl Capabilities {
             LocationOpened { .. } => Capability::ProjectOpen,
             Pong { .. } => Capability::Health,
             KittyImage { .. } => Capability::LargeScreens,
+            SnapshotDelta { delta, .. } if delta.shift.is_some() => {
+                return self.contains(Capability::Interactive)
+                    && self.contains(Capability::ScrollDeltas);
+            }
             ExtensionCatalog { .. } | ExtensionCatalogChanged { .. } => {
                 Capability::ExtensionCatalog
             }
@@ -264,6 +271,7 @@ impl RemoteHello {
             optional.push(Capability::TerminalColors.name().into());
             optional.push(Capability::Attachments.name().into());
             optional.push(Capability::LargeScreens.name().into());
+            optional.push(Capability::ScrollDeltas.name().into());
         }
         Self {
             generation: GENERATION,
@@ -814,6 +822,77 @@ mod tests {
             old.negotiate(Capabilities::ALL),
             Err(EndpointError::InvalidHandshake)
         );
+    }
+
+    #[test]
+    fn scroll_deltas_are_optional_and_older_peers_never_receive_row_shifts() {
+        use crate::domain::{Cursor, RowShift, ScreenDelta, TerminalId, TerminalSize};
+        let size = TerminalSize {
+            columns: 80,
+            rows: 24,
+        };
+        let delta = |shift| ServerMessage::SnapshotDelta {
+            terminal_id: TerminalId::new(),
+            delta: ScreenDelta {
+                revision: 2,
+                base_revision: 1,
+                size,
+                shift,
+                rows: Vec::new(),
+                hyperlinks: Vec::new(),
+                cursor: Cursor {
+                    column: 0,
+                    row: 0,
+                    visible: true,
+                    shape: Default::default(),
+                    blinking: false,
+                },
+                scroll: Default::default(),
+                mouse_tracking: false,
+                graphics: None,
+            },
+        };
+        let plain = delta(None);
+        let shifted = delta(Some(RowShift {
+            top: 0,
+            bottom: 24,
+            by: 3,
+        }));
+        assert!(
+            !RemoteHello::new(ClientMode::Control, "0.38.0")
+                .optional
+                .iter()
+                .any(|name| name == "scroll-deltas.v1")
+        );
+        let interactive = ClientMode::Interactive {
+            size,
+            selector: None,
+        };
+        let offer = RemoteHello::new(interactive, "0.38.0");
+        assert!(offer.optional.iter().any(|name| name == "scroll-deltas.v1"));
+        let selected = offer.negotiate(Capabilities::ALL).unwrap();
+        assert!(selected.allows_server(&plain));
+        assert!(selected.allows_server(&shifted));
+
+        // An older client never offers it, and a daemon that predates it
+        // never selects it: both keep generation-1 deltas.
+        let mut old = offer.clone();
+        old.optional.retain(|name| name != "scroll-deltas.v1");
+        let older_daemon = Capabilities::from_names(
+            &Capabilities::ALL
+                .names()
+                .into_iter()
+                .filter(|name| name != "scroll-deltas.v1")
+                .collect::<Vec<_>>(),
+        );
+        for selected in [
+            old.negotiate(Capabilities::ALL).unwrap(),
+            offer.negotiate(older_daemon).unwrap(),
+        ] {
+            assert!(!selected.contains(Capability::ScrollDeltas));
+            assert!(selected.allows_server(&plain));
+            assert!(!selected.allows_server(&shifted));
+        }
     }
 
     #[test]

@@ -438,7 +438,7 @@ fn delta_cases(size: TerminalSize) -> Vec<(&'static str, ScreenSnapshot, ScreenS
 
 fn screen_message(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Vec<u8> {
     let terminal_id = fut::domain::TerminalId::new();
-    let message = match next.delta_from(previous) {
+    let message = match next.delta_from(previous, true) {
         Some(delta) => ServerMessage::SnapshotDelta { terminal_id, delta },
         None => ServerMessage::Snapshot {
             terminal_id,
@@ -458,7 +458,7 @@ fn bench_delta(c: &mut Criterion) {
         for (case, previous, next) in delta_cases(size) {
             let name = format!("{case}_{size_name}");
             let encoded = screen_message(&previous, &next);
-            let kind = if next.delta_from(&previous).is_some() {
+            let kind = if next.delta_from(&previous, true).is_some() {
                 "delta"
             } else {
                 "full"

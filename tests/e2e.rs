@@ -107,6 +107,8 @@ type RawConnection = Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>
 struct Connection {
     raw: RawConnection,
     grids: HashMap<TerminalId, ScreenSnapshot>,
+    /// Deltas received that moved retained rows.
+    shifted_deltas: usize,
 }
 
 impl Connection {
@@ -114,6 +116,7 @@ impl Connection {
         Self {
             raw: Framed::new(stream, codec()),
             grids: HashMap::new(),
+            shifted_deltas: 0,
         }
     }
 }
@@ -166,6 +169,7 @@ fn track_screen(connection: &mut Connection, message: ServerMessage) -> ServerMe
             }
         }
         ServerMessage::SnapshotDelta { terminal_id, delta } => {
+            connection.shifted_deltas += usize::from(delta.shift.is_some());
             let screen = apply_delta(&mut connection.grids, terminal_id, delta);
             connection.grids.insert(terminal_id, screen.clone());
             ServerMessage::Snapshot {
@@ -2450,6 +2454,102 @@ done
     .await;
 
     harness.detach(&mut client).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn scrolling_sends_row_shifts_only_to_peers_that_negotiated_them() {
+    let script = r#"
+printf 'READY\r\n'
+while IFS= read -r line; do
+  i=0
+  while [ $i -lt 3 ]; do printf '%s output line %s\r\n' "$line" $i; i=$((i+1)); done
+  printf 'DONE %s\r\n' "$line"
+done
+"#;
+    let mut harness = Harness::start(script).await;
+    let (mut client, terminal_id, _) = harness.interactive().await;
+    snapshot_containing(&mut client, terminal_id, "READY").await;
+    harness.detach(&mut client).await;
+
+    // Scroll a full screen several times, then check the grid built from
+    // every delta against a fresh full screen.
+    async fn scroll(client: &mut Connection, terminal_id: TerminalId, peer: &str) {
+        for round in 0..12 {
+            let line = format!("{peer}{round}");
+            send(
+                client,
+                ClientMessage::Input {
+                    bytes: format!("{line}\n").into_bytes(),
+                },
+            )
+            .await;
+            snapshot_containing(client, terminal_id, &format!("DONE {line}")).await;
+        }
+        while let Ok(Some(Ok(frame))) =
+            time::timeout(Duration::from_millis(200), client.next()).await
+        {
+            let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
+            track_screen(client, envelope.message);
+        }
+        let applied = client.grids[&terminal_id].clone();
+        send_uncorrelated(client, ClientMessage::RefreshTerminal { terminal_id }).await;
+        let refreshed = receive_matching(client, |message| {
+            matches!(message, ServerMessage::Snapshot { terminal_id: id, .. } if *id == terminal_id)
+        })
+        .await;
+        let ServerMessage::Snapshot { screen, .. } = refreshed else {
+            unreachable!()
+        };
+        assert_eq!(snapshot_text(&screen), snapshot_text(&applied));
+        assert_eq!(screen.cells, applied.cells);
+    }
+
+    async fn remote(harness: &Harness, scroll_deltas: bool) -> (Connection, TerminalId) {
+        use fut::protocol::remote::RemoteHello;
+        let mut client = harness.connect().await.unwrap();
+        let mut offer = RemoteHello::new(interactive_mode(None), "0.37.0");
+        if !scroll_deltas {
+            offer.optional.retain(|name| name != "scroll-deltas.v1");
+        }
+        send(&mut client, ClientMessage::RemoteHello(offer)).await;
+        match receive(&mut client).await.expect("remote welcome") {
+            ServerMessage::RemoteWelcome(welcome) => {
+                assert_eq!(
+                    welcome
+                        .capabilities
+                        .iter()
+                        .any(|name| name == "scroll-deltas.v1"),
+                    scroll_deltas
+                );
+                let terminal_id = welcome.selected.expect("selected view").focused.terminal_id;
+                (client, terminal_id)
+            }
+            other => panic!("expected remote welcome, received {other:?}"),
+        }
+    }
+
+    // A peer that predates `scroll-deltas.v1` keeps row diffs and full screens.
+    let (mut old, terminal_id) = remote(&harness, false).await;
+    scroll(&mut old, terminal_id, "old").await;
+    assert_eq!(old.shifted_deltas, 0, "an older peer received a row shift");
+    harness.detach(&mut old).await;
+
+    let (mut new, terminal_id) = remote(&harness, true).await;
+    scroll(&mut new, terminal_id, "new").await;
+    assert!(
+        new.shifted_deltas > 0,
+        "a negotiated peer received no row shift"
+    );
+    harness.detach(&mut new).await;
+
+    let (mut local, terminal_id, _) = harness.interactive().await;
+    scroll(&mut local, terminal_id, "local").await;
+    assert!(
+        local.shifted_deltas > 0,
+        "a local client received no row shift"
+    );
+    harness.detach(&mut local).await;
     harness.shutdown().await;
 }
 

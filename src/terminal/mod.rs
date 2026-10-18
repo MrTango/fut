@@ -56,10 +56,13 @@ pub mod bench {
 
     impl VtBench {
         pub fn new(size: TerminalSize) -> anyhow::Result<Self> {
+            Self::with_scrollback(size, super::DEFAULT_SCROLLBACK_BYTES)
+        }
+
+        pub fn with_scrollback(size: TerminalSize, bytes: usize) -> anyhow::Result<Self> {
             let writer: Arc<Mutex<Box<dyn io::Write + Send>>> =
                 Arc::new(Mutex::new(Box::new(io::sink())));
-            super::ghostty::GhosttyTerminal::new(size, writer, super::DEFAULT_SCROLLBACK_BYTES)
-                .map(Self)
+            super::ghostty::GhosttyTerminal::new(size, writer, bytes).map(Self)
         }
 
         pub fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<Option<ScreenSnapshot>> {

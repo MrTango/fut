@@ -2727,6 +2727,9 @@ struct OutboundQueue {
     /// format embeds Kitty image pixels instead of referencing separate
     /// `kitty_image` frames.
     embed_images: std::sync::atomic::AtomicBool,
+    /// Set for remote peers without `scroll-deltas.v1`: their frozen delta
+    /// format has no row shift, so scrolling falls back to row diffs.
+    unshifted_deltas: std::sync::atomic::AtomicBool,
 }
 
 impl ClientConnection {
@@ -2861,16 +2864,17 @@ const OUTBOUND_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 /// screen actually written to this connection last time — never against
 /// whatever the attachment layer last produced, since coalescing can drop
 /// frames the writer never sent. Updates `last_sent` to match what this call
-/// returns.
+/// returns. `shifts` permits deltas that move retained rows.
 fn snapshot_message(
     terminal_id: TerminalId,
     screen: ScreenSnapshot,
     force_full: bool,
+    shifts: bool,
     last_sent: &mut HashMap<TerminalId, ScreenSnapshot>,
 ) -> ServerMessage {
     if !force_full
         && let Some(previous) = last_sent.get(&terminal_id)
-        && let Some(delta) = screen.delta_from(previous)
+        && let Some(delta) = screen.delta_from(previous, shifts)
     {
         last_sent.insert(terminal_id, screen);
         return ServerMessage::SnapshotDelta { terminal_id, delta };
@@ -2974,7 +2978,15 @@ async fn write_outbound(
                 force_full,
             } => (
                 None,
-                snapshot_message(terminal_id, screen, force_full, &mut last_sent),
+                snapshot_message(
+                    terminal_id,
+                    screen,
+                    force_full,
+                    !queue
+                        .unshifted_deltas
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    &mut last_sent,
+                ),
             ),
             Outbound::Message {
                 request_id,
@@ -3111,6 +3123,10 @@ async fn handle_connection(
                     connection.remote = Some(capabilities);
                     connection.outbound.embed_images.store(
                         !capabilities.separate_images(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    connection.outbound.unshifted_deltas.store(
+                        !capabilities.contains(Capability::ScrollDeltas),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
@@ -7711,13 +7727,13 @@ mod tests {
         let terminal_id = TerminalId::new();
         let first = ScreenSnapshot::new(1, size, cells.clone(), cursor).unwrap();
         let mut last_sent = HashMap::new();
-        let message = snapshot_message(terminal_id, first, false, &mut last_sent);
+        let message = snapshot_message(terminal_id, first, false, true, &mut last_sent);
         assert!(matches!(message, ServerMessage::Snapshot { .. }));
 
         let mut second_cells = cells;
         second_cells[0].contents = "x".into();
         let second = ScreenSnapshot::new(2, size, second_cells.clone(), cursor).unwrap();
-        let message = snapshot_message(terminal_id, second, false, &mut last_sent);
+        let message = snapshot_message(terminal_id, second, false, true, &mut last_sent);
         assert!(matches!(message, ServerMessage::SnapshotDelta { .. }));
 
         let mut third = ScreenSnapshot::new(
@@ -7748,7 +7764,7 @@ mod tests {
                 source_height: 1,
                 z: 0,
             });
-        let message = snapshot_message(terminal_id, third, false, &mut last_sent);
+        let message = snapshot_message(terminal_id, third, false, true, &mut last_sent);
         let ServerMessage::SnapshotDelta { delta, .. } = message else {
             panic!("cursor-only change should produce a delta")
         };
@@ -7757,6 +7773,229 @@ mod tests {
         assert!(delta.cursor.blinking);
         assert!(delta.mouse_tracking);
         assert_eq!(delta.graphics.unwrap().placements.len(), 1);
+    }
+
+    /// Deterministic xorshift, so a failing seed reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    /// One random burst of terminal output: scrolling text, scroll regions,
+    /// explicit scrolls in both directions, reverse index, line insertion and
+    /// deletion, overwrites, erases, styling, and hyperlinks.
+    fn random_output(rng: &mut Rng, size: TerminalSize) -> Vec<u8> {
+        let rows = usize::from(size.rows);
+        let columns = usize::from(size.columns);
+        let mut out = String::new();
+        let text = |rng: &mut Rng, out: &mut String| {
+            let words = ["fut", "yes", "build", "", "x", "compiling", "≈", "界"];
+            for _ in 0..rng.below(6) {
+                if rng.below(4) == 0 {
+                    out.push_str(&format!("\x1b[3{}m", rng.below(8)));
+                }
+                out.push_str(words[rng.below(words.len())]);
+                out.push(' ');
+                if rng.below(5) == 0 {
+                    out.push_str("\x1b[0m");
+                }
+            }
+        };
+        for _ in 0..1 + rng.below(3) {
+            match rng.below(12) {
+                0..=3 => {
+                    for _ in 0..1 + rng.below(rows + rows / 2) {
+                        text(rng, &mut out);
+                        out.push_str("\r\n");
+                    }
+                }
+                4 => {
+                    let top = 1 + rng.below(rows);
+                    let bottom = top + rng.below(rows + 1 - top);
+                    out.push_str(&format!("\x1b[{top};{bottom}r"));
+                }
+                5 => out.push_str("\x1b[r"),
+                6 => out.push_str(&format!("\x1b[{}S", 1 + rng.below(rows))),
+                7 => out.push_str(&format!("\x1b[{}T", 1 + rng.below(rows))),
+                8 => {
+                    out.push_str(&format!("\x1b[{};1H", 1 + rng.below(rows)));
+                    for _ in 0..1 + rng.below(rows) {
+                        out.push_str("\x1bM\r");
+                        text(rng, &mut out);
+                    }
+                }
+                9 => {
+                    let operation = ["L", "M"][rng.below(2)];
+                    out.push_str(&format!(
+                        "\x1b[{};1H\x1b[{}{operation}",
+                        1 + rng.below(rows),
+                        1 + rng.below(rows)
+                    ));
+                }
+                10 => {
+                    out.push_str(&format!(
+                        "\x1b[{};{}H",
+                        1 + rng.below(rows),
+                        1 + rng.below(columns)
+                    ));
+                    if rng.below(3) == 0 {
+                        out.push_str("\x1b]8;;https://example.com/a\x1b\\link\x1b]8;;\x1b\\");
+                    }
+                    text(rng, &mut out);
+                    out.push_str(["", "\x1b[K", "\x1b[1J", "\x1b[2K"][rng.below(4)]);
+                }
+                _ => {
+                    if rng.below(8) == 0 {
+                        out.push_str(["\x1b[2J", "\x1b[?1049h", "\x1b[?1049l"][rng.below(3)]);
+                    }
+                    text(rng, &mut out);
+                }
+            }
+        }
+        out.into_bytes()
+    }
+
+    #[test]
+    fn deltas_from_random_vt_output_apply_to_exactly_the_full_screen() {
+        // Test builds keep Ghostty's integrity checks, which make each feed
+        // cost milliseconds; every screen is therefore also checked against
+        // several earlier bases, which costs no further VT work.
+        let sizes = [(80, 24), (13, 7), (40, 12), (3, 2), (1, 5)];
+        let mut checked = 0;
+        let mut shifted = 0;
+        for seed in 1..=12_u64 {
+            let (columns, rows) = sizes[seed as usize % sizes.len()];
+            let size = TerminalSize { columns, rows };
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut vt = crate::terminal::bench::VtBench::with_scrollback(size, 4096).unwrap();
+            let terminal_id = TerminalId::new();
+            let mut last_sent = HashMap::new();
+            let mut client: Option<ScreenSnapshot> = None;
+            let mut history: Vec<ScreenSnapshot> = Vec::new();
+            for step in 0..50 {
+                let Some(screen) = vt.feed(&random_output(&mut rng, size)).unwrap() else {
+                    continue;
+                };
+                let context = format!("seed {seed} step {step}");
+                for _ in 0..4.min(history.len()) {
+                    let base = &history[rng.below(history.len())];
+                    for shifts in [true, false] {
+                        let Some(delta) = screen.delta_from(base, shifts) else {
+                            continue;
+                        };
+                        assert!(
+                            shifts || delta.shift.is_none(),
+                            "{context}: unnegotiated shift"
+                        );
+                        shifted += usize::from(delta.shift.is_some());
+                        checked += 1;
+                        let mut applied = base.clone();
+                        applied.apply_delta(delta).unwrap();
+                        assert_eq!(applied, screen, "{context} shifts {shifts}");
+                    }
+                }
+                history.push(screen.clone());
+                // Coalescing drops snapshots the writer never sends.
+                if rng.below(4) == 0 {
+                    continue;
+                }
+                let force_full = rng.below(40) == 0;
+                match snapshot_message(
+                    terminal_id,
+                    screen.clone(),
+                    force_full,
+                    true,
+                    &mut last_sent,
+                ) {
+                    ServerMessage::Snapshot { screen, .. } => client = Some(screen),
+                    ServerMessage::SnapshotDelta { delta, .. } => {
+                        // Survive the wire, as a client receives it.
+                        let delta = crate::protocol::decode_payload(
+                            &crate::protocol::encode_payload(&delta).unwrap(),
+                        )
+                        .unwrap();
+                        client
+                            .as_mut()
+                            .expect("a delta follows a full screen")
+                            .apply_delta(delta)
+                            .unwrap_or_else(|error| panic!("{context}: {error}"));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+                assert_eq!(client.as_ref(), Some(&screen), "{context}");
+            }
+        }
+        // The workload must actually exercise both kinds of delta.
+        assert!(shifted > 50, "only {shifted} shifted deltas");
+        assert!(checked > 2 * shifted, "only {checked} deltas checked");
+    }
+
+    #[tokio::test]
+    async fn writers_for_older_remote_peers_never_send_row_shifts() {
+        let size = TerminalSize {
+            columns: 20,
+            rows: 6,
+        };
+        let mut vt = crate::terminal::bench::VtBench::new(size).unwrap();
+        let mut screens = Vec::new();
+        for line in 0..24 {
+            screens.push(
+                vt.feed(format!("line {line}\r\n").as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        for unshifted in [true, false] {
+            let terminal_id = TerminalId::new();
+            let (server, client) = UnixStream::pair().unwrap();
+            let (sink, _) = Framed::new(server, codec()).split();
+            let mut reader = Framed::new(client, codec());
+            let queue = Arc::new(OutboundQueue::default());
+            // As the remote handshake records a peer without `scroll-deltas.v1`.
+            queue
+                .unshifted_deltas
+                .store(unshifted, std::sync::atomic::Ordering::Relaxed);
+            let writer = tokio::spawn(write_outbound(sink, Arc::clone(&queue)));
+            let mut shifts = 0;
+            let mut received: Option<ScreenSnapshot> = None;
+            for screen in &screens {
+                queue
+                    .push(Outbound::Snapshot {
+                        terminal_id,
+                        screen: screen.clone(),
+                        force_full: false,
+                    })
+                    .unwrap();
+                let frame = timeout(Duration::from_secs(2), reader.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
+                match envelope.message {
+                    ServerMessage::Snapshot { screen, .. } => received = Some(screen),
+                    ServerMessage::SnapshotDelta { delta, .. } => {
+                        shifts += usize::from(delta.shift.is_some());
+                        received.as_mut().unwrap().apply_delta(delta).unwrap();
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+                assert_eq!(received.as_ref(), Some(screen));
+            }
+            if unshifted {
+                assert_eq!(shifts, 0);
+            } else {
+                assert!(shifts > 0);
+            }
+            queue.finish();
+            writer.await.unwrap();
+        }
     }
 
     fn screen_with_image(revision: u64, generation: u64) -> ScreenSnapshot {
@@ -7847,6 +8086,7 @@ mod tests {
                     columns: 2,
                     rows: 1,
                 },
+                shift: None,
                 rows: Vec::new(),
                 hyperlinks: Vec::new(),
                 cursor: screen_with_image(4, 2).cursor,
