@@ -145,18 +145,22 @@ fX2...0Q      app=cargo        state=working  progress=40  title="proj/main/buil
 Current releases of Claude Code (2.1.295 and later), Codex, and Pi (1.1.0 and
 later) emit OSC 7501 themselves, so they show status in Fut with nothing
 installed. Fut still ships first-party lifecycle plugins as legacy fallbacks
-for older agent versions and for setups where the agent never sees Fut's
-support reply, such as an agent running inside tmux:
+for older agent versions:
 
 - [Claude Code](agents/claude-code.md)
 - [Codex](agents/codex.md)
 - [Pi](agents/pi.md)
 
-The plugins call `fut agent report` and feed the same status records as native
-OSC 7501, so installing one alongside a native reporter is harmless but
-unnecessary. One exception remains: Codex does not report turn completion over
-OSC 7501, so its documented `notify` command setting is still the way to get
-completion attention. Screen-based Codex detection exists as a lower-priority
+The Claude Code and Codex plugins call `fut agent report`, so they work only
+inside Fut. Pi's extension writes OSC 7501 to Pi's terminal, so it works in any
+terminal that implements the protocol, including over SSH, and falls back to
+`fut agent report` when Pi has no terminal. None of them reach Fut from inside
+tmux, which drops OSC 7501 and runs outside the Fut terminal's process tree.
+All feed the same status records as native OSC 7501, so installing a plugin
+alongside a native reporter is harmless but unnecessary. One exception
+remains: Codex does not report turn completion over OSC 7501, so its
+documented `notify` command setting is still the way to get completion
+attention. Screen-based Codex detection exists as a lower-priority
 fallback; explicit OSC or CLI reports take precedence.
 
 ## Control integrated agents

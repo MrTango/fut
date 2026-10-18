@@ -9,9 +9,10 @@ permalink: /agents/claude-code/
 
 > **Legacy fallback.** Claude Code 2.1.295 and later emits OSC 7501 natively
 > and shows status in Fut with nothing installed. Install this plugin only for
-> older Claude Code versions, when terminal title reporting is disabled with
-> `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, or when Claude Code runs inside a
-> multiplexer such as tmux that does not forward Fut's OSC 7501 support reply.
+> older Claude Code versions or when terminal title reporting is disabled with
+> `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`. It does not help inside tmux: tmux
+> drops OSC 7501, and Fut rejects CLI reports from outside the Fut terminal's
+> process tree.
 
 Install Fut first, then add Fut's marketplace and lifecycle plugin:
 

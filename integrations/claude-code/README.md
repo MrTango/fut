@@ -2,8 +2,8 @@
 
 **Legacy fallback.** Claude Code 2.1.295 and later reports status to Fut
 natively over OSC 7501 and needs no plugin. This plugin remains for older
-Claude Code versions and for setups where Claude Code never receives Fut's
-OSC 7501 support reply, such as running inside tmux.
+Claude Code versions. It does not help inside tmux, which drops OSC 7501 and
+runs outside the Fut terminal's process tree.
 
 This first-party Claude Code plugin reports lifecycle state for the Claude Code
 session running in a Fut terminal. It has no commands, skills, agents, or MCP

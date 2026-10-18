@@ -11,8 +11,8 @@ permalink: /agents/codex/
 > 7501 idle, working, and blocked status natively and need no plugin for those.
 > Codex does not report turn completion over OSC 7501, so the `notify` setting
 > below is still required for completion attention. Install the plugin only for
-> older Codex versions or when Codex runs inside a multiplexer such as tmux that
-> does not forward Fut's OSC 7501 support reply.
+> older Codex versions. It does not help inside tmux: tmux drops OSC 7501, and
+> Fut rejects CLI reports from outside the Fut terminal's process tree.
 
 The Codex plugin requires `python3`. Install Fut first, then add Fut's
 marketplace and plugin:
