@@ -678,12 +678,21 @@ impl StatusProcess<'_> {
             .and_then(|pid| u32::try_from(pid).ok())
             .unwrap_or(self.child_pid)
     }
+
+    /// The same liveness rule the daemon uses to release a record owner.
+    fn owns(self, pid: u32) -> bool {
+        crate::daemon::process::is_descendant(pid, self.child_pid)
+    }
 }
 
 struct RuntimeStatusProducer<'a> {
     publisher: &'a async_mpsc::Sender<NativeStatusBatch>,
     process: Option<StatusProcess<'a>>,
     coalescer: StatusCoalescer,
+    /// Foreground process that sent the latest OSC 7501 report, unless that
+    /// was the terminal's own shell, which never exits before the terminal.
+    program_status_owner: Option<u32>,
+    terminal_pid: Option<u32>,
 }
 
 impl<'a> RuntimeStatusProducer<'a> {
@@ -695,6 +704,8 @@ impl<'a> RuntimeStatusProducer<'a> {
             publisher,
             process,
             coalescer: StatusCoalescer::default(),
+            program_status_owner: None,
+            terminal_pid: process.map(|process| process.child_pid),
         }
     }
 
@@ -703,18 +714,32 @@ impl<'a> RuntimeStatusProducer<'a> {
     fn receive(&mut self, terminal: &GhosttyTerminal) {
         let updates = terminal.take_status_receipts();
         let process = self.process;
-        self.receive_updates(updates, || process.map(StatusProcess::foreground_pid));
+        let released = self.receive_updates(
+            updates,
+            || process.map(StatusProcess::foreground_pid),
+            |pid| process.is_some_and(|process| process.owns(pid)),
+        );
+        if released {
+            terminal.release_program_status_lock();
+        }
     }
 
+    /// Returns whether held OSC 9;4 progress was released because the
+    /// program that sent OSC 7501 has exited.
     fn receive_updates(
         &mut self,
-        updates: Vec<(NativeStatusSource, StatusUpdate)>,
+        mut updates: Vec<(NativeStatusSource, StatusUpdate)>,
         foreground_pid: impl FnOnce() -> Option<u32>,
-    ) {
+        owner_alive: impl FnOnce(u32) -> bool,
+    ) -> bool {
         if updates.is_empty() {
-            return;
+            return false;
         }
         let foreground_pid = foreground_pid();
+        let released = self.resolve_held_progress(&mut updates, foreground_pid, owner_alive);
+        if updates.is_empty() {
+            return released;
+        }
         // Split at protocol boundaries, keeping parser order: each run is
         // applied with its own provenance.
         let mut runs: Vec<NativeStatusBatch> = Vec::new();
@@ -733,6 +758,48 @@ impl<'a> RuntimeStatusProducer<'a> {
                 self.publish(batch);
             }
         }
+        released
+    }
+
+    /// OSC 9;4 is held after an OSC 7501 report so legacy progress cannot
+    /// overwrite a live program's kind or message. That precedence ends with
+    /// the reporting program, the same boundary that drops its working and
+    /// blocked records: once it has exited, later progress comes from another
+    /// program and is shown. A report in the same feed renews the hold. Like
+    /// a record clear, an OSC 7501 clear never claims ownership, so a program
+    /// that clears on its way out (a nested Fut client detaching) still
+    /// releases the hold when it exits, even if the shell is already back in
+    /// the foreground when its clear is read.
+    fn resolve_held_progress(
+        &mut self,
+        updates: &mut Vec<(NativeStatusSource, StatusUpdate)>,
+        foreground_pid: Option<u32>,
+        owner_alive: impl FnOnce(u32) -> bool,
+    ) -> bool {
+        let reported = updates.iter().any(|(source, update)| {
+            *source == NativeStatusSource::Osc && matches!(update, StatusUpdate::Report(_))
+        });
+        if reported {
+            let terminal_pid = self.terminal_pid;
+            self.program_status_owner =
+                foreground_pid.filter(|pid| *pid != 0 && Some(*pid) != terminal_pid);
+        } else if updates
+            .iter()
+            .any(|(source, _)| *source == NativeStatusSource::HeldProgress)
+            && self
+                .program_status_owner
+                .take_if(|owner| !owner_alive(*owner))
+                .is_some()
+        {
+            for (source, _) in updates.iter_mut() {
+                if *source == NativeStatusSource::HeldProgress {
+                    *source = NativeStatusSource::Progress;
+                }
+            }
+            return true;
+        }
+        updates.retain(|(source, _)| *source != NativeStatusSource::HeldProgress);
+        false
     }
 
     fn flush(&mut self, force: bool) {
@@ -2684,10 +2751,14 @@ mod tests {
         let (status_updates, mut statuses) = async_mpsc::channel(2);
         let mut producer = RuntimeStatusProducer::new(&status_updates, None);
         let samples = Cell::new(0);
-        producer.receive_updates(Vec::new(), || {
-            samples.set(samples.get() + 1);
-            Some(41)
-        });
+        producer.receive_updates(
+            Vec::new(),
+            || {
+                samples.set(samples.get() + 1);
+                Some(41)
+            },
+            |_| true,
+        );
         assert_eq!(samples.get(), 0);
 
         let progress = StatusUpdate::Clear { id: None };
@@ -2701,6 +2772,7 @@ mod tests {
                 samples.set(samples.get() + 1);
                 Some(41)
             },
+            |_| true,
         );
         assert_eq!(samples.get(), 1);
 
@@ -2721,6 +2793,141 @@ mod tests {
                 NativeStatusSource::Osc,
             )
         );
+    }
+
+    #[test]
+    fn held_progress_is_released_only_after_its_reporter_exits() {
+        let (status_updates, mut statuses) = async_mpsc::channel(8);
+        let mut producer = RuntimeStatusProducer::new(&status_updates, None);
+        producer.terminal_pid = Some(10);
+        let progress = legacy_working(40);
+        let held = || (NativeStatusSource::HeldProgress, progress.clone());
+        let report = || {
+            (
+                NativeStatusSource::Osc,
+                osc_report(crate::domain::StatusState::Blocked),
+            )
+        };
+        let clear = || (NativeStatusSource::Osc, StatusUpdate::Clear { id: None });
+
+        // A program (pid 77) reports; the liveness check is not needed yet.
+        assert!(!producer.receive_updates(vec![report()], || Some(77), |_| unreachable!()));
+        assert_eq!(statuses.try_recv().unwrap().source, NativeStatusSource::Osc);
+
+        // While the reporter lives, progress stays held and is dropped.
+        assert!(!producer.receive_updates(vec![held()], || Some(77), |pid| pid == 77));
+        assert!(statuses.try_recv().is_err());
+
+        // A report in the same feed renews the hold even if the old owner left.
+        assert!(!producer.receive_updates(vec![held(), report()], || Some(78), |_| false));
+        assert_eq!(
+            statuses.try_recv().unwrap().updates,
+            vec![osc_report(crate::domain::StatusState::Blocked)]
+        );
+
+        // A clear read after the shell is back in the foreground does not
+        // hand ownership to the shell.
+        assert!(!producer.receive_updates(vec![clear()], || Some(10), |_| unreachable!()));
+        let _ = statuses.try_recv();
+        assert!(!producer.receive_updates(vec![held()], || Some(10), |pid| pid == 78));
+        assert!(statuses.try_recv().is_err());
+
+        // Once the reporter (78) has exited, a later program's progress shows.
+        assert!(producer.receive_updates(vec![held()], || Some(90), |pid| pid != 78));
+        let batch = statuses.try_recv().unwrap();
+        assert_eq!(batch.source, NativeStatusSource::Progress);
+        assert_eq!(batch.updates, vec![progress]);
+    }
+
+    #[test]
+    fn held_progress_from_a_shell_report_waits_for_a_full_reset() {
+        let (status_updates, mut statuses) = async_mpsc::channel(8);
+        let mut producer = RuntimeStatusProducer::new(&status_updates, None);
+        producer.terminal_pid = Some(10);
+        // The terminal's own shell never exits before the terminal, and an
+        // unknown foreground (0 or unavailable) cannot be tracked either.
+        for foreground in [Some(10), Some(0), None] {
+            producer.receive_updates(
+                vec![(
+                    NativeStatusSource::Osc,
+                    osc_report(crate::domain::StatusState::Blocked),
+                )],
+                || foreground,
+                |_| unreachable!(),
+            );
+            let _ = statuses.try_recv();
+            assert!(!producer.receive_updates(
+                vec![(NativeStatusSource::HeldProgress, legacy_working(40))],
+                || Some(90),
+                |_| unreachable!("there is no owner to outlive"),
+            ));
+            assert!(statuses.try_recv().is_err());
+        }
+    }
+
+    /// Regression: a nested Fut client forwards its rollup as OSC 7501 to the
+    /// terminal it runs in and clears it on detach. After it exits, cargo-style
+    /// progress in that terminal must show again without a full reset.
+    #[test]
+    fn progress_shows_after_a_nested_client_that_forwarded_status_exits() {
+        let (status_updates, mut statuses) = async_mpsc::channel(8);
+        let mut terminal = test_terminal(Box::new(std::io::sink()));
+        let mut producer = RuntimeStatusProducer::new(&status_updates, None);
+        producer.terminal_pid = Some(10);
+        let client = 77;
+
+        terminal.vt_write(b"\x1b]7501;state=clear\x1b\\\x1b]7501;state=working:app=fut\x1b\\");
+        producer.receive_updates(terminal.take_status_receipts(), || Some(client), |_| true);
+        terminal.vt_write(b"\x1b]9;4;1;20\x1b\\");
+        assert!(!producer.receive_updates(
+            terminal.take_status_receipts(),
+            || Some(client),
+            |pid| pid == client,
+        ));
+        // Detach clears; by the time it is read the shell may be foreground.
+        terminal.vt_write(b"\x1b]7501;state=clear\x1b\\");
+        producer.receive_updates(terminal.take_status_receipts(), || Some(10), |_| true);
+        while statuses.try_recv().is_ok() {}
+
+        terminal.vt_write(b"\x1b]9;4;1;45\x1b\\");
+        let released =
+            producer.receive_updates(terminal.take_status_receipts(), || Some(10), |_| false);
+        assert!(released);
+        terminal.release_program_status_lock();
+        let batch = statuses.try_recv().unwrap();
+        assert_eq!(batch.source, NativeStatusSource::Progress);
+        assert_eq!(batch.updates, vec![legacy_working(45)]);
+
+        terminal.vt_write(b"\x1b]9;4;1;50\x1b\\");
+        assert_eq!(
+            terminal.take_status_receipts(),
+            vec![(NativeStatusSource::Progress, legacy_working(50))],
+            "the terminal no longer holds progress"
+        );
+    }
+
+    fn legacy_working(progress: u8) -> StatusUpdate {
+        StatusUpdate::Report(crate::domain::StatusReport {
+            id: String::new(),
+            state: crate::domain::StatusState::Working,
+            kind: None,
+            progress: Some(progress),
+            app: None,
+            title: None,
+            message: None,
+        })
+    }
+
+    fn osc_report(state: crate::domain::StatusState) -> StatusUpdate {
+        StatusUpdate::Report(crate::domain::StatusReport {
+            id: String::new(),
+            state,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            message: None,
+        })
     }
 
     #[tokio::test]

@@ -1538,6 +1538,81 @@ done
 }
 
 #[tokio::test]
+async fn osc_9_4_progress_resumes_once_the_osc_7501_program_exits() {
+    // Job control gives each subshell its own foreground process group, as an
+    // interactive shell would. Reporters pause around their reports so the
+    // runtime sees them in the foreground: a report read only after its
+    // program has exited belongs to the shell, which keeps the lockout.
+    let script = r#"
+set -m
+st() { printf '\033]7501;state=%s:app=deploy\033\134' "$1"; }
+wait_for() { while [ ! -e "$1" ]; do sleep 0.02; done; }
+progress() { while [ ! -e "$2" ]; do printf '\033]9;4;1;%s\033\134' "$1"; sleep 0.05; done; }
+( sleep 0.2; st blocked; wait_for step1; progress 20 step2 )
+( progress 45 step3 )
+( sleep 0.2; st done; sleep 0.5 )
+wait_for step4
+( progress 50 step5 )
+exec sleep 30
+"#;
+    let harness = Harness::start(script).await;
+    let cwd = harness.root.path().join("cwd");
+    let harness_ref = &harness;
+    let activity_until =
+        |step: &'static str, condition: fn(&fut::domain::ProgramStatus) -> bool| async move {
+            time::timeout(DEADLINE, async {
+                loop {
+                    let activity = harness_ref.resources().await.sessions[0].workspaces[0].tabs[0]
+                        .panes[0]
+                        .activity
+                        .clone();
+                    if condition(&activity) {
+                        break activity;
+                    }
+                    time::sleep(POLL_INTERVAL).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{step}: program status did not change: {}",
+                    harness_ref.logs()
+                )
+            })
+        };
+
+    activity_until("blocked", |activity| {
+        activity.summary_state() == StatusState::Blocked
+    })
+    .await;
+    // Legacy progress from the live OSC 7501 program is ignored.
+    fs::write(cwd.join("step1"), b"").unwrap();
+    time::sleep(Duration::from_millis(500)).await;
+    let activity = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0]
+        .activity
+        .clone();
+    assert_eq!(activity.root().unwrap().state, StatusState::Blocked);
+    assert_eq!(activity.source, Some(StatusSource::Osc));
+
+    // Once it exits, the next program's progress shows without a reset.
+    fs::write(cwd.join("step2"), b"").unwrap();
+    let activity = activity_until("progress 45", |activity| activity.progress() == Some(45)).await;
+    assert_eq!(activity.records.len(), 1);
+    assert_eq!(activity.source, Some(StatusSource::legacy_progress()));
+
+    // A surviving done result is replaced, as by any new root report.
+    fs::write(cwd.join("step3"), b"").unwrap();
+    activity_until("done", |activity| {
+        activity.summary_state() == StatusState::Done
+    })
+    .await;
+    fs::write(cwd.join("step4"), b"").unwrap();
+    activity_until("progress 50", |activity| activity.progress() == Some(50)).await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn agent_waiters_follow_fresh_work_despite_old_error_and_reject_concurrent_prompt() {
     let binary = env!("CARGO_BIN_EXE_fut");
     let script = format!(

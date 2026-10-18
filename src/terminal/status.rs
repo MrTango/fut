@@ -16,13 +16,17 @@ pub(crate) enum NativeStatusSource {
     Osc,
     /// Root records inferred from legacy OSC 9;4 progress.
     Progress,
+    /// OSC 9;4 progress received after an OSC 7501 report. The runtime turns
+    /// it into `Progress` once that reporter has exited and drops it
+    /// otherwise, so it never reaches the coalescer.
+    HeldProgress,
 }
 
 impl NativeStatusSource {
     pub(crate) fn status_source(self) -> StatusSource {
         match self {
             Self::Osc => StatusSource::Osc,
-            Self::Progress => StatusSource::legacy_progress(),
+            Self::Progress | Self::HeldProgress => StatusSource::legacy_progress(),
         }
     }
 }

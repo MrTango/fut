@@ -93,9 +93,11 @@ fn status_update(report: ProgramStatusReport) -> StatusUpdate {
 #[derive(Default)]
 struct StatusReceipts {
     updates: Vec<(NativeStatusSource, StatusUpdate)>,
-    /// An OSC 7501 report arrived since the last full reset. From then on the
-    /// program speaks the real protocol, and OSC 9;4 progress (often emitted
-    /// alongside it) must not overwrite its kind or message.
+    /// An OSC 7501 report arrived since the last full reset. While that
+    /// program lives it speaks the real protocol, and OSC 9;4 progress (often
+    /// emitted alongside it) must not overwrite its kind or message, so
+    /// progress is held for the runtime, which knows whether the reporter has
+    /// exited. A full reset or the reporter's exit releases it.
     program_status_seen: bool,
     /// Last OSC 9;4 percentage, kept for a pause that omits it.
     progress: Option<u8>,
@@ -103,16 +105,16 @@ struct StatusReceipts {
 
 impl StatusReceipts {
     fn push_progress(&mut self, report: ProgressReport) {
-        if self.program_status_seen {
-            return;
-        }
+        let source = if self.program_status_seen {
+            NativeStatusSource::HeldProgress
+        } else {
+            NativeStatusSource::Progress
+        };
         let state = match report.state {
             ProgressState::Remove => {
                 self.progress = None;
-                self.updates.push((
-                    NativeStatusSource::Progress,
-                    StatusUpdate::Clear { id: None },
-                ));
+                self.updates
+                    .push((source, StatusUpdate::Clear { id: None }));
                 return;
             }
             ProgressState::Set => {
@@ -132,7 +134,7 @@ impl StatusReceipts {
             ProgressState::Error => StatusState::Error,
         };
         self.updates.push((
-            NativeStatusSource::Progress,
+            source,
             StatusUpdate::Report(StatusReport {
                 id: String::new(),
                 state,
@@ -326,12 +328,14 @@ impl GhosttyTerminal {
                 let update = status_update(report);
                 // RIS removes progress just before it clears program status;
                 // the full clear subsumes that legacy removal.
-                let legacy_clear = (
-                    NativeStatusSource::Progress,
-                    StatusUpdate::Clear { id: None },
-                );
                 if update == (StatusUpdate::Clear { id: None })
-                    && receipts.updates.last() == Some(&legacy_clear)
+                    && matches!(
+                        receipts.updates.last(),
+                        Some((
+                            NativeStatusSource::Progress | NativeStatusSource::HeldProgress,
+                            StatusUpdate::Clear { id: None }
+                        ))
+                    )
                 {
                     receipts.updates.pop();
                 }
@@ -444,6 +448,14 @@ impl GhosttyTerminal {
             |_| Vec::new(),
             |mut receipts| std::mem::take(&mut receipts.updates),
         )
+    }
+
+    /// Let OSC 9;4 speak again because the program that sent OSC 7501 has
+    /// exited.
+    pub(super) fn release_program_status_lock(&self) {
+        if let Ok(mut receipts) = self.status_updates.lock() {
+            receipts.program_status_seen = false;
+        }
     }
 
     #[cfg(test)]
@@ -2752,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn program_status_silences_legacy_progress_until_full_reset() {
+    fn program_status_holds_legacy_progress_until_reset_or_release() {
         let mut terminal = terminal(20, 2);
         terminal.vt_write(
             b"\x1b]9;4;1;10\x07\
@@ -2769,15 +2781,40 @@ mod tests {
             .map(|(source, _)| *source)
             .collect::<Vec<_>>();
         // Neither a prompt boundary nor a soft reset re-enables progress.
+        let held = NativeStatusSource::HeldProgress;
         assert_eq!(
             sources,
             [
                 NativeStatusSource::Progress,
                 NativeStatusSource::Osc,
+                held,
+                held,
                 NativeStatusSource::Osc,
+                held,
+                held,
             ]
         );
-        assert_eq!(receipts[2].1, StatusUpdate::PromptStart);
+        assert_eq!(receipts[4].1, StatusUpdate::PromptStart);
+        assert_eq!(receipts[2].1, legacy_root(StatusState::Working, Some(20)));
+
+        // The runtime releases the hold once the reporter has exited.
+        terminal.release_program_status_lock();
+        terminal.vt_write(b"\x1b]9;4;1;25\x07");
+        assert_eq!(
+            terminal.take_status_receipts(),
+            vec![(
+                NativeStatusSource::Progress,
+                legacy_root(StatusState::Working, Some(25))
+            )]
+        );
+        terminal.vt_write(b"\x1b]7501;state=clear\x07\x1b]9;4;1;35\x07");
+        assert_eq!(
+            terminal.take_status_receipts(),
+            vec![
+                (NativeStatusSource::Osc, StatusUpdate::Clear { id: None }),
+                (held, legacy_root(StatusState::Working, Some(35))),
+            ]
+        );
 
         terminal.vt_write(b"\x1bc\x1b]9;4;1;30\x07");
         assert_eq!(

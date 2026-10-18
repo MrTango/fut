@@ -90,11 +90,19 @@ status, tab and workspace progress, and error attention. Explicit OSC 7501
 and CLI reports take precedence: they replace the inferred record, OSC 9;4 is
 ignored while an explicit reporter owns the terminal, and `9;4;0` only removes
 what OSC 9;4 created. Once a program sends any OSC 7501 report, Fut ignores
-OSC 9;4 in that terminal until a full reset (RIS), so legacy progress emitted
-alongside the real protocol cannot overwrite a blocked kind or message. A new
-prompt or the exit of the foreground program that sent it ends inferred
-working progress; an inferred error stays, like any error, until `9;4;0` or
-new progress replaces it.
+OSC 9;4 in that terminal until that program exits or a full reset (RIS), so
+legacy progress emitted alongside the real protocol cannot overwrite a blocked
+kind or message. A new prompt or a soft reset does not end this. The program
+is the foreground process that sent the report, as for its records; when the
+terminal's own shell reports, only RIS ends it, and a report Fut reads only
+after its program has already exited counts as the shell's. Sending `state=clear` does
+not make a program the reporter, so an attached Fut client forwarding its
+status (including `fut --machine` over SSH) releases the terminal when it
+exits. Progress after that exit treats a surviving `done` or `error` root
+like any new root report does: it replaces it, and result children stay. A
+new prompt or the exit of the foreground program that sent OSC 9;4 ends
+inferred working progress; an inferred error stays, like any error, until
+`9;4;0` or new progress replaces it.
 
 Programs running inside Fut receive scoped `FUT_SESSION_ID`, `FUT_WORKSPACE_ID`,
 `FUT_TAB_ID`, `FUT_PANE_ID`, and `FUT_TERMINAL_ID` environment variables. These

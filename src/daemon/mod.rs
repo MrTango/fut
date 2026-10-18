@@ -4,7 +4,7 @@ mod git;
 mod lease;
 pub mod path;
 mod presence;
-mod process;
+pub(crate) mod process;
 mod recipe;
 
 pub mod autostart;

@@ -1,6 +1,6 @@
 /// Verify inherited terminal context against the live process tree. A desktop
 /// app can inherit FUT_* while being reparented outside the terminal's tree.
-pub(super) fn is_descendant(pid: u32, ancestor: u32) -> bool {
+pub(crate) fn is_descendant(pid: u32, ancestor: u32) -> bool {
     lineage(pid, ancestor).is_some()
 }
 

@@ -4488,6 +4488,84 @@ mod tests {
     }
 
     #[test]
+    fn legacy_progress_after_an_exited_reporter_treats_its_result_like_a_new_report() {
+        use crate::domain::StatusState;
+
+        // After a 7501 program exits, its done or error result survives. Later
+        // OSC 9;4 progress replaces that result exactly as a new explicit root
+        // report would: the root is replaced, result children stay.
+        for result in [StatusState::Done, StatusState::Error] {
+            let mut trees = [StatusSource::Osc, StatusSource::legacy_progress()].map(|source| {
+                let mut tree = ResourceTree::default();
+                let path = initial("build", "/build");
+                let terminal_id = path.terminal_id;
+                tree.create_session(path).unwrap();
+                for id in ["", "result"] {
+                    tree.apply_automatic_status_update(
+                        terminal_id,
+                        StatusUpdate::Report(status_report(id, result)),
+                        StatusSource::Osc,
+                        77,
+                        10,
+                    )
+                    .unwrap();
+                }
+                (tree, terminal_id, source)
+            });
+            // While the reporter's lease is live, legacy progress is ignored.
+            let (tree, terminal_id, source) = &mut trees[1];
+            let before = tree.program_status(*terminal_id).unwrap().clone();
+            tree.apply_status_updates(
+                *terminal_id,
+                vec![StatusUpdate::Report(status_report(
+                    "",
+                    StatusState::Working,
+                ))],
+                source.clone(),
+                11,
+            )
+            .unwrap();
+            assert_eq!(tree.program_status(*terminal_id).unwrap(), &before);
+
+            for (tree, terminal_id, source) in &mut trees {
+                tree.release_automatic_status_owner(*terminal_id, 77)
+                    .unwrap();
+                tree.apply_status_updates(
+                    *terminal_id,
+                    vec![StatusUpdate::Report(StatusReport {
+                        progress: Some(45),
+                        ..status_report("", StatusState::Working)
+                    })],
+                    source.clone(),
+                    12,
+                )
+                .unwrap();
+                let status = tree.program_status(*terminal_id).unwrap();
+                assert_eq!(status.root().unwrap().state, StatusState::Working);
+                assert_eq!(status.root().unwrap().progress, Some(45));
+                assert_eq!(status.records.len(), 2);
+                assert_eq!(status.records[1].id, "result");
+                assert_eq!(status.records[1].state, result);
+            }
+
+            // OSC 9;4;0 then retracts only its own root; the replaced result
+            // does not come back.
+            let (tree, terminal_id, source) = &mut trees[1];
+            tree.apply_status_updates(
+                *terminal_id,
+                vec![StatusUpdate::Clear { id: None }],
+                source.clone(),
+                13,
+            )
+            .unwrap();
+            let status = tree.program_status(*terminal_id).unwrap();
+            assert!(status.root().is_none());
+            assert_eq!(status.records.len(), 1);
+            assert_eq!(status.records[0].id, "result");
+        }
+    }
+
+    #[test]
     fn status_clears_do_not_claim_ownership_and_full_clear_releases_it() {
         let mut tree = ResourceTree::default();
         let path = initial("agent", "/agent");
