@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Forward Fut's status rollup to the terminal Fut runs in as OSC 7501, so Ghostty or an outer Fut shows working, blocked, done, and error status for every Fut terminal. Fut sends it only after the terminal answers the support query, clears it on detach, and can be forced on or off with `alerts.outer_terminal_status`.
+
 ## 0.37
 
 - Keep the navigator, notifications, and agents dialogs on the selected row and scroll position across updates when a remote machine is configured; remote rows and machine headers no longer snap back to the top.

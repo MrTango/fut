@@ -64,13 +64,20 @@ from coding-agent lifecycle notifications:
 
 ```toml
 [alerts]
-signal_outer_terminal = true # Optional; default false.
+signal_outer_terminal = true   # Optional; default false.
+outer_terminal_status = "auto" # "auto" (default), "always", or "never".
 ```
 
 `signal_outer_terminal` is client-local and emits one BEL when a newly unseen
 terminal bell arrives; whether that BEL is audible, visual, or ignored remains
 under the containing terminal emulator's control. It is deliberately off by
 default.
+
+`outer_terminal_status` controls whether the client forwards its program-status
+rollup to the containing terminal as OSC 7501. `auto` sends only after that
+terminal answers the support query; `always` skips the query, for passthrough
+setups that cannot answer; `never` turns forwarding off. See
+[forwarding status to the outer terminal](agents.md#forward-status-to-the-outer-terminal).
 
 ## Remote image-path uploads
 

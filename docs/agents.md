@@ -95,6 +95,51 @@ fut agent skill
 The printed `SKILL.md` is bundled with the binary, so its instructions match the
 installed Fut release.
 
+## Forward status to the outer terminal
+
+An attached Fut client reports its own rollup to the terminal it runs in,
+using the same protocol. A terminal that supports OSC 7501, such as Ghostty or
+another Fut, then shows what every Fut terminal is doing. Running Fut inside a
+Fut terminal (including `fut --machine` over SSH) shows the inner Fut as one
+program with a child per busy terminal:
+
+```text
+root          app=fut   state=blocked  msg="proj/main/claude: Apply changes?"
+fPq...Yw      app=claude-code  state=blocked  title="proj/main/claude"
+fX2...0Q      app=cargo        state=working  progress=40  title="proj/main/build"
+```
+
+- **Negotiation.** The client sends `OSC 7501 ; ? ST` when it starts and
+  reports nothing until the terminal answers. Terminals that do not support the
+  protocol, and multiplexers such as tmux that do not forward the reply, get
+  nothing beyond that query. Set `alerts.outer_terminal_status = "always"` to
+  skip the query, or `"never"` to turn forwarding off; see
+  [configuration](configuration.md).
+- **Records.** Each Fut terminal whose status is working, blocked, done, or
+  error gets one child whose id is the terminal's compact ID. Idle terminals
+  are left out. A child carries that terminal's state, blocked kind, progress,
+  and program app; its title is the `session/workspace/tab` location, prefixed
+  by the machine label when several machines are configured; its message joins
+  the program's title and message. The root has `app=fut`, the strongest child
+  state (blocked, then error, working, done), that child's kind and
+  `location: message`, and progress when exactly one child is working or
+  blocked. Done is forwarded whether or not you have seen it inside Fut, so the
+  outer terminal tracks its own read state. At most 64 children are sent,
+  strongest first. The terminal running the client itself is never included.
+- **Ownership.** While attached, the client owns the outer terminal's status
+  records. Its first report starts with `state=clear`, which also removes
+  records a crashed client left behind. When nothing is busy it sends
+  `state=clear` instead of a done report, and detaching or exiting clears
+  everything. Switching machines and remote reconnects keep the same client,
+  so its records refresh rather than clear. A client killed with `SIGKILL`
+  cannot clear: the outer terminal drops its working and blocked records when
+  the process exits, but done and error stay until a new client claims the
+  terminal or something sends `state=clear`. The client's alternate screen
+  does not affect the records.
+- **Rate.** Only changes are sent: changed records, removed children cleared
+  by id, root last. Changes go out at most every 100 ms and progress-only
+  changes at most every 500 ms.
+
 ## Legacy plugin fallbacks
 
 Current releases of Claude Code (2.1.295 and later), Codex, and Pi (1.1.0 and
