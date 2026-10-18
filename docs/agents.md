@@ -183,13 +183,11 @@ for older agent versions:
 - [Codex](agents/codex.md)
 - [Pi](agents/pi.md)
 
-The Claude Code and Codex plugins call `fut agent report`, so they work only
-inside Fut. Pi's extension writes OSC 7501 to Pi's terminal, so it works in any
-terminal that implements the protocol, including over SSH, and falls back to
-`fut agent report` when Pi has no terminal. None of them reach Fut from inside
-tmux, which drops OSC 7501 and runs outside the Fut terminal's process tree.
-All feed the same status records as native OSC 7501, so installing a plugin
-alongside a native reporter is harmless but unnecessary. One exception
+The plugins call `fut agent report`, so they work only inside Fut. They do
+not reach Fut from inside tmux, which runs outside the Fut terminal's process
+tree and also drops OSC 7501. All feed the same status records as native
+OSC 7501, so installing a plugin alongside a native reporter is harmless but
+unnecessary. One exception
 remains: Codex does not report turn completion over OSC 7501, so its
 documented `notify` command setting is still the way to get completion
 attention. Screen-based Codex detection exists as a lower-priority
