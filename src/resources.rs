@@ -1327,6 +1327,7 @@ impl ResourceTree {
     pub(crate) fn has_detection_status(
         &self,
         terminal_id: TerminalId,
+        detector: &str,
     ) -> Result<bool, ResourceError> {
         let pane_id = self
             .terminals
@@ -1334,7 +1335,7 @@ impl ResourceTree {
             .ok_or(ResourceError::NotFound("terminal"))?;
         self.panes
             .get(pane_id)
-            .map(|pane| pane.status_bookkeeping.has_detection())
+            .map(|pane| pane.status_bookkeeping.has_detection(detector))
             .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))
     }
 
@@ -4239,7 +4240,7 @@ mod tests {
             agent: "codex".into(),
             rule: "screen".into(),
         };
-        assert!(!tree.has_detection_status(terminal_id).unwrap());
+        assert!(!tree.has_detection_status(terminal_id, "codex").unwrap());
 
         tree.apply_status_report(
             terminal_id,
@@ -4269,7 +4270,7 @@ mod tests {
             13,
         )
         .unwrap();
-        assert!(tree.has_detection_status(terminal_id).unwrap());
+        assert!(tree.has_detection_status(terminal_id, "codex").unwrap());
 
         let takeover_revision = tree
             .apply_status_report(
@@ -4286,7 +4287,7 @@ mod tests {
         assert!(status.records.iter().any(|record| record.id == "result"));
         assert!(status.records.iter().any(|record| record.id == "new-child"));
         let owned = status.clone();
-        assert!(!tree.has_detection_status(terminal_id).unwrap());
+        assert!(!tree.has_detection_status(terminal_id, "codex").unwrap());
         for update in [
             StatusUpdate::ProcessExit,
             StatusUpdate::PromptStart,
@@ -4314,7 +4315,7 @@ mod tests {
         assert!(status.records.iter().any(|record| record.id == "result"));
         assert!(matches!(status.source, Some(StatusSource::Report { .. })));
         assert!(status.is_reporting());
-        assert!(tree.has_detection_status(terminal_id).unwrap());
+        assert!(tree.has_detection_status(terminal_id, "codex").unwrap());
 
         tree.clear_status(terminal_id, Some("result")).unwrap();
         let status = tree.program_status(terminal_id).unwrap();
@@ -4328,7 +4329,162 @@ mod tests {
         );
         tree.drop_transient_status(terminal_id, 16).unwrap();
         assert!(tree.program_status(terminal_id).unwrap().records.is_empty());
-        assert!(!tree.has_detection_status(terminal_id).unwrap());
+        assert!(!tree.has_detection_status(terminal_id, "codex").unwrap());
+    }
+
+    #[test]
+    fn legacy_progress_is_a_weak_root_that_retracts_only_itself() {
+        use crate::domain::{BlockedKind, StatusState};
+
+        let mut tree = ResourceTree::default();
+        let path = initial("build", "/build");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let cli = StatusSource::Report {
+            source: Some("pi".into()),
+            agent_session_id: None,
+        };
+        let progress = |state, progress| {
+            StatusUpdate::Report(StatusReport {
+                progress,
+                ..status_report("", state)
+            })
+        };
+        let legacy = |tree: &mut ResourceTree, update| {
+            tree.apply_status_updates(
+                terminal_id,
+                vec![update],
+                StatusSource::legacy_progress(),
+                0,
+            )
+            .unwrap()
+        };
+
+        tree.apply_status_report(
+            terminal_id,
+            status_report("result", StatusState::Done),
+            cli.clone(),
+            10,
+        )
+        .unwrap();
+        tree.apply_status_updates(
+            terminal_id,
+            vec![StatusUpdate::PromptStart],
+            StatusSource::Osc,
+            11,
+        )
+        .unwrap();
+        legacy(&mut tree, progress(StatusState::Working, Some(40)));
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.root().unwrap().state, StatusState::Working);
+        assert_eq!(status.progress(), Some(40));
+        assert!(!tree.has_detection_status(terminal_id, "codex").unwrap());
+
+        // OSC 9;4;0 removes the inferred root, never the explicit result.
+        legacy(&mut tree, StatusUpdate::Clear { id: None });
+        let status = tree.program_status(terminal_id).unwrap();
+        assert!(status.root().is_none());
+        assert_eq!(status.records.len(), 1);
+
+        // An explicit blocked report replaces the inferred root, and its
+        // lease keeps later legacy progress from erasing the kind or message.
+        legacy(&mut tree, progress(StatusState::Working, None));
+        tree.apply_status_report(
+            terminal_id,
+            StatusReport {
+                kind: Some(BlockedKind::Permission),
+                message: Some("Apply?".into()),
+                ..status_report("", StatusState::Blocked)
+            },
+            cli,
+            12,
+        )
+        .unwrap();
+        let blocked = tree.program_status(terminal_id).unwrap().clone();
+        for update in [
+            progress(StatusState::Working, Some(90)),
+            StatusUpdate::Clear { id: None },
+        ] {
+            legacy(&mut tree, update);
+            assert_eq!(tree.program_status(terminal_id).unwrap(), &blocked);
+        }
+
+        // Prompt boundaries clear inferred work like any transient record,
+        // while an inferred error stays until legacy progress retracts it.
+        tree.apply_status_updates(
+            terminal_id,
+            vec![StatusUpdate::PromptStart],
+            StatusSource::Osc,
+            13,
+        )
+        .unwrap();
+        legacy(&mut tree, progress(StatusState::Working, Some(10)));
+        tree.apply_status_updates(
+            terminal_id,
+            vec![StatusUpdate::PromptStart],
+            StatusSource::Osc,
+            14,
+        )
+        .unwrap();
+        assert!(tree.program_status(terminal_id).unwrap().root().is_none());
+        legacy(&mut tree, progress(StatusState::Error, Some(10)));
+        tree.apply_status_updates(
+            terminal_id,
+            vec![StatusUpdate::PromptStart],
+            StatusSource::Osc,
+            15,
+        )
+        .unwrap();
+        let status = tree.program_status(terminal_id).unwrap();
+        assert_eq!(status.root().unwrap().state, StatusState::Error);
+        assert!(status.has_unread_attention());
+        legacy(&mut tree, StatusUpdate::Clear { id: None });
+        assert!(tree.program_status(terminal_id).unwrap().root().is_none());
+    }
+
+    #[test]
+    fn legacy_progress_ends_with_its_foreground_owner() {
+        use crate::domain::StatusState;
+
+        let mut tree = ResourceTree::default();
+        let path = initial("build", "/build");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        let progress = |state| StatusUpdate::Report(status_report("", state));
+
+        tree.apply_automatic_status_update(
+            terminal_id,
+            progress(StatusState::Working),
+            StatusSource::legacy_progress(),
+            77,
+            10,
+        )
+        .unwrap();
+        assert_eq!(tree.automatic_status_owners(), vec![(terminal_id, 77)]);
+        tree.release_automatic_status_owner(terminal_id, 77)
+            .unwrap();
+        assert!(tree.program_status(terminal_id).unwrap().records.is_empty());
+        assert!(tree.automatic_status_owners().is_empty());
+
+        tree.apply_automatic_status_update(
+            terminal_id,
+            progress(StatusState::Error),
+            StatusSource::legacy_progress(),
+            78,
+            11,
+        )
+        .unwrap();
+        tree.release_automatic_status_owner(terminal_id, 78)
+            .unwrap();
+        assert_eq!(
+            tree.program_status(terminal_id)
+                .unwrap()
+                .root()
+                .unwrap()
+                .state,
+            StatusState::Error
+        );
+        assert!(tree.automatic_status_owners().is_empty());
     }
 
     #[test]

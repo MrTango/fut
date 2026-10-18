@@ -440,6 +440,18 @@ pub enum StatusSource {
 }
 
 impl StatusSource {
+    /// Weak provenance for root records inferred from legacy ConEmu-style
+    /// OSC 9;4 progress. It reuses the detection shape so the frozen remote
+    /// contract needs no new enum case, and so it inherits detection's
+    /// precedence: explicit OSC 7501 and CLI reports always win.
+    #[must_use]
+    pub fn legacy_progress() -> Self {
+        Self::Detection {
+            agent: "progress".into(),
+            rule: "osc_9_4".into(),
+        }
+    }
+
     fn is_explicit(&self) -> bool {
         !matches!(self, Self::Detection { .. })
     }
@@ -825,7 +837,13 @@ impl ProgramStatus {
                     bookkeeping.sync(self);
                 }
                 StatusUpdate::Clear { id } => {
-                    let removed = self.remove_subtree(id.as_deref(), &mut bookkeeping.lru);
+                    // A weak source only retracts what it inferred itself.
+                    let removed = match source.as_ref().filter(|_| detection) {
+                        Some(source) => {
+                            self.remove_inferred_subtree(id.as_deref(), source, bookkeeping)
+                        }
+                        None => self.remove_subtree(id.as_deref(), &mut bookkeeping.lru),
+                    };
                     changed |= removed;
                     bookkeeping.sync(self);
                 }
@@ -867,7 +885,7 @@ impl ProgramStatus {
             .iter()
             .filter_map(|(id, origin)| {
                 (origin.automatic_pid == Some(automatic_pid)
-                    && bookkeeping.active_explicit_ids.contains(id))
+                    && bookkeeping.owner_releases(id, origin))
                 .then_some(id.clone())
             })
             .collect::<BTreeSet<_>>();
@@ -992,20 +1010,35 @@ impl ProgramStatus {
         true
     }
 
+    fn remove_inferred_subtree(
+        &mut self,
+        id: Option<&str>,
+        source: &StatusSource,
+        bookkeeping: &mut StatusBookkeeping,
+    ) -> bool {
+        let target = id.unwrap_or_default();
+        let inferred = bookkeeping
+            .origins
+            .iter()
+            .filter(|(record_id, origin)| {
+                &origin.source == source && status_subtree_contains(target, record_id)
+            })
+            .map(|(record_id, _)| record_id.clone())
+            .collect::<BTreeSet<_>>();
+        let before = self.records.len();
+        self.records.retain(|record| !inferred.contains(&record.id));
+        let changed = self.records.len() != before;
+        if changed {
+            bookkeeping.sync(self);
+        }
+        changed
+    }
+
     fn remove_subtree(&mut self, id: Option<&str>, lru: &mut Vec<String>) -> bool {
         let id = id.unwrap_or_default();
         let before = self.records.len();
-        if id.is_empty() {
-            self.records.clear();
-        } else {
-            self.records.retain(|record| {
-                record.id != id
-                    && !record
-                        .id
-                        .strip_prefix(id)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-            });
-        }
+        self.records
+            .retain(|record| !status_subtree_contains(id, &record.id));
         let changed = self.records.len() != before;
         if changed {
             self.sync_lru(lru);
@@ -1060,16 +1093,24 @@ impl StatusBookkeeping {
         }
     }
 
-    pub(crate) fn has_detection(&self) -> bool {
-        self.origins
-            .values()
-            .any(|origin| !origin.source.is_explicit())
+    pub(crate) fn has_detection(&self, detector: &str) -> bool {
+        self.origins.values().any(|origin| {
+            matches!(&origin.source, StatusSource::Detection { agent, .. } if agent == detector)
+        })
+    }
+
+    /// Whether the record's foreground-process owner releases it on exit:
+    /// explicit records while their lease is active, and inferred records
+    /// (legacy progress), which have no lease of their own.
+    fn owner_releases(&self, id: &str, origin: &StatusOrigin) -> bool {
+        self.active_explicit_ids.contains(id) || !origin.source.is_explicit()
     }
 
     pub(crate) fn automatic_pids(&self) -> BTreeSet<u32> {
-        self.active_explicit_ids
+        self.origins
             .iter()
-            .filter_map(|id| self.origins.get(id)?.automatic_pid)
+            .filter(|(id, origin)| self.owner_releases(id, origin))
+            .filter_map(|(_, origin)| origin.automatic_pid)
             .collect()
     }
 
@@ -1131,6 +1172,16 @@ impl StatusBookkeeping {
             .find(eligible)
             .map(|origin| origin.source.clone())
     }
+}
+
+/// Whether `id` lies in the subtree rooted at `target`; the empty target is
+/// the whole tree.
+fn status_subtree_contains(target: &str, id: &str) -> bool {
+    target.is_empty()
+        || id == target
+        || id
+            .strip_prefix(target)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn validate_status_id(id: &str) -> Result<(), &'static str> {

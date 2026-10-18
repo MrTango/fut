@@ -240,7 +240,13 @@ fn status_lifecycle_transitions(
             StatusUpdate::Clear { id } => {
                 let removed = states
                     .keys()
-                    .filter(|record_id| status_clear_matches(id.as_deref(), record_id))
+                    .filter(|record_id| {
+                        // A weak clear only retracts inferred records, so an
+                        // explicit record that survived it was not removed.
+                        status_clear_matches(id.as_deref(), record_id)
+                            && !(detection
+                                && after.records.iter().any(|record| &record.id == *record_id))
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 for record_id in removed {
@@ -2347,7 +2353,7 @@ async fn refresh_process_names(
                 state.apply_status_updates(terminal_id, vec![StatusUpdate::Report(report)], source);
         } else if state
             .resources
-            .has_detection_status(terminal_id)
+            .has_detection_status(terminal_id, "codex")
             .unwrap_or(false)
         {
             let _ = state.apply_status_updates(
