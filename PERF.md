@@ -313,8 +313,8 @@ backpressure were not measured by these microbenchmarks.
 
 Scrolling shifts every row, so the current row diff falls back to full
 screens. The measured plain 508x160 screen is 163 KB and takes 1.9 ms to
-decode. Scroll-aware deltas followed in Round 8; row-chunked screens remain
-follow-up work, and client draw cost at these sizes is not yet measured.
+decode. Scroll-aware deltas followed in Round 8 and row-chunked screens in
+Round 9; client draw cost at these sizes is not yet measured.
 
 ### Round 8 (2026-10-19): row-shift deltas (lsc-9ea8)
 
@@ -355,8 +355,8 @@ At 508x160 a scrolled frame is 4.2 KB and 53 µs to decode instead of 163 KB
 and 1.5 ms; a wheel step is 3.2 KB and 45 µs. Frame size now tracks the rows
 a frame exposes. The saturating flood is unchanged by design: `seq` writes
 about 4,500 lines per 8 ms publication, more than the grid holds, so every
-frame is new content and a full screen is the right message (lsc-78c8 covers
-chunking those). Latency at 200x50 was unchanged: typing p50/p95 0.5/0.6 ms on
+frame is new content and a full screen is the right message (Round 9 chunks
+those above one frame). Latency at 200x50 was unchanged: typing p50/p95 0.5/0.6 ms on
 both, burst 8.5/8.8 ms (branch) vs 8.6/8.7 ms (main).
 
 `benches/render.rs` `delta` group, branch only (load ~11). `produce` builds
@@ -385,6 +385,95 @@ daemon's visible screen after each step; 19/19 matched on both builds):
 `vim` `ctrl+e`/`ctrl+y` ×30 38–42 KiB vs 588–590 KiB. Page jumps (`space`,
 `b`, `ctrl+f`, `ctrl+b`) and `seq` stay full screens on both. Copy-mode screens
 are still sent whole.
+
+### Round 9 (2026-10-19): row-range chunked screens (lsc-78c8)
+
+A screen was one frame, so the visible grid was capped at 150,000 cells: the
+worst-case screen encoding (48 bytes per fully styled, selected, hyperlinked
+32-byte cell, plus a 512 KiB hyperlink table and 1,024 image placements) had
+to fit the 8 MiB `MAX_FRAME_LEN`. A full screen, copy-mode screen, or delta
+whose rows hold more than `MAX_VISIBLE_CELLS` (150,000) cells now travels as
+`screen_begin` (everything but the rows), `screen_rows` frames of at most
+150,000 cells each, spread evenly, and `screen_end`, all tied to one revision.
+The writer splits a screen only after taking it off the connection's queue
+and writes the whole sequence before anything else, so coalescing still
+replaces whole screens and sequences never interleave; `last_sent` is what the
+client assembles. The client (`protocol::chunked::ScreenAssembler`) presents a
+screen only at its end, drops a partial screen when a newer one for that
+terminal begins, and refreshes after a malformed sequence. Screens within
+150,000 cells are sent exactly as before.
+
+The grid limit is now a memory bound, Ghostty-style: each dimension is bounded
+only by its `u16` (65,535; one worst-case row of that width encodes to 3.1 MB,
+so any row fits a frame), and the total by `MAX_GRID_CELLS` = 2^20 cells, 40
+MiB per in-memory copy, which covers an 8K display at 4x8-pixel cells
+(1920x540). A worst-case 1000x300 screen splits into two 7.2 MB row chunks.
+Remote peers negotiate `chunked-screens.v1`; without it they keep 150,000
+cells (50,000 without `large-screens.v1`), and a larger terminal shared with a
+bigger client reaches them cropped to its top-left corner until their own
+resize shrinks it.
+
+Host: macOS/aarch64, 10 cores, release builds of `main` (d994c4a) and the
+branch built from the same tree and run back to back twice, load 3–14 (other
+agents' builds). `mise run perf:e2e`-equivalent runs (`perf_client`, fresh
+disposable daemon per scenario); both runs agree, the second is shown:
+
+| Scenario | Grid | main: delta / full, wire, decode | branch: delta / full, wire, decode |
+| --- | --- | ---: | ---: |
+| flood | 200x50 | 1 / 19, 0.4 MiB, 3.6 ms | 1 / 19, 0.4 MiB, 3.6 ms |
+| flood | 508x160 | 1 / 19, 2.9 MiB, 29.6 ms | 1 / 19, 2.9 MiB, 28.9 ms |
+| scroll | 200x50 | 410 / 0, 0.7 MiB, 11.4 ms | 418 / 0, 0.7 MiB, 12.3 ms |
+| scroll | 508x160 | 408 / 0, 1.6 MiB, 19.2 ms | 403 / 0, 1.6 MiB, 19.3 ms |
+| wheel up / down | 508x160 | 60 / 0 each, 2.4 / 2.3 ms | 60 / 0 each, 2.4 / 2.4 ms |
+| typing p50 / p95 | 200x50 | 0.4 / 1.2 ms | 0.4 / 1.0 ms |
+| typing p50 / p95 | 508x160 | 2.2 / 3.2 ms | 2.2 / 3.4 ms |
+| burst p50 / p95 | 508x160 | 10.8 / 13.0 ms | 10.7 / 13.0 ms |
+
+No frame was chunked at either size, and the largest frames were identical
+(20,103 and 162,668 bytes). `main` rejects 508x320 (`invalid_size`); the
+branch above the old cap, every materialized grid matching a fresh refresh:
+
+| Scenario | Grid | delta / full | chunked screens | wire | largest frame | decode total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| flood | 508x320 | 1 / 19 | 19 | 6.0 MiB | 164 KB | 60 ms |
+| styled flood | 508x320 | 1 / 25 | 25 | 9.0 MiB | 188 KB | 88 ms |
+| scroll | 508x320 | 402 / 0 | 0 | 1.6 MiB | 5.3 KB | 20 ms |
+| wheel, each direction | 508x320 | 60 / 0 | 0 | 0.2 MiB | 3.2 KB | 2.3 ms |
+| flood | 1000x300 | 1 / 20 | 20 | 11.5 MiB | 302 KB | 118 ms |
+| scroll | 1000x300 | 401 / 0 | 0 | 3.1 MiB | 16 KB | 36 ms |
+
+Typing at 508x320 is 4.2 / 10.5 ms p50 / p95 (the row diff walks twice the
+rows); scrolling stays proportional to exposed rows because shifts apply at
+any size. Full screens cost ~3 ms to decode per 160k cells, as before.
+
+`benches/render.rs` `delta` group, `main` vs branch back to back (load ~5);
+`produce` now includes the writer's split check:
+
+| Case | main produce / rows / apply | branch produce / rows / apply |
+| --- | ---: | ---: |
+| type 200x50 | 44.6 / 44.6 / 4.9 µs | 43.8 / 43.9 / 4.8 µs |
+| flood 200x50 | 124 / 121 / 195 µs | 124 / 122 / 195 µs |
+| scroll4 200x50 | 122 / 121 / 35 µs | 122 / 124 / 35 µs |
+| type 508x160 | 348 / 352 / 11.0 µs | 343 / 343 / 10.9 µs |
+| flood 508x160 | 0.93 / 0.92 / 1.55 ms | 0.94 / 0.93 / 1.54 ms |
+| scroll4 508x160 | 0.89 / 0.92 / 0.18 ms | 0.89 / 0.93 / 0.18 ms |
+| pager half page 508x160 | 1.20 / 0.92 / 0.97 ms | 1.18 / 0.92 / 0.97 ms |
+| flood 508x320 (4 frames) | rejected | 2.14 / 2.12 / 3.21 ms |
+| scroll4 508x320 | rejected | 1.80 / 2.13 / 0.39 ms |
+
+`scale` group (dense truecolor, branch): 508x320 is a 1.95 MB screen in 4
+frames (largest 977 KB): feed 38.5 ms, encode 3.4 ms, decode and assemble
+10.9 ms, clone 0.43 ms; 1000x300 is 3.6 MB in 4 frames: 69.3 / 6.5 / 20.8 /
+0.81 ms. Splitting adds no measurable cost over a single frame of the same
+cells (833x180, one frame: 2.96 ms encode, 11.1 ms decode for 1.8 MB).
+
+A real client in a 508x320 PTY (pane 508x319, 162,052 cells; pyte-rendered,
+compared row by row with the daemon's visible screen after each step) matched
+19/19 steps (`seq`, `yes`, `less` paging, `vim`, `top`); a full screen is two
+164 KB chunks. The same at 200x50 matched 19/19 with no chunks. A new client
+attaching through the stdio bridge as a remote peer at 508x320 matched 6/6;
+the `main` client as a remote peer is rejected at 508x320 exactly as against
+a `main` daemon, and at 200x50 matched 19/19.
 
 ### External multiplexer baseline (2026-08-10)
 
