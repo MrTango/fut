@@ -212,13 +212,9 @@ argv = ["./run"]
         client.wait_for("REMOTE_READY").await;
         client.send(b"ping\r");
         client.wait_for("REMOTE:ping").await;
-        // All of these used to resolve workspace roots/config in the client.
+        // Project opening must not resolve the remote workspace root in the client.
         client.send(b"\x02S");
         client.wait_for("project opener unavailable").await;
-        client.send(b"\x02:");
-        client.send(b"Remote attack");
-        client.send(b"\r");
-        client.wait_for("commands unavailable").await;
         client.send(b"\x02d");
         client.wait_success().await;
         assert_ssh_reaped(root.path()).await;
@@ -230,6 +226,184 @@ argv = ["./run"]
         assert!(!root.path().join("must-not-be-created").exists());
     }
     assert_ssh_arguments(root.path(), "clonk", 4, true);
+    assert!(matches!(
+        harness.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_configured_commands_use_remote_context_forms_input_and_activation() {
+    let harness = Harness::start_with("printf 'COMMAND_HOST_READY\\r\\n'; while IFS= read -r line; do printf 'HOST:%s\\r\\n' \"$line\"; done", |root| {
+        let extension = root.join("remote-commands");
+        fs::create_dir_all(extension.join("opened")).unwrap();
+        fs::write(extension.join("fut-extension.toml"), r#"
+api_version = 1
+version = '1.0.0'
+fut = '>=0.8.0, <1.0.0'
+id = 'remote-probe'
+capabilities = ['commands']
+[commands.interactive]
+title = 'Remote interactive probe'
+argv = ['./probe']
+activate_opened = true
+[[commands.interactive.fields]]
+name = 'command'
+label = 'Remote command'
+default_config = 'command'
+[[commands.interactive.fields]]
+name = 'prompt'
+label = 'Remote prompt'
+[commands.background]
+title = 'Remote background probe'
+argv = ['./probe']
+mode = 'background'
+"#).unwrap();
+        let probe = extension.join("probe");
+        fs::write(&probe, format!(r#"#!/bin/sh
+printf 'SOCKET=%s\nROOT=%s\nCWD=%s\nFORM=%s\n' "$FUT_SOCKET" "$FUT_EXTENSION_ROOT" "$PWD" "$FUT_EXTENSION_FORM" > "$FUT_EXTENSION_ROOT/$FUT_EXTENSION_COMMAND.context"
+printf '%s\n' "$*" > "$FUT_EXTENSION_ROOT/$FUT_EXTENSION_COMMAND.args"
+if [ "$FUT_EXTENSION_COMMAND" = background ]; then exit 0; fi
+printf 'REMOTE_COMMAND_INPUT_READY\r\n'
+IFS= read -r input
+printf '%s\n' "$input" > "$FUT_EXTENSION_ROOT/input"
+exec '{}' --socket "$FUT_SOCKET" open --background "$FUT_EXTENSION_ROOT/opened" --name activated -- /bin/sh -c "printf 'REMOTE_COMMAND_ACTIVATED\\r\\n'; while IFS= read -r line; do printf 'ACTIVATED:%s\\r\\n' \"\$line\"; done"
+"#, env!("CARGO_BIN_EXE_fut"))).unwrap();
+        fs::set_permissions(probe, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.join("home/.config/fut/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(config, format!("extensions = [{:?}]\n[extension.remote-probe]\ncommand = ['remote-default']\n", extension.to_str().unwrap())).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", root.join("home/trusted-probe")).unwrap();
+    }).await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let extension = harness
+        .root
+        .path()
+        .join("remote-commands")
+        .canonicalize()
+        .unwrap();
+    let cwd = harness.root.path().join("cwd").canonicalize().unwrap();
+    let before = harness.resources().await;
+    let config = root.path().join("config.toml");
+    // No local extension installation: the binding and form must use the remote catalog.
+    // A conflicting local default must not replace the remote extension's configuration.
+    fs::write(&config, r#"
+[ui.bindings]
+'remote-probe:interactive' = 'g'
+[extension.remote-probe]
+command = ['wrong-local-default']
+[extension_commands."remote-probe:background"]
+args = ['--from-local-config']
+[trusted_commands.local_probe]
+title = 'Local trusted remote probe'
+binding = 't'
+program = '~/trusted-probe'
+args = ['-c', 'printf "SOCKET=%s\nCWD=%s\n" "$FUT_SOCKET" "$PWD" > trusted.context; printf "TRUSTED_REMOTE_READY\r\n"; read -r input; printf "%s\n" "$input" > trusted.input']
+"#).unwrap();
+    let mut command = Command::new("/usr/bin/script");
+    remote_env(&mut command, root.path(), &bin, &harness.socket);
+    command
+        .env("FUT_CONFIG", &config)
+        .args(script_command_args())
+        .arg("stty cols 100 rows 30; exec \"$FUT_BIN\" --machine clonk --attach-only");
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("navigator").await;
+    client.send(b"\r");
+    client.wait_for("COMMAND_HOST_READY").await;
+
+    client.send(b"\x02:remote background probe\r");
+    wait_for(DEADLINE, || {
+        fs::read_to_string(extension.join("background.context"))
+            .is_ok_and(|text| text.contains("\nFORM=") && text.ends_with('\n'))
+            && fs::read_to_string(extension.join("background.args"))
+                .is_ok_and(|text| text == "--from-local-config\n")
+    })
+    .await;
+    let background = fs::read_to_string(extension.join("background.context")).unwrap();
+    assert_eq!(
+        fs::read_to_string(extension.join("background.args")).unwrap(),
+        "--from-local-config\n"
+    );
+    assert!(
+        background.contains(&format!("SOCKET={}\n", harness.socket.display())),
+        "{background:?}"
+    );
+    assert!(
+        background.contains(&format!("ROOT={}\n", extension.display())),
+        "{background:?}"
+    );
+    assert!(
+        background.contains(&format!("CWD={}\n", cwd.display())),
+        "{background:?}"
+    );
+
+    client.send(b"\x02t");
+    client.wait_for("TRUSTED_REMOTE_READY").await;
+    let trusted = fs::read_to_string(cwd.join("trusted.context")).unwrap();
+    assert_eq!(
+        trusted,
+        format!(
+            "SOCKET={}\nCWD={}\n",
+            harness.socket.display(),
+            cwd.display()
+        )
+    );
+    client.send(b"trusted-input\r");
+    wait_for(DEADLINE, || {
+        fs::read_to_string(cwd.join("trusted.input")).is_ok_and(|text| text == "trusted-input\n")
+    })
+    .await;
+    client.send_until(b"host-ready\n", "HOST:host-ready").await;
+    assert_eq!(
+        without_observations(harness.resources().await),
+        without_observations(before)
+    );
+
+    client.send(b"\x02g");
+    client.wait_for("Remote prompt").await;
+    client.send(b"\tremote prompt value\r");
+    client.wait_for("REMOTE_COMMAND_INPUT_READY").await;
+    let context = fs::read_to_string(extension.join("interactive.context")).unwrap();
+    assert_eq!(
+        context,
+        format!(
+            "SOCKET={}\nROOT={}\nCWD={}\nFORM={{\"command\":\"remote-default\",\"prompt\":\"remote prompt value\"}}\n",
+            harness.socket.display(),
+            extension.display(),
+            cwd.display(),
+        )
+    );
+    client.send(b"remote-input\r");
+    client.wait_for("REMOTE_COMMAND_ACTIVATED").await;
+    assert_eq!(
+        fs::read_to_string(extension.join("input")).unwrap(),
+        "remote-input\n"
+    );
+    client.send(b"activation-ping\r");
+    client.wait_for("ACTIVATED:activation-ping").await;
+    assert!(!root.path().join("must-not-be-created").exists());
+    assert!(!root.path().join("trusted.context").exists());
+    assert!(!root.path().join("must-not-be-used.sock").exists());
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert_ssh_reaped(root.path()).await;
+    // Navigator, attachment, one connection per command, and remote form defaults.
+    assert_eq!(
+        fs::read_to_string(root.path().join("ssh-pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        6
+    );
+    let arguments = fs::read_to_string(root.path().join("ssh-args")).unwrap();
+    assert_eq!(
+        arguments.matches("BatchMode=yes\n").count(),
+        4,
+        "{arguments:?}"
+    );
+    assert!(!arguments.contains("--start-if-missing"), "{arguments:?}");
     assert!(matches!(
         harness.control_command(ClientMessage::Ping).await,
         ServerMessage::Pong { .. }

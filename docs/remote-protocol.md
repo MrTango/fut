@@ -95,14 +95,14 @@ are common to every negotiated connection.
 | `alerts.v1` | Interactive `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | No attached-terminal bell subscription or acknowledgement |
 | `control-alerts.v1` | Lease-free control `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | Background metadata retains no bell summary; agent summaries remain in resources |
 | `extension-catalog.v1` | Catalog in the welcome; control `get_extension_catalog` and interactive catalog-change notifications | No extension declarations, styles or command listings; related local overrides are ignored |
+| `configured-commands.v1` | Control `command_defaults`, dedicated control `command_start`, `command_operation`; `command_reply` | Remote configured commands are unavailable |
 
 </div>
 
 Interactive resource operations execute **on the daemon's machine**. Paths,
 programs and argv in these methods are endpoint-local. Remote resource roots,
 PIDs, extension paths and tokens never authorize local filesystem or process
-operations. The current UI blocks project opening, configuration reload,
-configured/extension commands and client hooks regardless of capabilities.
+operations. Configuration reload and client hooks remain local-only.
 Clipboard and rendering run locally; terminal links allow only HTTP/HTTPS.
 Pane links and ordinary terminal/navigation/layout operations remain usable.
 An extension's Fut package requirement applies to the hosting daemon, not the
@@ -110,6 +110,34 @@ local renderer; remote catalog validation retains structural/fingerprint checks
 without imposing the local package version on remote declarations.
 No capability in generation 2 permits daemon shutdown, configuration mutation,
 agent reporting, token publication, or private control/automation methods.
+
+### Configured commands
+
+Each command uses a separate SSH control connection with the normal handshake
+and `configured-commands.v1` negotiated. `command_start` supplies a command spec,
+target terminal ID, terminal size, and optional form values. The daemon resolves
+the target's live ancestry. A preceding `command_defaults` request resolves form
+defaults from remote configuration without launching the command, returning
+`Defaults { values }` with its request ID. For extension commands only `{ id, command }` and
+an explicit `extension_args_override` decision are authoritative client inputs:
+the remote catalog and remote UI configuration supply executable, roots,
+execution settings, and config. If the override is false, remote configured args
+win; if true, supplied args (including an empty list) win. Generic commands from
+the client's config deliberately execute their supplied program/argv remotely,
+using the target terminal's remote foreground cwd. The client preserves `~` and
+`~/` program paths; the daemon expands them against its own user's home.
+
+All command replies use `command_reply`. Popup starts return `Ready` with the
+start request ID, then asynchronous `Screen` and `Done` with no request ID.
+Background starts have no screen or `Ready`: they return `Done` with the start
+request ID. `Done` includes the exit code, optional activated pane, and optional
+failure output. Input, key input, paste, resize, mouse, clipboard completion and
+copy cancellation go through `command_operation`, require request IDs, and get
+matching `Ack` (or `Error`). Mouse coordinates include the content rectangle
+`[x, y, width, height]`; clipboard requests return text and a copy request ID in
+the Ack and are completed with `FinishClipboard`. Clipboard access stays local.
+The connection is dedicated after start: other control methods cannot interleave.
+Disconnect or detach closes the popup or cancels the background process.
 
 ### Image attachment uploads
 

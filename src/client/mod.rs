@@ -10,6 +10,7 @@ mod clipboard_image;
 mod colors;
 mod command_bar;
 mod command_form;
+pub(crate) mod command_server;
 pub mod config;
 mod connection;
 mod context_menu;
@@ -33,6 +34,7 @@ mod perf;
 mod presentation;
 mod project_opener;
 mod remote;
+mod remote_command;
 #[cfg(test)]
 mod remote_tests;
 mod rename;
@@ -113,6 +115,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::{Clear, Widget},
 };
+use remote_command::CommandSurface as TemporaryCommandSurface;
 use rename::{RenameAction, RenameState};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -131,8 +134,8 @@ use presentation::PresentationTokenInvocation;
 use sidebar::{ComponentEffect, SidebarComponentKind, SidebarSide, SidebarState, render_sidebar};
 use tab_bar::{TabBarAction, TabBarState};
 use temporary_command::{
-    BackgroundCommandResult, ExtensionCommandContext, TemporaryCommandSurface,
-    TemporaryCommandUpdate, dispatch_background_command,
+    BackgroundCommandResult, ExtensionCommandContext, TemporaryCommandUpdate,
+    dispatch_background_command,
 };
 use toast::{Toast, ToastState};
 use ui_catalog::{UiCatalog, UiCatalogAction};
@@ -1512,7 +1515,10 @@ async fn run_loop(
                                 temporary_command
                                     .as_ref()
                                     .expect("command exists")
-                                    .write_failure_log(attachment.local_socket()?)
+                                    .write_failure_log(&match &attachment {
+                                        Attachment::Local(socket) => socket.clone(),
+                                        Attachment::Remote { .. } => crate::daemon::path::socket_path(None)?,
+                                    })
                                     .await,
                             )
                         };
@@ -1564,7 +1570,13 @@ async fn run_loop(
                 }
             }
             result = background_result.recv() => {
-                if let Some(BackgroundCommandResult::Failed(message)) = result {
+                let failure = match result {
+                    Some(BackgroundCommandResult::Failed(message)) => Some(message),
+                    Some(BackgroundCommandResult::Remote { generation, result })
+                        if attachment.command_generation() == Some(generation) => result.err(),
+                    _ => None,
+                };
+                if let Some(message) = failure {
                     toasts.error(format!("command failed · {}", sanitize(&message)));
                     force_draw = true;
                 }
@@ -2389,6 +2401,7 @@ async fn run_loop(
                     | ServerMessage::AgentPrompted { .. }
                     | ServerMessage::AgentSettled { .. }
                     | ServerMessage::ExtensionCatalog { .. }
+                    | ServerMessage::CommandReply { .. }
                     | ServerMessage::TokenPublished { .. } => {
                         bail!("unexpected control response on interactive connection")
                     }
@@ -2470,23 +2483,43 @@ async fn run_loop(
                 match event {
                     Event::Key(key) if temporary_command.is_some() => {
                         let command = temporary_command.as_mut().expect("command exists");
-                        if let Some(event) = terminal_key_event(key) {
-                            command.key_input(event).await?;
+                        let result = if let Some(event) = terminal_key_event(key) {
+                            command.key_input(event).await
                         } else if let Some(bytes) = encode_key(key) {
-                            command.input(bytes).await?;
+                            command.input(bytes).await
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(error) = result {
+                            temporary_command = None;
+                            toasts.error(format!("command failed · {}", one_line_error(&error)));
+                            view.invalidate_drawn();
+                            resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
+                            force_draw = true;
                         }
                     }
                     Event::Paste(text) if temporary_command.is_some() => {
-                        temporary_command.as_mut().expect("command exists").paste(text).await?;
+                        if let Err(error) = temporary_command.as_mut().expect("command exists").paste(text).await {
+                            temporary_command = None;
+                            toasts.error(format!("command failed · {}", one_line_error(&error)));
+                            view.invalidate_drawn();
+                            resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
+                            force_draw = true;
+                        }
                     }
                     Event::Resize(columns, rows) if temporary_command.is_some() && columns > 0 && rows > 0 => {
                         let host = Rect::new(0, 0, columns, rows);
                         let command = temporary_command.as_mut().expect("command exists");
                         let content = temporary_command_content(command.size().area(host));
-                        command.resize(TerminalSize {
+                        if let Err(error) = command.resize(TerminalSize {
                             columns: content.width,
                             rows: content.height,
-                        }).await?;
+                        }).await {
+                            temporary_command = None;
+                            toasts.error(format!("command failed · {}", one_line_error(&error)));
+                            view.invalidate_drawn();
+                            resize_view(framed, host, &mut view, &resources, &ui).await?;
+                        }
                         force_draw = true;
                     }
                     Event::Mouse(mouse) if temporary_command.is_some() => {
@@ -2524,15 +2557,25 @@ async fn run_loop(
                                 };
                                 let submission = form.submit();
                                 let host: Rect = terminal.size()?.into();
-                                match spawn_temporary_command(
+                                let result = if let Some(terminal_id) = submission.remote_target {
+                                    match &attachment {
+                                        Attachment::Remote { target, .. } => spawn_remote_popup(
+                                            &submission.command, terminal_id, host, target, Some(&submission.values),
+                                        ).await,
+                                        Attachment::Local(_) => Err(anyhow::anyhow!("remote command attachment is no longer available")),
+                                    }
+                                } else {
+                                    spawn_temporary_command(
                                     ui.terminal.clone(),
                                     &submission.command,
-                                    view.focused().child_pid,
+                                    view.focused(),
                                     host,
-                                    attachment.local_socket()?,
-                                    Some(&submission.context),
+                                    &attachment,
+                                    submission.context.as_ref(),
                                     Some(&submission.values),
-                                ).await {
+                                    ).await
+                                };
+                                match result {
                                     Ok(command) => temporary_command = Some(command),
                                     Err(error) => toasts.error(format!("command failed · {}", one_line_error(&error))),
                                 }
@@ -4132,20 +4175,21 @@ async fn run_loop(
                                 &ui.styles,
                                 frame.buffer_mut(),
                             );
-                            frame.render_widget(Screen(&command.screen, Locality::Local), content);
-                            if command.screen.cursor.visible
-                                && command.screen.cursor.column < content.width
-                                && command.screen.cursor.row < content.height
+                            let screen = command.screen();
+                            frame.render_widget(Screen(screen, attachment.locality()), content);
+                            if screen.cursor.visible
+                                && screen.cursor.column < content.width
+                                && screen.cursor.row < content.height
                             {
                                 frame.set_cursor_position((
-                                    content.x + command.screen.cursor.column,
-                                    content.y + command.screen.cursor.row,
+                                    content.x + screen.cursor.column,
+                                    content.y + screen.cursor.row,
                                 ));
                                 rendered_cursor = Some(RenderedCursor {
-                                    column: content.x + command.screen.cursor.column,
-                                    row: content.y + command.screen.cursor.row,
-                                    shape: command.screen.cursor.shape,
-                                    blinking: command.screen.cursor.blinking,
+                                    column: content.x + screen.cursor.column,
+                                    row: content.y + screen.cursor.row,
+                                    shape: screen.cursor.shape,
+                                    blinking: screen.cursor.blinking,
                                 });
                             }
                             toasts.render(
@@ -5471,7 +5515,7 @@ async fn dispatch_presentation_token_action(
             extension_id,
             command,
         } => {
-            if let Some(message) = attachment.locality().blocked_command() {
+            if let Some(message) = attachment.blocked_command() {
                 return Ok(Some(Toast::info(message)));
             }
             let Some(path) =
@@ -5498,6 +5542,18 @@ async fn dispatch_presentation_token_action(
                 terminal_id: path.pane.terminal_id,
                 child_pid: view.focused().child_pid,
             };
+            if matches!(attachment, Attachment::Remote { .. }) {
+                return dispatch_remote_command(
+                    command,
+                    &focused,
+                    host,
+                    attachment,
+                    surface,
+                    temporary_command,
+                    background_results,
+                )
+                .await;
+            }
             if command.mode() == crate::extensions::ExtensionCommandMode::Background {
                 dispatch_background_command(
                     command,
@@ -5540,9 +5596,9 @@ async fn dispatch_presentation_token_action(
             match spawn_temporary_command(
                 ui.terminal.clone(),
                 &command,
-                focused.child_pid,
+                &focused,
                 host,
-                attachment.local_socket()?,
+                attachment,
                 Some(&context),
                 None,
             )
@@ -5607,12 +5663,27 @@ async fn dispatch_client_action(
             }));
         }
         ClientAction::RunCommand(index) => {
+            if let Some(message) = attachment.blocked_command() {
+                return Ok(Some(Toast::info(message)));
+            }
             let Some(command) = ui.bindings.command(index) else {
                 return Ok(Some(Toast::error(
                     "configured command is no longer available",
                 )));
             };
             let command = command.clone();
+            if matches!(attachment, Attachment::Remote { .. }) {
+                return dispatch_remote_command(
+                    command,
+                    view.focused(),
+                    host,
+                    attachment,
+                    surface,
+                    temporary_command,
+                    background_results,
+                )
+                .await;
+            }
             let workspace_context = command.extension.as_ref().and_then(|_| {
                 resources.snapshot().and_then(|snapshot| {
                     snapshot.sessions.iter().find_map(|session| {
@@ -5686,9 +5757,9 @@ async fn dispatch_client_action(
             match spawn_temporary_command(
                 ui.terminal.clone(),
                 &command,
-                view.focused().child_pid,
+                view.focused(),
                 host,
-                attachment.local_socket()?,
+                attachment,
                 extension_context.as_ref(),
                 None,
             )
@@ -6203,12 +6274,69 @@ async fn dispatch_client_action(
     Ok(None)
 }
 
+async fn dispatch_remote_command(
+    command: PaletteCommand,
+    focused: &SelectedTarget,
+    host: Rect,
+    attachment: &Attachment,
+    surface: &mut Option<ClientSurface>,
+    temporary_command: &mut Option<TemporaryCommandSurface>,
+    background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
+) -> anyhow::Result<Option<Toast>> {
+    let Attachment::Remote { target, .. } = attachment else {
+        unreachable!("remote command dispatcher requires a remote attachment")
+    };
+    if command.mode() == crate::extensions::ExtensionCommandMode::Background {
+        attachment.run_background_command(command, focused.clone(), background_results.clone());
+        return Ok(None);
+    }
+    let result = if command.fields.is_empty() {
+        spawn_remote_popup(&command, focused.terminal_id, host, target, None)
+            .await
+            .map(|command| *temporary_command = Some(command))
+    } else {
+        match remote_command::field_defaults(&command, focused.terminal_id, target).await {
+            Ok(defaults) => CommandFormState::open_remote(command, defaults, focused.terminal_id)
+                .map(|form| *surface = Some(ClientSurface::CommandForm(Box::new(form)))),
+            Err(error) => Err(error),
+        }
+    };
+    Ok(result
+        .err()
+        .map(|error| Toast::error(format!("command failed · {}", one_line_error(&error)))))
+}
+
+async fn spawn_remote_popup(
+    command: &PaletteCommand,
+    terminal_id: TerminalId,
+    host: Rect,
+    target: &str,
+    form: Option<&BTreeMap<String, String>>,
+) -> anyhow::Result<TemporaryCommandSurface> {
+    let crate::extensions::ExtensionCommandExecution::Interactive { size, .. } = &command.execution
+    else {
+        bail!("background commands cannot open an interactive surface")
+    };
+    let content = temporary_command_content(size.area(host));
+    TemporaryCommandSurface::spawn_remote(
+        command,
+        terminal_id,
+        TerminalSize {
+            columns: content.width,
+            rows: content.height,
+        },
+        target,
+        form,
+    )
+    .await
+}
+
 async fn spawn_temporary_command(
     terminal_config: crate::terminal::TerminalConfig,
     command: &PaletteCommand,
-    child_pid: u32,
+    focused: &SelectedTarget,
     host: Rect,
-    socket_path: &Path,
+    attachment: &Attachment,
     extension_context: Option<&ExtensionCommandContext>,
     form: Option<&BTreeMap<String, String>>,
 ) -> anyhow::Result<TemporaryCommandSurface> {
@@ -6217,15 +6345,29 @@ async fn spawn_temporary_command(
         anyhow::bail!("background commands cannot open an interactive surface");
     };
     let content = temporary_command_content(size.area(host));
+    let dimensions = TerminalSize {
+        columns: content.width,
+        rows: content.height,
+    };
+    if let Attachment::Remote { target, .. } = attachment {
+        return TemporaryCommandSurface::spawn_remote(
+            command,
+            focused.terminal_id,
+            dimensions,
+            target,
+            form,
+        )
+        .await;
+    }
     TemporaryCommandSurface::spawn(
         terminal_config,
         command,
-        child_pid,
+        focused.child_pid,
         TerminalSize {
             columns: content.width,
             rows: content.height,
         },
-        socket_path,
+        attachment.local_socket()?,
         extension_context,
         form,
     )

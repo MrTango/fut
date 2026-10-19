@@ -234,8 +234,8 @@ pub(crate) enum ExtensionCommandMode {
 
 /// Runtime command execution. Background commands have no popup-specific
 /// state by construction.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ExtensionCommandExecution {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ExtensionCommandExecution {
     Interactive {
         size: PopupSize,
         activate_opened: bool,

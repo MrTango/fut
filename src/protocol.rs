@@ -4,6 +4,9 @@
 pub mod chunked;
 pub mod remote;
 
+pub use crate::command::PopupSize as RemoteCommandSize;
+pub use crate::extensions::ExtensionCommandExecution as RemoteCommandExecution;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio_util::codec::LengthDelimitedCodec;
@@ -368,9 +371,105 @@ pub enum ExtensionTokenStyle {
     Deleted,
 }
 
+/// Executables and execution settings are hints only for extension commands:
+/// the daemon resolves those from its own catalog and configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteCommandSpec {
+    pub title: String,
+    pub program: std::path::PathBuf,
+    pub args: Vec<String>,
+    pub execution: RemoteCommandExecution,
+    pub extension: Option<RemoteCommandIdentity>,
+    pub extension_args_override: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteCommandIdentity {
+    pub id: String,
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteMouseKind {
+    Down { button: crate::domain::MouseButton },
+    Up { button: crate::domain::MouseButton },
+    Drag { button: crate::domain::MouseButton },
+    Moved,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteCommandOperation {
+    Input(Vec<u8>),
+    KeyInput(crate::domain::TerminalKeyEvent),
+    Paste(String),
+    Resize(TerminalSize),
+    Mouse {
+        kind: RemoteMouseKind,
+        column: u16,
+        row: u16,
+        shift: bool,
+        control: bool,
+        alt: bool,
+        content: [u16; 4],
+    },
+    FinishClipboard {
+        request_id: uuid::Uuid,
+        copied: bool,
+    },
+    CancelMouseCopy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteClipboardCopy {
+    pub request_id: uuid::Uuid,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteCommandReply {
+    Defaults {
+        values: BTreeMap<String, String>,
+    },
+    Ready {
+        screen: ScreenSnapshot,
+    },
+    Screen {
+        screen: ScreenSnapshot,
+    },
+    Done {
+        exit_code: Option<i32>,
+        activated_target: Option<PaneId>,
+        failure_output: Option<String>,
+    },
+    Ack {
+        clipboard: Option<RemoteClipboardCopy>,
+        handled: bool,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    CommandDefaults {
+        command: RemoteCommandSpec,
+        target: TerminalId,
+    },
+    CommandStart {
+        command: RemoteCommandSpec,
+        target: TerminalId,
+        size: TerminalSize,
+        form: Option<std::collections::BTreeMap<String, String>>,
+    },
+    CommandOperation {
+        operation: RemoteCommandOperation,
+    },
     RemoteHello(remote::RemoteHello),
     Hello {
         version: u16,
@@ -618,6 +717,9 @@ pub enum PresentationTokenPublishAction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    CommandReply {
+        reply: RemoteCommandReply,
+    },
     RemoteWelcome(remote::RemoteWelcome),
     EndpointError {
         error: remote::EndpointError,

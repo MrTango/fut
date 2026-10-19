@@ -30,7 +30,7 @@ use crate::{
     resources::TrustedProjectConfig,
     terminal::{
         CopyModeOutcome, MouseInputOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
-        TerminalLifecycle, spawn_terminal,
+        TerminalLifecycle, spawn_command_terminal,
     },
 };
 
@@ -129,6 +129,10 @@ fn shell_display(value: &str) -> String {
 pub(super) enum BackgroundCommandResult {
     Succeeded,
     Failed(String),
+    Remote {
+        generation: uuid::Uuid,
+        result: Result<(), String>,
+    },
 }
 
 pub(super) struct TemporaryCommandSurface {
@@ -177,6 +181,14 @@ pub(super) enum TemporaryCommandUpdate {
     Stopped,
 }
 
+pub(super) struct CommandSpawnContext<'a> {
+    pub cwd: PathBuf,
+    pub socket: &'a Path,
+    pub extension: Option<&'a ExtensionCommandContext>,
+    pub form: Option<&'a BTreeMap<String, String>>,
+    pub target: Option<&'a SelectedTarget>,
+}
+
 impl TemporaryCommandSurface {
     pub(super) async fn spawn(
         terminal_config: crate::terminal::TerminalConfig,
@@ -187,13 +199,6 @@ impl TemporaryCommandSurface {
         extension_context: Option<&ExtensionCommandContext>,
         form: Option<&BTreeMap<String, String>>,
     ) -> anyhow::Result<Self> {
-        let crate::extensions::ExtensionCommandExecution::Interactive {
-            size: popup_size,
-            activate_opened,
-        } = command.execution
-        else {
-            anyhow::bail!("background commands cannot open an interactive surface");
-        };
         let cwd = if let Some(context) = extension_context {
             context.workspace_root.clone()
         } else {
@@ -201,7 +206,45 @@ impl TemporaryCommandSurface {
                 .await
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()))
         };
+        Self::spawn_in(
+            terminal_config,
+            command,
+            size,
+            CommandSpawnContext {
+                cwd,
+                socket: socket_path,
+                extension: extension_context,
+                form,
+                target: None,
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn spawn_in(
+        terminal_config: crate::terminal::TerminalConfig,
+        command: &PaletteCommand,
+        size: TerminalSize,
+        context: CommandSpawnContext<'_>,
+    ) -> anyhow::Result<Self> {
+        let crate::extensions::ExtensionCommandExecution::Interactive {
+            size: popup_size,
+            activate_opened,
+        } = command.execution
+        else {
+            anyhow::bail!("background commands cannot open an interactive surface");
+        };
+        let CommandSpawnContext {
+            cwd,
+            socket: socket_path,
+            extension: extension_context,
+            form,
+            target,
+        } = context;
         let mut env = std::env::vars_os().collect::<HashMap<_, _>>();
+        if let Some(target) = target {
+            add_target_environment(&mut env, target, socket_path)?;
+        }
         if command.extension.is_some() {
             let context =
                 extension_context.context("extension command is missing runtime context")?;
@@ -218,7 +261,7 @@ impl TemporaryCommandSurface {
                 activation.path.as_os_str().to_owned(),
             );
         }
-        let handle = spawn_terminal(SpawnSpec {
+        let handle = spawn_command_terminal(SpawnSpec {
             terminal: terminal_config,
             id: terminal_id,
             program: command.program.clone(),
@@ -251,6 +294,13 @@ impl TemporaryCommandSurface {
 
     pub(super) fn title(&self) -> &str {
         &self.title
+    }
+
+    pub(super) fn close_on_disconnect(&self) {
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let _ = handle.close().await;
+        });
     }
 
     pub(super) fn size(&self) -> PopupSize {
@@ -589,15 +639,7 @@ impl TemporaryCommandSurface {
     }
 
     pub(super) async fn write_failure_log(&self, socket_path: &Path) -> anyhow::Result<PathBuf> {
-        let output = self
-            .handle
-            .read_output(
-                TerminalOutputSource::RecentUnwrapped,
-                MAX_TERMINAL_OUTPUT_ROWS,
-                false,
-            )
-            .await
-            .context("read failed command output")?;
+        let output = self.failure_output().await?;
         let directory = socket_path
             .parent()
             .context("resolve command log directory")?
@@ -606,10 +648,23 @@ impl TemporaryCommandSurface {
             .await
             .with_context(|| format!("create command log directory {}", directory.display()))?;
         let path = directory.join(format!("command-{}.log", self.handle.id()));
-        tokio::fs::write(&path, output.text)
+        tokio::fs::write(&path, output)
             .await
             .with_context(|| format!("write command log {}", path.display()))?;
         Ok(path)
+    }
+
+    pub(super) async fn failure_output(&self) -> anyhow::Result<String> {
+        Ok(self
+            .handle
+            .read_output(
+                TerminalOutputSource::RecentUnwrapped,
+                MAX_TERMINAL_OUTPUT_ROWS,
+                false,
+            )
+            .await
+            .context("read failed command output")?
+            .text)
     }
 
     pub(super) async fn update(&mut self) -> TemporaryCommandUpdate {
@@ -744,67 +799,175 @@ async fn run_background_command(
     context: &ExtensionCommandContext,
     socket_path: &Path,
 ) -> BackgroundCommandResult {
+    let (code, failure) = run_background_process(
+        command,
+        Some(context),
+        &context.workspace_root,
+        socket_path,
+        None,
+    )
+    .await;
+    match (code, failure) {
+        (Some(0), None) => BackgroundCommandResult::Succeeded,
+        (_, failure) => {
+            BackgroundCommandResult::Failed(failure.unwrap_or_else(|| "command failed".into()))
+        }
+    }
+}
+
+/// Shared runner. Dropping this future kills the child and drops its stderr
+/// reader; no detached task can outlive a remote command connection.
+pub(super) async fn run_background_process(
+    command: &PaletteCommand,
+    context: Option<&ExtensionCommandContext>,
+    cwd: &Path,
+    socket_path: &Path,
+    form: Option<&BTreeMap<String, String>>,
+) -> (Option<i32>, Option<String>) {
+    run_background_process_at(command, context, cwd, socket_path, form, None).await
+}
+
+pub(super) async fn run_background_process_at(
+    command: &PaletteCommand,
+    context: Option<&ExtensionCommandContext>,
+    cwd: &Path,
+    socket_path: &Path,
+    form: Option<&BTreeMap<String, String>>,
+    target: Option<&SelectedTarget>,
+) -> (Option<i32>, Option<String>) {
     let mut environment = std::env::vars_os().collect::<HashMap<_, _>>();
-    if let Err(error) = add_form_environment(&mut environment, None)
-        .and_then(|()| add_extension_environment(&mut environment, command, context, socket_path))
+    if let Err(error) = target
+        .map(|target| add_target_environment(&mut environment, target, socket_path))
+        .transpose()
+        .and_then(|_| add_form_environment(&mut environment, form))
+        .and_then(|()| match context {
+            Some(context) => {
+                add_extension_environment(&mut environment, command, context, socket_path)
+            }
+            None => Ok(()),
+        })
     {
-        return BackgroundCommandResult::Failed(bounded_error(format!(
-            "{} environment failed: {error:#}",
-            command.title
-        )));
+        return (
+            None,
+            Some(bounded_error(format!(
+                "{} environment failed: {error:#}",
+                command.title
+            ))),
+        );
     }
     let mut process = tokio::process::Command::new(&command.program);
     process
         .args(&command.args)
-        .current_dir(&context.workspace_root)
+        .kill_on_drop(true)
+        .current_dir(cwd)
+        .env_clear()
         .envs(environment)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return BackgroundCommandResult::Failed(bounded_error(format!(
-                "{} failed to start: {error}",
-                command.title
-            )));
+            return (
+                None,
+                Some(bounded_error(format!(
+                    "{} failed to start: {error}",
+                    command.title
+                ))),
+            );
         }
     };
+    #[cfg(unix)]
+    let _process_group = BackgroundProcessGroup(child.id());
     let stderr = child.stderr.take();
-    let stderr_task = tokio::spawn(async move {
+    let stderr_read = async move {
         match stderr {
             Some(stderr) => drain_bounded(stderr).await,
             None => Ok(Vec::new()),
         }
-    });
-    let status = child.wait().await;
-    let stderr = stderr_task
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    };
+    tokio::pin!(stderr_read);
+    let (status, stderr) = tokio::select! {
+        stderr = &mut stderr_read => (child.wait().await, stderr),
+        status = child.wait() => {
+            // The command owns its process group. Do not let an exited shell's
+            // descendants keep its stderr pipe and SSH command alive forever.
+            #[cfg(unix)]
+            drop(_process_group);
+            let stderr = tokio::time::timeout(std::time::Duration::from_millis(250), &mut stderr_read)
+                .await.unwrap_or_else(|_| Ok(Vec::new()));
+            (status, stderr)
+        }
+    };
+    let stderr = stderr.unwrap_or_default();
     match status {
-        Ok(status) if status.success() => BackgroundCommandResult::Succeeded,
+        Ok(status) if status.success() => (status.code(), None),
         Ok(status) => {
             let detail = String::from_utf8_lossy(&stderr)
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
+            let code = status.code();
             let status = status
                 .code()
                 .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
             let suffix = (!detail.is_empty()).then(|| format!(": {detail}"));
-            BackgroundCommandResult::Failed(bounded_error(format!(
-                "{} exited with status {status}{}",
-                command.title,
-                suffix.unwrap_or_default()
-            )))
+            (
+                code,
+                Some(bounded_error(format!(
+                    "{} exited with status {status}{}",
+                    command.title,
+                    suffix.unwrap_or_default()
+                ))),
+            )
         }
-        Err(error) => BackgroundCommandResult::Failed(bounded_error(format!(
-            "{} wait failed: {error}",
-            command.title
-        ))),
+        Err(error) => (
+            None,
+            Some(bounded_error(format!(
+                "{} wait failed: {error}",
+                command.title
+            ))),
+        ),
     }
+}
+
+#[cfg(unix)]
+struct BackgroundProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for BackgroundProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // The child starts in its own process group, never Fut's group.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+fn add_target_environment(
+    environment: &mut HashMap<OsString, OsString>,
+    target: &SelectedTarget,
+    socket_path: &Path,
+) -> anyhow::Result<()> {
+    environment.retain(|key, _| {
+        !key.to_string_lossy().starts_with("FUT_EXTENSION") && key != ACTIVATE_OPENED_SOCKET_ENV
+    });
+    environment.insert("FUT_BIN".into(), std::env::current_exe()?.into_os_string());
+    environment.insert("FUT_SOCKET".into(), socket_path.as_os_str().to_owned());
+    for (key, value) in [
+        ("FUT_SESSION_ID", target.session_id.to_string()),
+        ("FUT_WORKSPACE_ID", target.workspace_id.to_string()),
+        ("FUT_TAB_ID", target.tab_id.to_string()),
+        ("FUT_PANE_ID", target.pane_id.to_string()),
+        ("FUT_TERMINAL_ID", target.terminal_id.to_string()),
+    ] {
+        environment.insert(key.into(), value.into());
+    }
+    Ok(())
 }
 
 fn add_extension_environment(
@@ -965,7 +1128,7 @@ impl Drop for ActivationSocket {
     }
 }
 
-async fn foreground_process_id(child_pid: u32) -> u32 {
+pub(super) async fn foreground_process_id(child_pid: u32) -> u32 {
     let output = tokio::time::timeout(
         std::time::Duration::from_millis(250),
         tokio::process::Command::new("/bin/ps")
@@ -983,7 +1146,7 @@ async fn foreground_process_id(child_pid: u32) -> u32 {
         .unwrap_or(child_pid)
 }
 
-async fn process_cwd(pid: u32) -> Option<PathBuf> {
+pub(super) async fn process_cwd(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         tokio::fs::read_link(format!("/proc/{pid}/cwd")).await.ok()
@@ -1027,6 +1190,56 @@ async fn process_cwd(pid: u32) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::client::config::ExtensionCommandIdentity;
+
+    #[test]
+    fn remote_target_environment_replaces_inherited_invocation_context() {
+        let target = ExtensionCommandContext::test().focused;
+        let mut env = HashMap::from([
+            (OsString::from("FUT_SOCKET"), OsString::from("/stale.sock")),
+            (
+                OsString::from("FUT_EXTENSION_CONFIG"),
+                OsString::from("stale"),
+            ),
+            (
+                OsString::from(ACTIVATE_OPENED_SOCKET_ENV),
+                OsString::from("/stale-activation.sock"),
+            ),
+        ]);
+        add_target_environment(&mut env, &target, Path::new("/remote/fut.sock")).unwrap();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("FUT_SOCKET")).unwrap(),
+            "/remote/fut.sock"
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("FUT_TERMINAL_ID")).unwrap(),
+            &OsString::from(target.terminal_id.to_string())
+        );
+        assert!(!env.contains_key(std::ffi::OsStr::new("FUT_EXTENSION_CONFIG")));
+        assert!(!env.contains_key(std::ffi::OsStr::new(ACTIVATE_OPENED_SOCKET_ENV)));
+    }
+
+    #[tokio::test]
+    async fn background_completion_does_not_wait_for_descendants_stderr() {
+        let root = tempfile::tempdir().unwrap();
+        let command = command(
+            "/bin/sh",
+            &["-c", "sleep 60 & printf 'parent exited' >&2; exit 7"],
+        );
+        let (code, output) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_background_process(
+                &command,
+                None,
+                root.path(),
+                &root.path().join("fut.sock"),
+                None,
+            ),
+        )
+        .await
+        .expect("descendant held the command connection open");
+        assert_eq!(code, Some(7));
+        assert!(output.unwrap().contains("parent exited"));
+    }
 
     fn mouse(kind: HostMouseEventKind, column: u16, row: u16) -> HostMouseEvent {
         HostMouseEvent {
@@ -1144,6 +1357,7 @@ mod tests {
             hotkey: None,
             program: program.into(),
             args: args.iter().map(|arg| (*arg).into()).collect(),
+            extension_args_override: false,
             execution: crate::extensions::ExtensionCommandExecution::Interactive {
                 size: PopupSize::default(),
                 activate_opened: false,

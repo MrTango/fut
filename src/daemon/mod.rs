@@ -1,5 +1,6 @@
 //! The single per-user Fut daemon and its local socket lifecycle.
 
+mod command;
 mod git;
 mod lease;
 pub mod path;
@@ -2836,6 +2837,35 @@ impl OutboundQueue {
                     }),
                 }
             }
+            Outbound::Message {
+                request_id: None,
+                message,
+            } if matches!(
+                &*message,
+                ServerMessage::CommandReply {
+                    reply: crate::protocol::RemoteCommandReply::Screen { .. }
+                }
+            ) =>
+            {
+                if let Some(Outbound::Message {
+                    request_id: None,
+                    message: pending,
+                }) = state.items.back_mut()
+                    && matches!(
+                        &**pending,
+                        ServerMessage::CommandReply {
+                            reply: crate::protocol::RemoteCommandReply::Screen { .. }
+                        }
+                    )
+                {
+                    *pending = message;
+                } else {
+                    state.items.push_back(Outbound::Message {
+                        request_id: None,
+                        message,
+                    });
+                }
+            }
             frame => state.items.push_back(frame),
         }
         drop(state);
@@ -4118,6 +4148,7 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::OpenProject { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportAutomaticAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::CommandDefaults { .. } | ClientMessage::CommandStart { .. } | ClientMessage::CommandOperation { .. } => send_error(&mut connection, envelope.request_id, "control_only", "commands require a dedicated control connection").await?,
                     ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -4379,6 +4410,17 @@ async fn control_loop(
             continue;
         }
         match envelope.message {
+            ClientMessage::CommandDefaults { command, target } => {
+                command::defaults(connection, &shared, envelope.request_id, command, target).await?;
+            }
+            ClientMessage::CommandStart { command, target, size, form } => {
+                return command::serve(connection, &shared, envelope.request_id, command, target, size, form).await;
+            }
+            ClientMessage::CommandOperation { .. } => {
+                command::reply(connection, envelope.request_id, crate::protocol::RemoteCommandReply::Error {
+                    message: "start a command on a dedicated control connection first".into(),
+                }).await?;
+            }
             ClientMessage::Ping => {
                 send(
                     connection,
@@ -7693,6 +7735,9 @@ async fn send(
             | ServerMessage::CopyModeFinalized { .. }
             | ServerMessage::CopyModeCancelled { .. }
             | ServerMessage::TargetSelected { .. }
+            | ServerMessage::CommandReply {
+                reply: crate::protocol::RemoteCommandReply::Screen { .. }
+            }
     ) {
         return connection.enqueue(Outbound::Message {
             request_id,
@@ -10433,6 +10478,109 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "agent_events_closed");
+    }
+
+    #[tokio::test]
+    async fn configured_background_start_returns_done_with_start_request_id() {
+        let (mut state, path) = inconsistent_state();
+        state.config_location = global_config::ConfigLocation::disabled();
+        state
+            .child_env
+            .insert("FUT_SOCKET".into(), "/tmp/fut-command-test.sock".into());
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                terminal: Default::default(),
+                id: path.terminal_id,
+                program: "/bin/sh".into(),
+                argv: vec!["-c".into(), "sleep 60".into()],
+                cwd: "/".into(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 40,
+                    rows: 5,
+                },
+            })
+            .unwrap(),
+        );
+        state.runtimes.insert(
+            path.terminal_id,
+            RuntimeEntry {
+                handle: Arc::clone(&terminal),
+                lease: AttachmentLease::default(),
+            },
+        );
+        let shared = Arc::new(Mutex::new(state));
+        let (server, client) = UnixStream::pair().unwrap();
+        let writers: WriterTasks = Default::default();
+        let mut connection = ClientConnection::new(server, &writers);
+        connection.remote = Some(Capabilities::ALL);
+        let request_id = uuid::Uuid::new_v4();
+        let task = tokio::spawn(async move {
+            command::serve(
+                &mut connection,
+                &shared,
+                Some(request_id),
+                crate::protocol::RemoteCommandSpec {
+                    title: "Server test".into(),
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "echo failed >&2; exit 9".into()],
+                    execution: crate::extensions::ExtensionCommandExecution::Background,
+                    extension: None,
+                    extension_args_override: false,
+                },
+                path.terminal_id,
+                TerminalSize {
+                    columns: 40,
+                    rows: 5,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        let mut client = Framed::new(client, codec());
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let envelope: Envelope<ServerMessage> = decode_payload(&frame).unwrap();
+        assert_eq!(envelope.request_id, Some(request_id));
+        let ServerMessage::CommandReply {
+            reply:
+                crate::protocol::RemoteCommandReply::Done {
+                    exit_code,
+                    activated_target,
+                    failure_output,
+                },
+        } = envelope.message
+        else {
+            panic!("background start must reply Done, not Ready")
+        };
+        assert_eq!(exit_code, Some(9));
+        assert_eq!(activated_target, None);
+        assert!(failure_output.unwrap().contains("failed"));
+        task.await.unwrap();
+        terminal.close().await.unwrap();
+    }
+
+    #[test]
+    fn configured_command_screens_coalesce_without_crossing_reply_barriers() {
+        let queue = OutboundQueue::default();
+        let screen = |revision| Outbound::Message {
+            request_id: None,
+            message: Box::new(ServerMessage::CommandReply {
+                reply: crate::protocol::RemoteCommandReply::Screen {
+                    screen: screen_with_image(revision, 1),
+                },
+            }),
+        };
+        queue.push(screen(1)).unwrap();
+        queue.push(screen(2)).unwrap();
+        assert_eq!(queue.state.lock().unwrap().items.len(), 1);
+        queue.push(Outbound::Frame(Bytes::new())).unwrap();
+        queue.push(screen(3)).unwrap();
+        assert_eq!(queue.state.lock().unwrap().items.len(), 3);
     }
 
     fn inconsistent_state() -> (SharedState, InitialPath) {

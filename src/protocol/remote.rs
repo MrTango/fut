@@ -73,10 +73,11 @@ pub enum Capability {
     LargeScreens,
     ScrollDeltas,
     ChunkedScreens,
+    ConfiguredCommands,
 }
 
 impl Capability {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -90,6 +91,7 @@ impl Capability {
         Self::LargeScreens,
         Self::ScrollDeltas,
         Self::ChunkedScreens,
+        Self::ConfiguredCommands,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -107,6 +109,7 @@ impl Capability {
             Self::LargeScreens => "large-screens.v1",
             Self::ScrollDeltas => "scroll-deltas.v1",
             Self::ChunkedScreens => "chunked-screens.v1",
+            Self::ConfiguredCommands => "configured-commands.v1",
         }
     }
 }
@@ -172,6 +175,9 @@ impl Capabilities {
             OpenProject { .. } => Capability::ProjectOpen,
             Ping => Capability::Health,
             GetExtensionCatalog => Capability::ExtensionCatalog,
+            CommandDefaults { .. } | CommandStart { .. } | CommandOperation { .. } => {
+                Capability::ConfiguredCommands
+            }
             TerminalColors { .. } => Capability::TerminalColors,
             AttachmentBegin { .. }
             | AttachmentChunk { .. }
@@ -212,6 +218,7 @@ impl Capabilities {
             }
             LocationOpened { .. } => Capability::ProjectOpen,
             Pong { .. } => Capability::Health,
+            CommandReply { .. } => Capability::ConfiguredCommands,
             KittyImage { .. } => Capability::LargeScreens,
             SnapshotDelta { delta, .. } if delta.shift.is_some() => {
                 return self.contains(Capability::Interactive)
@@ -281,6 +288,7 @@ impl RemoteHello {
             Capability::ExtensionCatalog.name().into(),
             Capability::NestedWorkspaces.name().into(),
             Capability::ProjectOpen.name().into(),
+            Capability::ConfiguredCommands.name().into(),
         ];
         if matches!(mode, ClientMode::Interactive { .. }) {
             optional.push(Capability::TerminalColors.name().into());
@@ -989,6 +997,37 @@ mod tests {
         assert_eq!(
             selected.max_visible_cells(),
             crate::domain::LEGACY_MAX_VISIBLE_CELLS
+        );
+    }
+
+    #[test]
+    fn configured_commands_are_independently_gated_and_round_trip() {
+        use crate::protocol::{RemoteCommandOperation, RemoteCommandReply};
+        let operation = ClientMessage::CommandOperation {
+            operation: RemoteCommandOperation::Paste("remote text".into()),
+        };
+        let done = ServerMessage::CommandReply {
+            reply: RemoteCommandReply::Done {
+                exit_code: Some(7),
+                activated_target: None,
+                failure_output: Some("failure".into()),
+            },
+        };
+        assert!(!Capabilities::default().allows_client(&operation));
+        assert!(!Capabilities::default().allows_server(&done));
+        let hello = RemoteHello::new(ClientMode::Control, "test");
+        let caps = hello.negotiate(Capabilities::ALL).unwrap();
+        assert!(caps.allows_client(&operation));
+        assert!(caps.allows_server(&done));
+        let encoded = rmp_serde::to_vec_named(&operation).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<ClientMessage>(&encoded).unwrap(),
+            operation
+        );
+        let encoded = rmp_serde::to_vec_named(&done).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<ServerMessage>(&encoded).unwrap(),
+            done
         );
     }
 

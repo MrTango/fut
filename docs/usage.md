@@ -106,10 +106,15 @@ can work.
 Remote attachment never stops, upgrades, or replaces an existing daemon, even if
 it is incompatible. Saved-machine background monitoring and `fut doctor` remain
 attach-only and never start remote daemons. The interactive project picker,
-configuration reload,
-configured commands, extension command actions, and client lifecycle hooks are
-unavailable because they currently assume the client and daemon share a
-filesystem. Remote terminal links are limited to HTTP and HTTPS. Ordinary
+configuration reload, and client lifecycle hooks remain unavailable because
+they assume the client and daemon share a filesystem. Configured commands and
+extension command actions run on the attached machine when its daemon supports
+remote commands. Interactive popups, form defaults, extension configuration,
+working directories, and Fut CLI context use that machine; rendering and
+clipboard access stay local. Commands require their tools to be installed on
+the remote machine; `~/` in a command's program path resolves to the remote
+user's home directory. Older daemons report that commands are unavailable instead
+of running them locally. Remote terminal links are limited to HTTP and HTTPS. Ordinary
 terminal input, navigation, layout actions, copy mode, and pane links continue
 to work.
 

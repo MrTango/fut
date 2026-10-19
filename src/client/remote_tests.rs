@@ -63,14 +63,15 @@ fields = [{ name = 'value', label = 'Value' }]
         .unwrap()
         .materialize(&catalog)
         .unwrap();
+    // Legacy peers omit configured-commands support; their commands must remain blocked.
     assert!(
-        Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk")
+        Attachment::remote(crate::protocol::remote::Capabilities::default(), "clonk")
             .client_hooks(&ui)
             .unwrap()
             .is_none()
     );
     assert!(
-        Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk")
+        Attachment::remote(crate::protocol::remote::Capabilities::default(), "clonk")
             .local_socket()
             .is_err()
     );
@@ -160,7 +161,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &mut ui,
             &mut temporary,
-            &Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk"),
+            &Attachment::remote(crate::protocol::remote::Capabilities::default(), "clonk"),
             None,
             federation::MachineId::Local,
             &background,
@@ -199,7 +200,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &ui,
             &mut temporary,
-            &Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk"),
+            &Attachment::remote(crate::protocol::remote::Capabilities::default(), "clonk"),
             &background,
         )
         .await

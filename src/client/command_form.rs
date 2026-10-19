@@ -15,14 +15,18 @@ use super::{
     dialog::{dialog_area, render_footer, render_frame, render_title},
     temporary_command::ExtensionCommandContext,
 };
-use crate::extensions::contains_unsafe_text;
+use crate::{
+    domain::TerminalId,
+    extensions::{ExtensionCommandField, contains_unsafe_text},
+};
 
 const MAX_WIDTH: u16 = 72;
 const MAX_VALUE_BYTES: usize = 4 * 1024;
 
 pub(super) struct CommandFormState {
     command: PaletteCommand,
-    context: ExtensionCommandContext,
+    context: Option<ExtensionCommandContext>,
+    remote_target: Option<TerminalId>,
     fields: Vec<FieldState>,
     selected: usize,
 }
@@ -45,7 +49,8 @@ pub(super) enum CommandFormAction {
 
 pub(super) struct CommandFormSubmission {
     pub command: PaletteCommand,
-    pub context: ExtensionCommandContext,
+    pub context: Option<ExtensionCommandContext>,
+    pub remote_target: Option<TerminalId>,
     pub values: BTreeMap<String, String>,
 }
 
@@ -54,14 +59,39 @@ impl CommandFormState {
         command: PaletteCommand,
         context: ExtensionCommandContext,
     ) -> anyhow::Result<Self> {
+        let mut form = Self::initialize(command, |field| match &field.default_config {
+            Some(key) => Ok(context.configured_field_default(key)?.unwrap_or_default()),
+            None => Ok(field.default.clone().unwrap_or_default()),
+        })?;
+        form.context = Some(context);
+        Ok(form)
+    }
+
+    pub(super) fn open_remote(
+        command: PaletteCommand,
+        defaults: BTreeMap<String, String>,
+        target: TerminalId,
+    ) -> anyhow::Result<Self> {
+        let mut form = Self::initialize(command, |field| {
+            Ok(defaults
+                .get(&field.name)
+                .cloned()
+                .or_else(|| field.default.clone())
+                .unwrap_or_default())
+        })?;
+        form.remote_target = Some(target);
+        Ok(form)
+    }
+
+    fn initialize(
+        command: PaletteCommand,
+        mut default_value: impl FnMut(&ExtensionCommandField) -> anyhow::Result<String>,
+    ) -> anyhow::Result<Self> {
         let fields = command
             .fields
             .iter()
             .map(|field| {
-                let value = match &field.default_config {
-                    Some(key) => context.configured_field_default(key)?.unwrap_or_default(),
-                    None => field.default.clone().unwrap_or_default(),
-                };
+                let value = default_value(field)?;
                 if value.len() > MAX_VALUE_BYTES {
                     anyhow::bail!(
                         "field {:?} default exceeds {MAX_VALUE_BYTES} bytes",
@@ -87,7 +117,8 @@ impl CommandFormState {
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             command,
-            context,
+            context: None,
+            remote_target: None,
             fields,
             selected: 0,
         })
@@ -178,6 +209,7 @@ impl CommandFormState {
         CommandFormSubmission {
             command: self.command,
             context: self.context,
+            remote_target: self.remote_target,
             values: self
                 .fields
                 .into_iter()
@@ -395,6 +427,7 @@ mod tests {
                 hotkey: None,
                 program: "/bin/true".into(),
                 args: Vec::new(),
+                extension_args_override: false,
                 execution: ExtensionCommandExecution::Interactive {
                     size: PopupSize::default(),
                     activate_opened: false,
@@ -473,14 +506,85 @@ mod tests {
             form.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             CommandFormAction::Submit
         );
+        let submission = form.submit();
+        assert!(submission.context.is_some());
+        assert_eq!(submission.remote_target, None);
         assert_eq!(
-            form.submit().values,
+            submission.values,
             BTreeMap::from([
                 ("command".into(), "pi".into()),
                 ("prompt".into(), "start here".into()),
                 ("worktree".into(), "feature".into()),
             ])
         );
+    }
+
+    #[test]
+    fn remote_defaults_use_field_names_and_submit_without_context() {
+        let mut command = form().command;
+        command.fields[0].default = Some("local worktree".into());
+        command.fields[0].default_config = Some("unused.worktree".into());
+        command.fields[1].default_config = Some("unused.command".into());
+        let target = TerminalId::new();
+        let form = CommandFormState::open_remote(
+            command,
+            BTreeMap::from([("worktree".into(), "remote worktree".into())]),
+            target,
+        )
+        .unwrap();
+        assert!(form.context.is_none());
+        assert_eq!(form.fields[0].cursor, "remote worktree".len());
+        let submission = form.submit();
+        assert!(submission.context.is_none());
+        assert_eq!(submission.remote_target, Some(target));
+        assert_eq!(
+            submission.values,
+            BTreeMap::from([
+                ("worktree".into(), "remote worktree".into()),
+                ("command".into(), "pi".into()),
+                ("prompt".into(), String::new()),
+            ])
+        );
+    }
+
+    #[test]
+    fn remote_submission_retains_original_target_while_other_forms_are_opened() {
+        let original_target = TerminalId::new();
+        let mut original =
+            CommandFormState::open_remote(form().command, BTreeMap::new(), original_target)
+                .unwrap();
+        let other_target = TerminalId::new();
+        let other =
+            CommandFormState::open_remote(form().command, BTreeMap::new(), other_target).unwrap();
+
+        original.paste("feature");
+        original.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        original.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            original.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            CommandFormAction::Submit
+        );
+
+        let submission = original.submit();
+        assert_eq!(submission.remote_target, Some(original_target));
+        assert_ne!(submission.remote_target, Some(other_target));
+        assert!(submission.context.is_none());
+        assert_eq!(other.submit().remote_target, Some(other_target));
+        assert_eq!(form().submit().remote_target, None);
+    }
+
+    #[test]
+    fn remote_defaults_are_validated() {
+        for value in ["x".repeat(MAX_VALUE_BYTES + 1), "\x1b[31munsafe".into()] {
+            assert!(
+                CommandFormState::open_remote(
+                    form().command,
+                    BTreeMap::from([("worktree".into(), value)]),
+                    TerminalId::new(),
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

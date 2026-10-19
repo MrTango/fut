@@ -832,10 +832,23 @@ impl<'a> RuntimeStatusProducer<'a> {
 }
 
 pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
+    spawn_with_environment(spec, false)
+}
+
+/// Command runners supply a complete environment snapshot, including removals
+/// of stale per-invocation Fut variables, rather than additive pane overrides.
+pub(crate) fn spawn_command_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
+    spawn_with_environment(spec, true)
+}
+
+fn spawn_with_environment(spec: SpawnSpec, clear_environment: bool) -> Result<TerminalHandle> {
     spec.size.validate()?;
     let spawn_cwd = spec.cwd.clone();
     let pair = native_pty_system().openpty(pty_size(spec.size))?;
     let mut command = CommandBuilder::new(&spec.program);
+    if clear_environment {
+        command.env_clear();
+    }
     command.args(&spec.argv);
     command.cwd(&spec.cwd);
     if !spec.env.contains_key(std::ffi::OsStr::new("COLORTERM")) {

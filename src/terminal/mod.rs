@@ -33,7 +33,7 @@ const DEFAULT_CELL_PIXEL_HEIGHT: u16 = 18;
 pub(crate) use ghostty::{
     CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
 };
-pub(crate) use runtime::AttachmentConfiguration;
+pub(crate) use runtime::{AttachmentConfiguration, spawn_command_terminal};
 pub use runtime::{
     CommandError, SpawnSpec, TerminalActivity, TerminalEvent, TerminalHandle, TerminalLifecycle,
     spawn_terminal,

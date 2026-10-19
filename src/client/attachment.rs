@@ -1,5 +1,8 @@
 //! Execution locality is independent of the transport's socket representation.
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use super::{actions::ClientAction, config::UiConfig};
 use crate::protocol::remote::Capabilities;
@@ -16,7 +19,22 @@ pub(super) enum Attachment {
     Remote {
         capabilities: Capabilities,
         target: String,
+        commands: Arc<RemoteCommands>,
     },
+}
+
+#[derive(Debug)]
+pub(super) struct RemoteCommands {
+    generation: uuid::Uuid,
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl Drop for RemoteCommands {
+    fn drop(&mut self) {
+        for task in self.tasks.get_mut().expect("command tasks lock") {
+            task.abort();
+        }
+    }
 }
 
 impl Attachment {
@@ -24,7 +42,48 @@ impl Attachment {
         Self::Remote {
             capabilities,
             target: target.into(),
+            commands: Arc::new(RemoteCommands {
+                generation: uuid::Uuid::new_v4(),
+                tasks: Mutex::new(Vec::new()),
+            }),
         }
+    }
+
+    pub(super) fn command_generation(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote { commands, .. } => Some(commands.generation),
+        }
+    }
+
+    pub(super) fn run_background_command(
+        &self,
+        command: super::config::PaletteCommand,
+        focused: crate::protocol::SelectedTarget,
+        results: tokio::sync::mpsc::UnboundedSender<
+            super::temporary_command::BackgroundCommandResult,
+        >,
+    ) {
+        let Self::Remote {
+            target, commands, ..
+        } = self
+        else {
+            unreachable!("remote command dispatcher requires a remote attachment")
+        };
+        let target = target.clone();
+        let generation = commands.generation;
+        let task = tokio::spawn(async move {
+            let result = super::remote_command::run_remote_background(&command, &focused, &target)
+                .await
+                .map_err(|error| super::one_line_error(&error));
+            let _ = results.send(super::temporary_command::BackgroundCommandResult::Remote {
+                generation,
+                result,
+            });
+        });
+        let mut tasks = commands.tasks.lock().expect("command tasks lock");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task.abort_handle());
     }
 
     pub(super) fn supports_terminal_colors(&self) -> bool {
@@ -42,6 +101,21 @@ impl Attachment {
             Self::Remote { capabilities, .. } => {
                 capabilities.contains(crate::protocol::remote::Capability::Attachments)
             }
+        }
+    }
+
+    pub(super) fn blocked_command(&self) -> Option<&'static str> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote { capabilities, .. }
+                if capabilities
+                    .contains(crate::protocol::remote::Capability::ConfiguredCommands) =>
+            {
+                None
+            }
+            Self::Remote { .. } => Some(
+                "commands unavailable during remote attachment · update Fut on the remote host and restart its daemon",
+            ),
         }
     }
 
@@ -63,16 +137,11 @@ impl Attachment {
 }
 
 impl Locality {
-    pub(super) fn blocked_command(self) -> Option<&'static str> {
-        (self == Self::Remote).then_some("commands unavailable during remote attachment")
-    }
-
     pub(super) fn blocked_action(self, action: ClientAction) -> Option<&'static str> {
         if self == Self::Local {
             return None;
         }
         match action {
-            ClientAction::RunCommand(_) => self.blocked_command(),
             ClientAction::OpenProject => {
                 Some("project opener unavailable during remote attachment")
             }
@@ -113,6 +182,32 @@ impl Attachment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_require_negotiated_support_and_have_distinct_attachment_generations() {
+        let legacy = Attachment::remote(Capabilities::default(), "legacy");
+        let current = Attachment::remote(Capabilities::ALL, "current");
+        assert!(legacy.blocked_command().is_some());
+        assert!(current.blocked_command().is_none());
+        assert!(
+            Attachment::Local("/tmp/fut.sock".into())
+                .blocked_command()
+                .is_none()
+        );
+        assert_ne!(legacy.command_generation(), current.command_generation());
+    }
+
+    #[tokio::test]
+    async fn dropping_attachment_cancels_its_background_commands() {
+        let attachment = Attachment::remote(Capabilities::ALL, "remote");
+        let task = tokio::spawn(std::future::pending::<()>());
+        let Attachment::Remote { commands, .. } = &attachment else {
+            unreachable!()
+        };
+        commands.tasks.lock().unwrap().push(task.abort_handle());
+        drop(attachment);
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
 
     #[test]
     fn image_paste_requires_remote_attachment_negotiation_but_is_available_locally() {

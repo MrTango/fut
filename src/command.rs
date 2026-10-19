@@ -2,13 +2,13 @@
 
 use anyhow::{Result, bail};
 use ratatui::layout::Rect;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const ACTIVATE_OPENED_SOCKET_ENV: &str = "FUT_COMMAND_ACTIVATE_SOCKET";
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PopupSize {
+pub struct PopupSize {
     pub width: Option<u16>,
     pub height: Option<u16>,
 }

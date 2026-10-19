@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use super::actions::{
     ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_key, suffix_name,
 };
+use super::attachment::Locality;
 use super::spinners::{SpinnerStyle, builtin_spinner};
 use crate::{
     command::PopupSize,
@@ -174,6 +175,7 @@ pub(super) struct PaletteCommand {
     pub hotkey: Option<String>,
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub extension_args_override: bool,
     pub execution: ExtensionCommandExecution,
     pub extension: Option<ExtensionCommandIdentity>,
     pub fields: Vec<crate::extensions::ExtensionCommandField>,
@@ -214,7 +216,7 @@ impl ExtensionCommandIdentity {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ExtensionCommandConfig {
-    args: Vec<String>,
+    args: Option<Vec<String>>,
 }
 
 impl PaletteCommand {
@@ -250,6 +252,7 @@ impl<'de> Deserialize<'de> for PaletteCommand {
             hotkey: dto.hotkey,
             program: dto.program,
             args: dto.args,
+            extension_args_override: false,
             execution,
             extension: None,
             fields: Vec::new(),
@@ -1789,11 +1792,12 @@ impl StagedUiConfig {
     ) -> Result<UiConfig> {
         if let Some(catalog) = catalog {
             let registry = extensions::ExtensionRegistry::from_remote_catalog(catalog.clone())?;
-            return materialize_config(
+            return materialize_config_for_locality(
                 self.config.clone(),
                 registry.extensions().to_vec(),
                 registry.config().clone(),
                 self.source.as_deref(),
+                Locality::Remote,
             );
         }
         let mut config = self.config.clone();
@@ -1804,11 +1808,12 @@ impl StagedUiConfig {
             .values
             .retain(|key, _| !key.contains(':'));
         remove_extension_tokens(&mut config.ui);
-        materialize_config(
+        materialize_config_for_locality(
             config,
             Vec::new(),
             Default::default(),
             self.source.as_deref(),
+            Locality::Remote,
         )
     }
 
@@ -2162,10 +2167,26 @@ fn resolve_explicit_extension_roots(
 }
 
 fn materialize_config(
+    config: Config,
+    extensions: Vec<Extension>,
+    extension_config: ExtensionConfigCatalog,
+    source: Option<&Path>,
+) -> Result<UiConfig> {
+    materialize_config_for_locality(
+        config,
+        extensions,
+        extension_config,
+        source,
+        Locality::Local,
+    )
+}
+
+fn materialize_config_for_locality(
     mut config: Config,
     extensions: Vec<Extension>,
     extension_config: ExtensionConfigCatalog,
     source: Option<&Path>,
+    locality: Locality,
 ) -> Result<UiConfig> {
     config.ui.alerts = config.alerts;
     let home = env::var_os("HOME").map(PathBuf::from);
@@ -2180,9 +2201,11 @@ fn materialize_config(
         .ui
         .bindings
         .set_hotkeys(std::mem::take(&mut config.ui.hotkeys));
-    for command in config.trusted_commands.values_mut() {
-        command.program =
-            expand_home_path(&command.program, home.as_deref(), "trusted command program")?;
+    if locality == Locality::Local {
+        for command in config.trusted_commands.values_mut() {
+            command.program =
+                expand_home_path(&command.program, home.as_deref(), "trusted command program")?;
+        }
     }
     config.ui.bindings.commands = config.trusted_commands.into_values().collect();
     for extension in &extensions {
@@ -2195,26 +2218,28 @@ fn materialize_config(
             };
             let slug = identity.slug();
             let binding = config.ui.bindings.values.remove(&slug);
-            let configured_args = config.extension_commands.remove(&slug);
+            let configured_args = config
+                .extension_commands
+                .remove(&slug)
+                .and_then(|configured| configured.args);
+            let extension_args_override = configured_args.is_some();
             config.ui.bindings.commands.push(PaletteCommand {
                 title: launcher.title().to_owned(),
                 binding,
                 hotkey: None,
                 program: PathBuf::from(&argv[0]),
-                args: configured_args.map_or_else(
-                    || {
-                        argv[1..]
-                            .iter()
-                            .map(|value| {
-                                value
-                                    .to_str()
-                                    .expect("extension manifest arguments are UTF-8")
-                                    .to_owned()
-                            })
-                            .collect()
-                    },
-                    |configured| configured.args,
-                ),
+                args: configured_args.unwrap_or_else(|| {
+                    argv[1..]
+                        .iter()
+                        .map(|value| {
+                            value
+                                .to_str()
+                                .expect("extension manifest arguments are UTF-8")
+                                .to_owned()
+                        })
+                        .collect()
+                }),
+                extension_args_override,
                 execution: launcher.execution().clone(),
                 extension: Some(identity),
                 fields: launcher.fields().to_vec(),
@@ -2290,7 +2315,7 @@ fn valid_project_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn expand_home_path(path: &Path, home: Option<&Path>, kind: &str) -> Result<PathBuf> {
+pub(super) fn expand_home_path(path: &Path, home: Option<&Path>, kind: &str) -> Result<PathBuf> {
     let value = path.as_os_str().to_string_lossy();
     if value == "~" {
         return home
@@ -4128,6 +4153,114 @@ components = [{ component = 'workspaces', row = { body = [{ token = 'workspace.p
     }
 
     #[test]
+    fn remote_trusted_commands_preserve_home_relative_program_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(&path, "[trusted_commands.diff]\nprogram = '~/bin/diff-popup'\ntitle = 'Diff'\nbinding = 'g'\n").unwrap();
+        let staged = stage_location(&ConfigLocation {
+            path: Some(path),
+            explicit: true,
+            source: "test",
+        })
+        .unwrap();
+        let catalog = extensions::ExtensionRegistry::new(1, Vec::new(), Default::default())
+            .unwrap()
+            .catalog()
+            .unwrap();
+        for catalog in [None, Some(&catalog)] {
+            let remote = staged.materialize_remote(catalog).unwrap();
+            assert_eq!(
+                remote.bindings.command(0).unwrap().program,
+                PathBuf::from("~/bin/diff-popup")
+            );
+        }
+        let local = staged.materialize(&catalog).unwrap();
+        assert_eq!(
+            local.bindings.command(0).unwrap().program,
+            PathBuf::from(env::var_os("HOME").unwrap()).join("bin/diff-popup")
+        );
+    }
+
+    #[test]
+    fn extension_args_override_tracks_explicit_args_locally_and_remotely() {
+        let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        fs::write(
+            extension_root.join(extensions::MANIFEST_FILE_NAME),
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands']\nid = 'configured'\n[commands.launch]\ntitle = 'Launch'\nargv = ['./launch', '--manifest']\n",
+        )
+        .unwrap();
+        let path = temporary.path().join("config.toml");
+        let location = ConfigLocation {
+            path: Some(path.clone()),
+            explicit: true,
+            source: "test",
+        };
+        for (override_config, expected_args, expected_override) in [
+            ("", vec!["--manifest"], false),
+            (
+                "[extension_commands.'configured:launch']\n",
+                vec!["--manifest"],
+                false,
+            ),
+            (
+                "[extension_commands.'configured:launch']\nargs = []\n",
+                vec![],
+                true,
+            ),
+            (
+                "[extension_commands.'configured:launch']\nargs = ['--manifest']\n",
+                vec!["--manifest"],
+                true,
+            ),
+            (
+                "[extension_commands.'configured:launch']\nargs = ['--configured']\n",
+                vec!["--configured"],
+                true,
+            ),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    "extensions = [{:?}]\n{override_config}",
+                    extension_root.display().to_string()
+                ),
+            )
+            .unwrap();
+            let loaded = load_path_outcome(&path, true).unwrap();
+            let command = loaded.ui.bindings.command(0).unwrap();
+            assert_eq!(command.args, expected_args, "{override_config:?}");
+            assert_eq!(
+                command.extension_args_override, expected_override,
+                "{override_config:?}"
+            );
+
+            let loaded = load_extensions_location(&location).unwrap();
+            let catalog = extensions::ExtensionRegistry::new(1, loaded.extensions, loaded.config)
+                .unwrap()
+                .catalog()
+                .unwrap();
+            let staged = stage_location(&location).unwrap();
+            let remote = staged.materialize_remote(Some(&catalog)).unwrap();
+            let command = remote.bindings.command(0).unwrap();
+            assert_eq!(command.args, expected_args, "{override_config:?}");
+            assert_eq!(
+                command.extension_args_override, expected_override,
+                "{override_config:?}"
+            );
+            assert!(
+                staged
+                    .materialize_remote(None)
+                    .unwrap()
+                    .bindings
+                    .command(0)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn relative_extension_roots_resolve_from_the_config_directory() {
         let temporary = tempfile::tempdir().unwrap();
         let config_dir = temporary.path().join("config");
@@ -4535,6 +4668,7 @@ size = { width = 120, height = 40 }
             PathBuf::from(env::var_os("HOME").unwrap()).join(".local/bin/git-diff")
         );
         assert_eq!(config.bindings.command(0).unwrap().args, ["-c", "git diff"]);
+        assert!(!config.bindings.command(0).unwrap().extension_args_override);
         assert!(matches!(
             config.bindings.command(0).unwrap().execution,
             ExtensionCommandExecution::Interactive {
