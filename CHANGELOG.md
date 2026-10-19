@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.38
+
 - Run configured and extension commands on the attached remote machine, including interactive popups, forms, and background commands.
 - Forward Fut's status rollup to the terminal Fut runs in as OSC 7501, so Ghostty or an outer Fut shows working, blocked, done, and error status for every Fut terminal. Fut sends it only after the terminal answers the support query, clears it on detach, and can be forced on or off with `alerts.outer_terminal_status`.
 - Show progress from programs that only emit ConEmu-style OSC 9;4 progress as working or error status in tabs and workspaces. Explicit OSC 7501 and agent reports always take precedence, and legacy progress is ignored while a program that speaks OSC 7501 is running.
