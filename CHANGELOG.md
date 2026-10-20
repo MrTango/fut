@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.39
+
 - Let compatible Fut clients and daemons from different releases keep working together without restarting terminals; daemons predating this handshake need one explicit restart.
 
 ## 0.38
