@@ -47,11 +47,12 @@ authentication, host-key, installation, timeout, or protocol error that must be
 repaired with ordinary OpenSSH and Fut commands outside doctor. Every probe
 closes and reaps its SSH process before the report completes.
 
-Released client and daemon protocol versions must match exactly. Compatible
-source changes keep the current release's protocol during development. The
-protocol is derived from the package version's minor component, so Fut 0.12.x
-uses protocol 12 and the next minor release advances it automatically. Doctor
-reports both versions when it can safely reach a daemon.
+Local clients and daemons negotiate a stable protocol generation and required
+capabilities independently of their Fut package versions. Doctor reports the
+selected generation, capabilities and package versions when it can safely reach
+a daemon. A daemon predating this handshake needs one explicit shutdown and
+restart; doctor never performs that upgrade itself. See the
+[local protocol contract](local-protocol.md).
 
 Configuration validation and active extension reporting are independent. If a
 changed package on disk is incompatible or malformed, the config check explains

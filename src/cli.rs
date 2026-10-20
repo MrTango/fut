@@ -4144,11 +4144,11 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
     request(connected_control(socket).await?, command).await
 }
 
-/// Connects at the current protocol version, failing on a mismatched daemon.
+/// Negotiate the stable local contract, independently of package versions.
 async fn connected_control(
     socket: &std::path::Path,
 ) -> Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
-    match control_handshake(socket, PROTOCOL_VERSION).await? {
+    match negotiated_control_handshake(socket).await? {
         ControlHandshake::Connected(framed) => Ok(framed),
         ControlHandshake::Incompatible { server, .. } => bail!(
             "daemon at {} uses protocol {server}, but this Fut client requires protocol \
@@ -4160,7 +4160,18 @@ async fn connected_control(
 }
 
 async fn shutdown_control(socket: &std::path::Path) -> Result<()> {
-    match control_handshake(socket, PROTOCOL_VERSION).await? {
+    // Only an explicit shutdown may fall back to the legacy handshake. Normal
+    // operations never guess a peer's schema or retry a rejected negotiation.
+    let handshake = match negotiated_control_handshake(socket).await {
+        Err(error)
+            if error.downcast_ref::<crate::protocol::remote::EndpointError>()
+                == Some(&crate::protocol::remote::EndpointError::InvalidHandshake) =>
+        {
+            legacy_control_handshake(socket).await?
+        }
+        result => result?,
+    };
+    match handshake {
         ControlHandshake::Connected(framed) => response_ok(
             request(framed, ClientMessage::Shutdown).await?,
             AcknowledgedCommand::Shutdown,
@@ -4191,7 +4202,51 @@ enum ControlHandshake {
     },
 }
 
-async fn control_handshake(socket: &std::path::Path, version: u16) -> Result<ControlHandshake> {
+async fn negotiated_control_handshake(socket: &std::path::Path) -> Result<ControlHandshake> {
+    use crate::protocol::local::LocalHello;
+
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect to {}", socket.display()))?;
+    let peer = peer_credentials(&stream).ok();
+    let mut framed = Framed::new(stream, codec());
+    let hello = LocalHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
+    let request_id = send(&mut framed, ClientMessage::LocalHello(hello.clone())).await?;
+    let frame = tokio::time::timeout(Duration::from_secs(2), framed.next())
+        .await
+        .context("daemon handshake timed out")?
+        .context("daemon disconnected")??;
+    let envelope: Envelope<ServerMessage> = crate::protocol::remote::decode_handshake(&frame)?;
+    // A legacy daemon cannot decode local_hello, including its envelope ID.
+    // Recognize only that negative response without relaxing correlation for
+    // successful welcomes or commands. Only explicit shutdown retries it.
+    if let ServerMessage::EndpointError { error } = &envelope.message
+        && crate::protocol::local::is_legacy_rejection(envelope.request_id, error)
+    {
+        return Err(unsupported_local_handshake(socket));
+    }
+    match correlated_message(envelope, request_id)? {
+        ServerMessage::LocalWelcome(welcome) => {
+            hello.accept(&welcome)?;
+            Ok(ControlHandshake::Connected(framed))
+        }
+        ServerMessage::IncompatibleProtocol { server, .. } => {
+            Ok(ControlHandshake::Incompatible { server, peer })
+        }
+        ServerMessage::EndpointError {
+            error: crate::protocol::remote::EndpointError::InvalidHandshake,
+        } => Err(unsupported_local_handshake(socket)),
+        ServerMessage::EndpointError { error } => Err(error.into()),
+        other => unexpected(other),
+    }
+}
+
+fn unsupported_local_handshake(socket: &std::path::Path) -> anyhow::Error {
+    crate::protocol::local::UnsupportedHandshake::error()
+        .context(format!("daemon does not support local negotiation; run `fut --socket {} daemon shutdown`, then retry", socket.display()))
+}
+
+async fn legacy_control_handshake(socket: &std::path::Path) -> Result<ControlHandshake> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect to {}", socket.display()))?;
@@ -4200,7 +4255,7 @@ async fn control_handshake(socket: &std::path::Path, version: u16) -> Result<Con
     let hello_request_id = send(
         &mut framed,
         ClientMessage::Hello {
-            version,
+            version: PROTOCOL_VERSION,
             client_version: env!("CARGO_PKG_VERSION").into(),
             mode: ClientMode::Control,
         },
@@ -4216,7 +4271,7 @@ async fn control_handshake(socket: &std::path::Path, version: u16) -> Result<Con
     {
         ServerMessage::Welcome {
             version: server, ..
-        } if server == version => Ok(ControlHandshake::Connected(framed)),
+        } if server == PROTOCOL_VERSION => Ok(ControlHandshake::Connected(framed)),
         ServerMessage::IncompatibleProtocol { server, .. } => {
             Ok(ControlHandshake::Incompatible { server, peer })
         }
@@ -5593,6 +5648,118 @@ mod tests {
         assert!(error.to_string().contains("non-socket"));
     }
 
+    #[tokio::test]
+    async fn ordinary_control_never_downgrades_after_legacy_handshake_rejection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request: Envelope<ClientMessage> =
+                decode_payload(&framed.next().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(request.message, ClientMessage::LocalHello(_)));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: None,
+                        message: ServerMessage::EndpointError {
+                            error: crate::protocol::remote::EndpointError::InvalidHandshake,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(framed.next().await.is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = connected_control(&socket).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::protocol::remote::EndpointError>(),
+            Some(&crate::protocol::remote::EndpointError::InvalidHandshake)
+        );
+        assert!(error.to_string().contains("daemon shutdown"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_recovers_from_a_real_legacy_handshake_rejection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request: Envelope<ClientMessage> =
+                decode_payload(&framed.next().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(request.message, ClientMessage::LocalHello(_)));
+            // Old daemons cannot deserialize the new message, so they cannot
+            // echo its request ID. This is the actual legacy error shape.
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: None,
+                        message: ServerMessage::EndpointError {
+                            error: crate::protocol::remote::EndpointError::InvalidHandshake,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            drop(framed);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request: Envelope<ClientMessage> =
+                decode_payload(&framed.next().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                request.message,
+                ClientMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    ..
+                }
+            ));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: request.request_id,
+                        message: ServerMessage::Welcome {
+                            version: PROTOCOL_VERSION,
+                            server_version: "0.38.0".into(),
+                            selected: None,
+                            extension_catalog: empty_extension_catalog(),
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let request: Envelope<ClientMessage> =
+                decode_payload(&framed.next().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(request.message, ClientMessage::Shutdown));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: request.request_id,
+                        message: ServerMessage::CommandCompleted {
+                            command: AcknowledgedCommand::Shutdown,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+        shutdown_control(&socket).await.unwrap();
+        server.await.unwrap();
+    }
+
     #[test]
     fn handshake_and_command_responses_require_the_exact_request_id() {
         let expected = Uuid::new_v4();
@@ -5607,6 +5774,14 @@ mod tests {
                 selected: None,
                 extension_catalog: empty_extension_catalog(),
             },
+            ServerMessage::LocalWelcome(crate::protocol::local::LocalWelcome {
+                generation: crate::protocol::local::GENERATION,
+                codec: crate::protocol::local::CODEC.into(),
+                server_version: "test".into(),
+                capabilities: vec![crate::protocol::local::BASELINE.into()],
+                selected: None,
+                extension_catalog: empty_extension_catalog(),
+            }),
             ServerMessage::CommandCompleted {
                 command: AcknowledgedCommand::Shutdown,
             },

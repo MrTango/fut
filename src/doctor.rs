@@ -27,10 +27,7 @@ use uuid::Uuid;
 use crate::{
     client::config,
     machines::Catalog,
-    protocol::{
-        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
-        decode_payload, encode_payload,
-    },
+    protocol::{ClientMessage, ClientMode, Envelope, ServerMessage, codec, encode_payload},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -315,7 +312,7 @@ pub async fn run(socket: &Path, location: &config::ConfigLocation) -> DoctorRepo
             "protocol",
             CheckStatus::Info,
             "skipped because no safe running socket is available".into(),
-            json!({ "client_protocol": PROTOCOL_VERSION }),
+            json!({ "local_generation": crate::protocol::local::GENERATION, "required_capabilities": [crate::protocol::local::BASELINE], "client_version": env!("CARGO_PKG_VERSION") }),
         ));
     }
     if !checks.iter().any(|check| check.id == "extensions") {
@@ -374,44 +371,50 @@ pub async fn run(socket: &Path, location: &config::ConfigLocation) -> DoctorRepo
 }
 
 async fn probe_daemon(socket: &Path) -> Vec<DoctorCheck> {
+    use crate::protocol::local::LocalHello;
+
     let request_id = Uuid::new_v4();
+    let offer = LocalHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
     let result = time::timeout(Duration::from_millis(500), async {
         let stream = UnixStream::connect(socket).await?;
         let mut framed = Framed::new(stream, codec());
         let hello = Envelope {
             request_id: Some(request_id),
-            message: ClientMessage::Hello {
-                version: PROTOCOL_VERSION,
-                client_version: env!("CARGO_PKG_VERSION").into(),
-                mode: ClientMode::Control,
-            },
+            message: ClientMessage::LocalHello(offer.clone()),
         };
         framed.send(Bytes::from(encode_payload(&hello)?)).await?;
         let response = framed
             .next()
             .await
             .ok_or_else(|| anyhow::anyhow!("daemon closed during handshake"))??;
-        let envelope = decode_payload::<Envelope<ServerMessage>>(&response)?;
+        let envelope =
+            crate::protocol::remote::decode_handshake::<Envelope<ServerMessage>>(&response)?;
+        if let ServerMessage::EndpointError { error } = &envelope.message
+            && crate::protocol::local::is_legacy_rejection(envelope.request_id, error)
+        {
+            return Err(crate::protocol::local::UnsupportedHandshake::error());
+        }
         if envelope.request_id != Some(request_id) {
             anyhow::bail!("daemon returned an uncorrelated handshake response");
+        }
+        if let ServerMessage::LocalWelcome(welcome) = &envelope.message {
+            offer.accept(welcome)?;
         }
         Ok::<ServerMessage, anyhow::Error>(envelope.message)
     })
     .await;
     match result {
-        Ok(Ok(ServerMessage::Welcome {
-            version,
-            server_version,
-            selected: None,
-            extension_catalog,
-        })) if version == PROTOCOL_VERSION => vec![
+        Ok(Ok(ServerMessage::LocalWelcome(welcome))) => vec![
             check(
                 "protocol",
                 CheckStatus::Ok,
-                format!("daemon {server_version} answered compatible protocol {version}"),
-                json!({ "client_protocol": PROTOCOL_VERSION, "server_protocol": version, "client_version": env!("CARGO_PKG_VERSION"), "server_version": server_version }),
+                format!(
+                    "daemon {} negotiated local generation {}",
+                    welcome.server_version, welcome.generation
+                ),
+                json!({ "local_generation": welcome.generation, "capabilities": welcome.capabilities, "client_version": env!("CARGO_PKG_VERSION"), "server_version": welcome.server_version }),
             ),
-            active_extensions_check(&extension_catalog),
+            active_extensions_check(&welcome.extension_catalog),
         ],
         Ok(Ok(ServerMessage::IncompatibleProtocol { client, server })) => vec![
             check(
@@ -978,6 +981,7 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::*;
+    use crate::protocol::decode_payload;
 
     fn empty_extension_catalog() -> crate::protocol::ExtensionCatalog {
         crate::protocol::ExtensionCatalog {
@@ -989,7 +993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_protocol_is_reported_as_compatible() {
+    async fn different_package_version_is_reported_as_compatible() {
         let temporary = tempfile::tempdir().unwrap();
         let socket = temporary.path().join("fut.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -1005,12 +1009,16 @@ mod tests {
                     .send(Bytes::from(
                         encode_payload(&Envelope {
                             request_id: hello.request_id,
-                            message: ServerMessage::Welcome {
-                                version: PROTOCOL_VERSION,
-                                server_version: "0.2.0".into(),
-                                selected: None,
-                                extension_catalog: empty_extension_catalog(),
-                            },
+                            message: ServerMessage::LocalWelcome(
+                                crate::protocol::local::LocalWelcome {
+                                    generation: crate::protocol::local::GENERATION,
+                                    codec: crate::protocol::remote::CODEC.into(),
+                                    capabilities: vec!["local.v1".into()],
+                                    server_version: "0.2.0".into(),
+                                    selected: None,
+                                    extension_catalog: empty_extension_catalog(),
+                                },
+                            ),
                         })
                         .unwrap(),
                     ))
@@ -1028,12 +1036,49 @@ mod tests {
         assert_eq!(protocol.status, CheckStatus::Ok);
         assert_eq!(
             protocol.summary,
-            format!("daemon 0.2.0 answered compatible protocol {PROTOCOL_VERSION}")
+            format!(
+                "daemon 0.2.0 negotiated local generation {}",
+                crate::protocol::local::GENERATION
+            )
         );
         assert_eq!(extensions.status, CheckStatus::Ok);
         assert_eq!(extensions.details["generation"], 1);
         assert_eq!(extensions.details["count"], 0);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_rejection_reports_upgrade_guidance_not_correlation_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            framed.next().await.unwrap().unwrap();
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: None,
+                        message: ServerMessage::EndpointError {
+                            error: crate::protocol::remote::EndpointError::InvalidHandshake,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+        let checks = probe_daemon(&socket).await;
+        let protocol = checks.iter().find(|check| check.id == "protocol").unwrap();
+        assert_eq!(protocol.status, CheckStatus::Error);
+        assert!(
+            protocol.summary.contains("fut daemon shutdown"),
+            "{}",
+            protocol.summary
+        );
+        assert!(!protocol.summary.contains("uncorrelated"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

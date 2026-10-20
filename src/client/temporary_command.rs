@@ -59,6 +59,13 @@ impl ExtensionCommandContext {
             .extension
             .as_ref()
             .context("extension command is missing its identity")?;
+        // Every local extension process (palette, binding, hotkey, token
+        // action, background dispatch and the host side of a remote command)
+        // resolves its context here, so this is where a daemon-catalog command
+        // that this binary may not run is refused.
+        if let Some(reason) = &extension.unavailable {
+            anyhow::bail!("{reason}");
+        }
         Ok(Self {
             focused: focused.clone(),
             workspace_root: workspace_root.to_owned(),
@@ -782,7 +789,7 @@ pub(super) fn dispatch_background_command(
         let result = match context {
             Ok(Ok(context)) => run_background_command(&command, &context, &socket_path).await,
             Ok(Err(error)) => BackgroundCommandResult::Failed(bounded_error(format!(
-                "{} config failed: {error:#}",
+                "{error:#} · {} config failed",
                 command.title
             ))),
             Err(error) => BackgroundCommandResult::Failed(bounded_error(format!(
@@ -1708,6 +1715,7 @@ mod tests {
             id: "test-extension".into(),
             root: temporary.path().to_owned(),
             command: "launch".into(),
+            unavailable: None,
         });
         let focused = SelectedTarget {
             session_id: crate::domain::SessionId::new(),
@@ -1806,6 +1814,7 @@ mod tests {
             id: "test-extension".into(),
             root: temporary.path().to_owned(),
             command: "restart".into(),
+            unavailable: None,
         });
         let focused = SelectedTarget {
             session_id: crate::domain::SessionId::new(),
@@ -1863,6 +1872,7 @@ mod tests {
             id: "test-extension".into(),
             root: temporary.path().to_owned(),
             command: "stop".into(),
+            unavailable: None,
         });
         let context = ExtensionCommandContext {
             focused: SelectedTarget {

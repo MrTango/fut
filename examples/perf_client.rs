@@ -23,9 +23,10 @@ use fut::{
         TerminalSize,
     },
     protocol::{
-        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage,
+        ClientMessage, ClientMode, Envelope, ServerMessage,
         chunked::{Assembly, ScreenAssembler},
         codec, decode_payload, encode_payload,
+        local::LocalHello,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -594,28 +595,32 @@ async fn main() -> anyhow::Result<()> {
         screens: ScreenAssembler::default(),
         pending: Frame::default(),
     };
+    let hello = LocalHello::new(
+        ClientMode::Interactive {
+            size: TerminalSize {
+                columns: args.columns,
+                rows: args.rows,
+            },
+            selector: None,
+        },
+        "fut-perf",
+    );
     send(
         &mut connection,
         Some(Uuid::new_v4()),
-        ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-            client_version: "fut-perf".into(),
-            mode: ClientMode::Interactive {
-                size: TerminalSize {
-                    columns: args.columns,
-                    rows: args.rows,
-                },
-                selector: None,
-            },
-        },
+        ClientMessage::LocalHello(hello.clone()),
     )
     .await?;
     let welcome = receive(&mut connection).await?;
     let terminal_id = match welcome.envelope.message {
-        ServerMessage::Welcome {
-            selected: Some(selected),
-            ..
-        } => selected.focused.terminal_id,
+        ServerMessage::LocalWelcome(welcome) => {
+            hello.accept(&welcome)?;
+            welcome
+                .selected
+                .context("daemon did not select a terminal")?
+                .focused
+                .terminal_id
+        }
         other => bail!("expected a welcome with a focused terminal, received {other:?}"),
     };
 

@@ -43,10 +43,13 @@ session      a project-level container
 Use `fut attach` to open the global navigator before attaching, or target an
 unambiguous resource directly with `fut session attach`, `fut workspace
 attach`, `fut tab attach`, `fut pane attach`, or `fut terminal attach`.
-For temporary access to a daemon from another Fut version, `fut attach
+Local clients negotiate a stable protocol generation and capabilities, so
+compatible Fut releases can share a daemon without restarting its terminals.
+Daemons predating this handshake need one explicit shutdown and restart.
+For temporary legacy access, `fut attach
 --ignore-protocol-mismatch` retries using the daemon's protocol. This is an
-unsafe compatibility escape hatch; unsupported protocol changes may still
-cause the client to fail.
+unsafe compatibility escape hatch; it does not override negotiated generation
+or capability failures, and unsupported legacy changes may still fail.
 
 Fut refuses to start a nested interactive client inside one of its terminals.
 If nesting is intentional, run `FUT_ALLOW_NESTED=1 fut`.
@@ -143,8 +146,9 @@ are optional: a peer without one of these disables only that feature. A missing
 extension catalog also disables its presentation styles and command listings;
 local theme and ordinary keybindings still work. An incompatible or malformed
 endpoint fails without restarting either daemon or retrying the private local
-protocol. The local exact-version check and `--ignore-protocol-mismatch` escape
-hatch are unchanged. See the [remote protocol contract](remote-protocol.md).
+protocol. Local connections use a separate [local contract](local-protocol.md),
+without exposing local-only methods to remote peers. See the
+[remote protocol contract](remote-protocol.md).
 
 Remote Fut currently requires macOS or Linux on both ends. Windows clients and
 Windows remote daemons are unsupported because the bridge connects to Fut's

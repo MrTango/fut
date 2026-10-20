@@ -15,8 +15,8 @@ use tokio::{net::UnixStream, time};
 use tokio_util::codec::Framed;
 
 use crate::protocol::{
-    ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec, decode_payload,
-    encode_payload,
+    ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec, encode_payload,
+    local::LocalHello, remote::EndpointError,
 };
 
 use super::path::{prepare_runtime_dir, runtime_dir};
@@ -103,12 +103,35 @@ fn open_daemon_log(path: &Path, incoming_bytes: u64) -> io::Result<File> {
         .open(path)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ProtocolProbe {
     Ready,
     Incompatible { server: u16 },
+    Legacy,
+    Rejected(EndpointError),
     Occupied,
     Unavailable,
+}
+
+impl ProtocolProbe {
+    /// A missing or unresponsive socket may be retried, but compatibility
+    /// failures must never start or replace a daemon.
+    fn check_ready(self, socket: &Path) -> Result<bool> {
+        match self {
+            Self::Ready => Ok(true),
+            Self::Occupied | Self::Unavailable => Ok(false),
+            Self::Legacy => Err(legacy_upgrade_error(socket)),
+            Self::Rejected(error) => bail!(
+                "daemon at {} rejected local negotiation: {error}; update the daemon explicitly before retrying",
+                socket.display()
+            ),
+            Self::Incompatible { server } => bail!(
+                "daemon at {} uses protocol {server}, but this Fut client requires protocol \
+                 {PROTOCOL_VERSION}; run `fut daemon shutdown`, then retry",
+                socket.display()
+            ),
+        }
+    }
 }
 
 /// Start a detached daemon if needed and wait until its real protocol responds.
@@ -117,18 +140,11 @@ pub async fn ensure_daemon(
     cwd: &Path,
     config_location: &crate::client::config::ConfigLocation,
 ) -> Result<()> {
-    let should_start = match probe_protocol(socket).await {
-        ProtocolProbe::Ready => return Ok(()),
-        ProtocolProbe::Incompatible { server } => {
-            bail!(
-                "daemon at {} uses protocol {server}, but this Fut client requires protocol \
-                 {PROTOCOL_VERSION}; run `fut daemon shutdown`, then retry",
-                socket.display()
-            )
-        }
-        ProtocolProbe::Occupied => false,
-        ProtocolProbe::Unavailable => true,
-    };
+    let probe = probe_protocol(socket).await;
+    let should_start = probe == ProtocolProbe::Unavailable;
+    if probe.check_ready(socket)? {
+        return Ok(());
+    }
     let log_path = daemon_log_path(socket)?;
     if should_start {
         prepare_runtime_dir(socket)?;
@@ -167,16 +183,8 @@ pub async fn ensure_daemon(
 
     let deadline = time::Instant::now() + START_DEADLINE;
     while time::Instant::now() < deadline {
-        match probe_protocol(socket).await {
-            ProtocolProbe::Ready => return Ok(()),
-            ProtocolProbe::Incompatible { server } => {
-                bail!(
-                    "daemon at {} uses protocol {server}, but this Fut client requires protocol \
-                     {PROTOCOL_VERSION}; run `fut daemon shutdown`, then retry",
-                    socket.display()
-                )
-            }
-            ProtocolProbe::Occupied | ProtocolProbe::Unavailable => {}
+        if probe_protocol(socket).await.check_ready(socket)? {
+            return Ok(());
         }
         time::sleep(Duration::from_millis(40)).await;
     }
@@ -195,6 +203,11 @@ pub async fn protocol_ready(socket: &Path) -> bool {
     probe_protocol(socket).await == ProtocolProbe::Ready
 }
 
+fn legacy_upgrade_error(socket: &Path) -> anyhow::Error {
+    crate::protocol::local::UnsupportedHandshake::error()
+        .context(format!("daemon at {} does not support local negotiation; run `fut --socket {} daemon shutdown`, then retry", socket.display(), socket.display()))
+}
+
 async fn probe_protocol(socket: &Path) -> ProtocolProbe {
     let stream = match time::timeout(PROBE_TIMEOUT, UnixStream::connect(socket)).await {
         Ok(Ok(stream)) => stream,
@@ -202,41 +215,52 @@ async fn probe_protocol(socket: &Path) -> ProtocolProbe {
     };
     time::timeout(PROBE_TIMEOUT, async {
         let mut framed = Framed::new(stream, codec());
+        let hello = LocalHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
         framed
             .send(Bytes::from(encode_payload(&Envelope {
                 request_id: None,
-                message: ClientMessage::Hello {
-                    version: PROTOCOL_VERSION,
-                    client_version: env!("CARGO_PKG_VERSION").into(),
-                    mode: ClientMode::Control,
-                },
+                message: ClientMessage::LocalHello(hello.clone()),
             })?))
             .await?;
         let frame = framed.next().await.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no welcome")
         })??;
-        let response: Envelope<ServerMessage> = decode_payload(&frame)?;
-        Ok::<ServerMessage, anyhow::Error>(response.message)
+        let response: Envelope<ServerMessage> =
+            match crate::protocol::remote::decode_handshake(&frame) {
+                Ok(response) => response,
+                Err(error) => return Ok(ProtocolProbe::Rejected(error)),
+            };
+        if response.request_id.is_some() {
+            return Ok(ProtocolProbe::Rejected(EndpointError::InvalidHandshake));
+        }
+        if let ServerMessage::EndpointError { error } = &response.message
+            && crate::protocol::local::is_legacy_rejection(response.request_id, error)
+        {
+            return Ok(ProtocolProbe::Legacy);
+        }
+        Ok::<ProtocolProbe, anyhow::Error>(match response.message {
+            ServerMessage::LocalWelcome(welcome) => match hello.accept(&welcome) {
+                Ok(_) => ProtocolProbe::Ready,
+                Err(error) => ProtocolProbe::Rejected(error),
+            },
+            ServerMessage::IncompatibleProtocol { server, .. } => {
+                ProtocolProbe::Incompatible { server }
+            }
+            ServerMessage::EndpointError { error } => ProtocolProbe::Rejected(error),
+            _ => ProtocolProbe::Occupied,
+        })
     })
     .await
     .map_or(ProtocolProbe::Occupied, |result| match result {
-        Ok(ServerMessage::Welcome {
-            version: PROTOCOL_VERSION,
-            ..
-        }) => ProtocolProbe::Ready,
-        Ok(
-            ServerMessage::Welcome {
-                version: server, ..
-            }
-            | ServerMessage::IncompatibleProtocol { server, .. },
-        ) => ProtocolProbe::Incompatible { server },
-        Ok(_) | Err(_) => ProtocolProbe::Occupied,
+        Ok(probe) => probe,
+        Err(_) => ProtocolProbe::Occupied,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::decode_payload;
 
     #[tokio::test]
     async fn absent_socket_is_not_ready() {
@@ -258,13 +282,7 @@ mod tests {
                     continue;
                 };
                 let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
-                assert!(matches!(
-                    hello.message,
-                    ClientMessage::Hello {
-                        version: PROTOCOL_VERSION,
-                        ..
-                    }
-                ));
+                assert!(matches!(hello.message, ClientMessage::LocalHello(_)));
                 let _ = framed
                     .send(Bytes::from(
                         encode_payload(&Envelope {
@@ -297,6 +315,114 @@ mod tests {
         );
         assert!(!temporary.path().join("fut-daemon.log").exists());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn negotiated_daemon_is_ready_despite_package_version_skew() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request = framed.next().await.unwrap().unwrap();
+            let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
+            assert!(matches!(hello.message, ClientMessage::LocalHello(_)));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: hello.request_id,
+                        message: ServerMessage::LocalWelcome(
+                            crate::protocol::local::LocalWelcome {
+                                generation: crate::protocol::local::GENERATION,
+                                codec: crate::protocol::local::CODEC.into(),
+                                server_version: "9.999.0".into(),
+                                capabilities: vec![crate::protocol::local::BASELINE.into()],
+                                selected: None,
+                                extension_catalog: crate::protocol::ExtensionCatalog {
+                                    generation: 1,
+                                    fingerprint: "0".repeat(64),
+                                    extensions: Vec::new(),
+                                    config: Default::default(),
+                                },
+                            },
+                        ),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+        let config = crate::client::config::resolve_location(None).unwrap();
+        ensure_daemon(&socket, temporary.path(), &config)
+            .await
+            .unwrap();
+        assert!(!temporary.path().join("fut-daemon.log").exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_rejection_explains_explicit_upgrade_without_starting_a_daemon() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            framed.next().await.unwrap().unwrap();
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: None,
+                        message: ServerMessage::EndpointError {
+                            error: EndpointError::InvalidHandshake,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+        let config = crate::client::config::resolve_location(None).unwrap();
+        let error = ensure_daemon(&socket, temporary.path(), &config)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("daemon shutdown"), "{error}");
+        assert!(error.to_string().contains(socket.to_str().unwrap()));
+        assert!(!temporary.path().join("fut-daemon.log").exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_negotiation_never_starts_a_replacement_daemon() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request = framed.next().await.unwrap().unwrap();
+            let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: hello.request_id,
+                        message: ServerMessage::EndpointError {
+                            error: EndpointError::MissingRequiredCapability,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+        let config = crate::client::config::resolve_location(None).unwrap();
+        let error = ensure_daemon(&socket, temporary.path(), &config)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing a required capability"));
+        assert!(!temporary.path().join("fut-daemon.log").exists());
+        server.await.unwrap();
     }
 
     #[test]

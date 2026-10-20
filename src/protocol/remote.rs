@@ -46,15 +46,15 @@ pub struct RemoteWelcome {
 #[derive(Clone, Debug, Eq, PartialEq, Error, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EndpointError {
-    #[error("incompatible remote generation: client {client}, server {server}")]
+    #[error("incompatible endpoint generation: client {client}, server {server}")]
     IncompatibleGeneration { client: u16, server: u16 },
-    #[error("unsupported remote codec")]
+    #[error("unsupported endpoint codec")]
     UnsupportedCodec,
-    #[error("remote endpoint is missing a required capability")]
+    #[error("endpoint is missing a required capability")]
     MissingRequiredCapability,
-    #[error("invalid remote handshake")]
+    #[error("invalid endpoint handshake")]
     InvalidHandshake,
-    #[error("remote method was not negotiated")]
+    #[error("endpoint method was not negotiated")]
     MethodNotNegotiated,
 }
 
@@ -400,7 +400,7 @@ impl RemoteHello {
     }
 }
 
-fn validate_version(version: &str) -> Result<(), EndpointError> {
+pub(super) fn validate_version(version: &str) -> Result<(), EndpointError> {
     if version.is_empty()
         || version.len() > MAX_VERSION_BYTES
         || !version
@@ -412,7 +412,7 @@ fn validate_version(version: &str) -> Result<(), EndpointError> {
     Ok(())
 }
 
-fn validate_name(name: &str) -> Result<(), EndpointError> {
+pub(super) fn validate_name(name: &str) -> Result<(), EndpointError> {
     if name.is_empty()
         || name.len() > MAX_NAME_BYTES
         || !name
@@ -424,7 +424,9 @@ fn validate_name(name: &str) -> Result<(), EndpointError> {
     Ok(())
 }
 
-fn validate_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<(), EndpointError> {
+pub(super) fn validate_names<'a>(
+    names: impl Iterator<Item = &'a String>,
+) -> Result<(), EndpointError> {
     let mut seen = HashSet::new();
     for name in names {
         validate_name(name)?;
@@ -435,7 +437,9 @@ fn validate_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<(), End
     Ok(())
 }
 
-fn capability_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+pub(super) fn capability_list<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
     struct List;
     impl<'de> de::Visitor<'de> for List {
         type Value = Vec<String>;
@@ -460,8 +464,8 @@ fn capability_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Str
     deserializer.deserialize_seq(List)
 }
 
-/// Strict decoding is only needed at the remote handshake boundary; retain
-/// the existing fast slice decoder for terminal traffic and the local protocol.
+/// Strict decoding for negotiated local and remote handshake boundaries;
+/// retain the existing fast slice decoder for terminal traffic.
 pub fn decode_handshake<T: de::DeserializeOwned>(payload: &[u8]) -> Result<T, EndpointError> {
     super::validate_payload_len(payload.len()).map_err(|_| EndpointError::InvalidHandshake)?;
     let mut decoder = rmp_serde::Deserializer::new(std::io::Cursor::new(payload));

@@ -3,6 +3,10 @@
 #[path = "ssh_bridge/mod.rs"]
 mod ssh_bridge_tests;
 
+// The byte-transparent stdio bridge test still calls the legacy helper by its
+// original name. Keep that explicit wire contract without migrating its module.
+use legacy_hello as hello;
+
 use std::{
     collections::HashMap,
     fs,
@@ -611,7 +615,7 @@ impl Harness {
                     self.logs()
                 );
                 if let Ok(mut connection) = self.connect().await
-                    && hello(&mut connection, ClientMode::Control, PROTOCOL_VERSION)
+                    && local_hello(&mut connection, ClientMode::Control)
                         .await
                         .is_ok_and(|message| matches!(message, ServerMessage::Welcome { .. }))
                 {
@@ -665,20 +669,14 @@ impl Harness {
         time::timeout(DEADLINE, async {
             loop {
                 let mut connection = self.connect().await.expect("connect interactive client");
-                let welcome = hello(
-                    &mut connection,
-                    interactive_mode(selector.clone()),
-                    PROTOCOL_VERSION,
-                )
-                .await
-                .expect("receive interactive welcome");
+                let welcome = local_hello(&mut connection, interactive_mode(selector.clone()))
+                    .await
+                    .expect("receive interactive welcome");
                 match welcome {
                     ServerMessage::Welcome {
-                        version,
                         selected: Some(selected),
                         ..
                     } => {
-                        assert_eq!(version, PROTOCOL_VERSION);
                         self.terminal_pid = Some(selected.focused.child_pid);
                         return (
                             connection,
@@ -701,7 +699,7 @@ impl Harness {
     async fn control_command(&self, message: ClientMessage) -> ServerMessage {
         let mut connection = self.connect().await.expect("connect control client");
         assert!(matches!(
-            hello(&mut connection, ClientMode::Control, PROTOCOL_VERSION)
+            local_hello(&mut connection, ClientMode::Control)
                 .await
                 .expect("receive control welcome"),
             ServerMessage::Welcome { .. }
@@ -4360,7 +4358,7 @@ argv = ["true"]
 
     let mut watcher = harness.connect().await.unwrap();
     assert!(matches!(
-        hello(&mut watcher, ClientMode::Control, PROTOCOL_VERSION)
+        local_hello(&mut watcher, ClientMode::Control)
             .await
             .unwrap(),
         ServerMessage::Welcome { .. }
@@ -5429,13 +5427,9 @@ scope = "workspace"
     let ServerMessage::Welcome {
         extension_catalog: after_failure_catalog,
         ..
-    } = hello(
-        &mut after_failure_connection,
-        ClientMode::Control,
-        PROTOCOL_VERSION,
-    )
-    .await
-    .unwrap()
+    } = local_hello(&mut after_failure_connection, ClientMode::Control)
+        .await
+        .unwrap()
     else {
         panic!("expected welcome after failed reload")
     };
@@ -5537,7 +5531,7 @@ scope = "workspace"
     let ServerMessage::Welcome {
         extension_catalog: initial_a,
         ..
-    } = hello(&mut client_a, interactive_mode(None), PROTOCOL_VERSION)
+    } = local_hello(&mut client_a, interactive_mode(None))
         .await
         .unwrap()
     else {
@@ -5547,7 +5541,7 @@ scope = "workspace"
     let ServerMessage::Welcome {
         extension_catalog: initial_b,
         ..
-    } = hello(&mut client_b, interactive_mode(None), PROTOCOL_VERSION)
+    } = local_hello(&mut client_b, interactive_mode(None))
         .await
         .unwrap()
     else {
@@ -5604,7 +5598,7 @@ presentation = "spinner"
     let ServerMessage::Welcome {
         extension_catalog: still_initial,
         ..
-    } = hello(&mut before_commit, interactive_mode(None), PROTOCOL_VERSION)
+    } = local_hello(&mut before_commit, interactive_mode(None))
         .await
         .unwrap()
     else {
@@ -5645,7 +5639,7 @@ presentation = "spinner"
     let ServerMessage::Welcome {
         extension_catalog: reconnect_catalog,
         ..
-    } = hello(&mut reconnected, interactive_mode(None), PROTOCOL_VERSION)
+    } = local_hello(&mut reconnected, interactive_mode(None))
         .await
         .unwrap()
     else {
@@ -5751,13 +5745,9 @@ argv = ["./final"]
     let ServerMessage::Welcome {
         extension_catalog: final_catalog,
         ..
-    } = hello(
-        &mut final_reconnect,
-        interactive_mode(None),
-        PROTOCOL_VERSION,
-    )
-    .await
-    .unwrap()
+    } = local_hello(&mut final_reconnect, interactive_mode(None))
+        .await
+        .unwrap()
     else {
         panic!("expected final reconnect welcome")
     };
@@ -5800,7 +5790,7 @@ async fn daemon_git_tokens_publish_atomic_shared_snapshots_on_live_directory_cha
     for _ in 0..2 {
         let mut watcher = harness.connect().await.unwrap();
         assert!(matches!(
-            hello(&mut watcher, ClientMode::Control, PROTOCOL_VERSION)
+            local_hello(&mut watcher, ClientMode::Control)
                 .await
                 .unwrap(),
             ServerMessage::Welcome { .. }
@@ -6852,10 +6842,9 @@ async fn interactive_tab_view_streams_all_panes_with_per_client_focus() {
     let ServerMessage::Welcome {
         selected: Some(first_view),
         ..
-    } = hello(
+    } = local_hello(
         &mut first,
         interactive_mode(Some(TargetSelector::Pane(pane_a))),
-        PROTOCOL_VERSION,
     )
     .await
     .unwrap()
@@ -7044,10 +7033,9 @@ async fn external_pane_moves_reconcile_both_tabs_and_preserve_per_client_focus()
     let ServerMessage::Welcome {
         selected: Some(first_view),
         ..
-    } = hello(
+    } = local_hello(
         &mut first,
         interactive_mode(Some(TargetSelector::Pane(pane_a))),
-        PROTOCOL_VERSION,
     )
     .await
     .unwrap()
@@ -7067,10 +7055,9 @@ async fn external_pane_moves_reconcile_both_tabs_and_preserve_per_client_focus()
     let ServerMessage::Welcome {
         selected: Some(second_view),
         ..
-    } = hello(
+    } = local_hello(
         &mut second,
         interactive_mode(Some(TargetSelector::Pane(pane_b.pane_id))),
-        PROTOCOL_VERSION,
     )
     .await
     .unwrap()
@@ -7206,10 +7193,9 @@ async fn external_pane_closes_reconcile_background_then_transfer_focused_input()
     let ServerMessage::Welcome {
         selected: Some(view),
         ..
-    } = hello(
+    } = local_hello(
         &mut attached,
         interactive_mode(Some(TargetSelector::Pane(pane_a))),
-        PROTOCOL_VERSION,
     )
     .await
     .unwrap()
@@ -9737,7 +9723,7 @@ done
 
     let mut ambiguous = harness.connect().await.unwrap();
     assert!(matches!(
-        hello(&mut ambiguous, interactive_mode(None), PROTOCOL_VERSION).await.unwrap(),
+        local_hello(&mut ambiguous, interactive_mode(None)).await.unwrap(),
         ServerMessage::Error { ref code, .. } if code == "target_required"
     ));
 
@@ -9927,12 +9913,11 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
 
     let mut ambiguous = harness.connect().await.unwrap();
     assert!(matches!(
-        hello(
+        local_hello(
             &mut ambiguous,
             interactive_mode(Some(TargetSelector::Session(SessionSelector::Id(
                 snapshot.sessions[0].id,
             )))),
-            PROTOCOL_VERSION,
         )
         .await
         .unwrap(),
@@ -10087,7 +10072,7 @@ panes = [
 
     let mut watcher = harness.connect().await.unwrap();
     assert!(matches!(
-        hello(&mut watcher, ClientMode::Control, PROTOCOL_VERSION)
+        local_hello(&mut watcher, ClientMode::Control)
             .await
             .unwrap(),
         ServerMessage::Welcome { .. }
@@ -10580,7 +10565,7 @@ async fn workspace_retirement_waits_for_its_acknowledgement_connection() {
 
     let mut retirement = harness.connect().await.unwrap();
     assert!(matches!(
-        hello(&mut retirement, ClientMode::Control, PROTOCOL_VERSION)
+        local_hello(&mut retirement, ClientMode::Control)
             .await
             .unwrap(),
         ServerMessage::Welcome { .. }
@@ -10880,7 +10865,7 @@ async fn terminal_attachments_share_input_and_use_the_smallest_client_geometry()
     let ServerMessage::Welcome {
         selected: Some(first_selected),
         ..
-    } = hello(
+    } = local_hello(
         &mut first,
         interactive_mode_with_size(
             Some(TargetSelector::Session(SessionSelector::Name("cwd".into()))),
@@ -10889,7 +10874,6 @@ async fn terminal_attachments_share_input_and_use_the_smallest_client_geometry()
                 rows: 40,
             },
         ),
-        PROTOCOL_VERSION,
     )
     .await
     .unwrap()
@@ -10902,7 +10886,7 @@ async fn terminal_attachments_share_input_and_use_the_smallest_client_geometry()
     let ServerMessage::Welcome {
         selected: Some(second_selected),
         ..
-    } = hello(
+    } = local_hello(
         &mut second,
         interactive_mode_with_size(
             Some(TargetSelector::Terminal(terminal_id)),
@@ -10911,7 +10895,6 @@ async fn terminal_attachments_share_input_and_use_the_smallest_client_geometry()
                 rows: 30,
             },
         ),
-        PROTOCOL_VERSION,
     )
     .await
     .unwrap()
@@ -15354,8 +15337,12 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
         .unwrap();
     assert_eq!(protocol["status"], "ok");
     assert_eq!(
-        protocol["details"]["client_protocol"],
-        serde_json::json!(PROTOCOL_VERSION)
+        protocol["details"]["local_generation"],
+        serde_json::json!(fut::protocol::local::GENERATION)
+    );
+    assert_eq!(
+        protocol["details"]["capabilities"],
+        serde_json::json!(["local.v1"])
     );
     let after = harness.resources().await;
     assert_eq!(without_observations(after), without_observations(before));
@@ -15815,10 +15802,9 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
     let (mut after_eof, selected) = time::timeout(DEADLINE, async {
         loop {
             let mut contender = harness.connect().await.expect("connect EOF contender");
-            match hello(
+            match local_hello(
                 &mut contender,
                 interactive_mode(Some(TargetSelector::Terminal(c.terminal_id))),
-                PROTOCOL_VERSION,
             )
             .await
             .unwrap()
@@ -15841,12 +15827,139 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
 }
 
 #[tokio::test]
+async fn negotiated_local_protocol_accepts_package_version_skew_and_private_control() {
+    use fut::protocol::local::LocalHello;
+
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+    for version in ["0.1.0", env!("CARGO_PKG_VERSION"), "9.999.0-dev"] {
+        let mut connection = harness.connect().await.unwrap();
+        let offer = LocalHello::new(ClientMode::Control, version);
+        let request_id = Uuid::new_v4();
+        send_envelope(
+            &mut connection,
+            Envelope {
+                request_id: Some(request_id),
+                message: ClientMessage::LocalHello(offer.clone()),
+            },
+        )
+        .await;
+        let response = receive_envelope(&mut connection).await.unwrap();
+        assert_eq!(response.request_id, Some(request_id));
+        let ServerMessage::LocalWelcome(welcome) = response.message else {
+            panic!("expected negotiated local welcome")
+        };
+        offer.accept(&welcome).unwrap();
+        send(&mut connection, ClientMessage::Ping).await;
+        assert!(matches!(
+            receive(&mut connection).await,
+            Some(ServerMessage::Pong { .. })
+        ));
+    }
+
+    // Shutdown remains a local privilege; negotiating capabilities must not
+    // accidentally put local connections behind the remote method allowlist.
+    let mut connection = harness.connect().await.unwrap();
+    send(
+        &mut connection,
+        ClientMessage::LocalHello(LocalHello::new(ClientMode::Control, "9.999.0")),
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut connection).await,
+        Some(ServerMessage::LocalWelcome(_))
+    ));
+    send(&mut connection, ClientMessage::Shutdown).await;
+    assert_eq!(
+        receive(&mut connection).await,
+        Some(ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::Shutdown,
+        })
+    );
+    harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn rejected_local_negotiation_never_leases_or_replaces_a_terminal() {
+    use fut::protocol::{local::LocalHello, remote::EndpointError};
+
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let before = harness.resources().await;
+    let terminal = &before.sessions[0].workspaces[0].tabs[0].panes[0];
+    let terminal_id = terminal.terminal_id;
+    for missing_capability in [false, true] {
+        let mut offer = LocalHello::new(interactive_mode(None), "9.999.0");
+        let expected = if missing_capability {
+            offer.required.push("future.v1".into());
+            EndpointError::MissingRequiredCapability
+        } else {
+            offer.generation += 1;
+            EndpointError::IncompatibleGeneration {
+                client: offer.generation,
+                server: fut::protocol::local::GENERATION,
+            }
+        };
+        let mut connection = harness.connect().await.unwrap();
+        send(&mut connection, ClientMessage::LocalHello(offer)).await;
+        assert_eq!(
+            receive(&mut connection).await,
+            Some(ServerMessage::EndpointError { error: expected })
+        );
+        assert!(
+            time::timeout(DEADLINE, connection.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut connection = harness.connect().await.unwrap();
+    let offer = LocalHello::new(interactive_mode(None), "0.1.0");
+    send(&mut connection, ClientMessage::LocalHello(offer.clone())).await;
+    let Some(ServerMessage::LocalWelcome(welcome)) = receive(&mut connection).await else {
+        panic!("rejected offers leaked an interactive lease")
+    };
+    offer.accept(&welcome).unwrap();
+    assert_eq!(welcome.selected.unwrap().focused.terminal_id, terminal_id);
+    harness.detach(&mut connection).await;
+    let after = harness.resources().await;
+    assert_eq!(
+        after.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id,
+        terminal_id
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_exact_match_still_supports_control_and_interactive_clients() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    for mode in [ClientMode::Control, interactive_mode(None)] {
+        let interactive = matches!(mode, ClientMode::Interactive { .. });
+        let mut connection = harness.connect().await.unwrap();
+        let ServerMessage::Welcome {
+            version, selected, ..
+        } = legacy_hello(&mut connection, mode, PROTOCOL_VERSION)
+            .await
+            .unwrap()
+        else {
+            panic!("exact-match legacy hello must receive a legacy welcome")
+        };
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert_eq!(selected.is_some(), interactive);
+        assert!(matches!(
+            correlated_command(&mut connection, ClientMessage::Ping).await,
+            ServerMessage::Pong { .. }
+        ));
+        harness.detach(&mut connection).await;
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn unsupported_protocol_is_rejected_without_harming_daemon() {
     let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
     let mut incompatible = harness.connect().await.expect("connect mismatched client");
     let unsupported = PROTOCOL_VERSION + 1;
     assert_eq!(
-        hello(&mut incompatible, interactive_mode(None), unsupported)
+        legacy_hello(&mut incompatible, interactive_mode(None), unsupported)
             .await
             .expect("receive protocol rejection"),
         ServerMessage::IncompatibleProtocol {
@@ -15885,7 +15998,7 @@ async fn control_connections_never_reply_to_fire_and_forget_ui_messages() {
     let terminal_id = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
     let mut control = harness.connect().await.expect("connect control client");
     assert!(matches!(
-        hello(&mut control, ClientMode::Control, PROTOCOL_VERSION)
+        local_hello(&mut control, ClientMode::Control)
             .await
             .expect("receive control welcome"),
         ServerMessage::Welcome { .. }
@@ -16447,7 +16560,7 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
 
     let mut control = harness.connect().await.unwrap();
     assert!(matches!(
-        hello(&mut control, ClientMode::Control, PROTOCOL_VERSION)
+        local_hello(&mut control, ClientMode::Control)
             .await
             .unwrap(),
         ServerMessage::Welcome { .. }
@@ -16569,15 +16682,321 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
     harness.shutdown().await;
 }
 
-async fn hello(
+// Representative, hand-authored local.v1 serialized fixtures, deliberately
+// independent of package versions and production constructors/defaults. These
+// pin complete field maps (including omitted defaults), not just self-roundtrips.
+fn local_v1_fixture<T>(fixture: Value) -> Envelope<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+{
+    let expected: Envelope<T> = serde_json::from_value(fixture.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&expected).unwrap(), fixture);
+    let bytes = encode_payload(&expected).unwrap();
+    // The outer envelope must remain a named map, not a positional struct.
+    assert!(matches!(bytes[0], 0x81 | 0x82));
+    let decoded: Envelope<T> = decode_payload(&bytes).unwrap();
+    assert_eq!(decoded, expected);
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), fixture);
+    decoded
+}
+
+const LOCAL_FIXTURE_SESSION: &str = "00000000-0000-0000-0000-000000000001";
+const LOCAL_FIXTURE_WORKSPACE: &str = "00000000-0000-0000-0000-000000000002";
+const LOCAL_FIXTURE_TAB: &str = "00000000-0000-0000-0000-000000000003";
+const LOCAL_FIXTURE_PANE: &str = "00000000-0000-0000-0000-000000000004";
+const LOCAL_FIXTURE_TERMINAL: &str = "00000000-0000-0000-0000-000000000005";
+const LOCAL_FIXTURE_REQUEST: &str = "00000000-0000-0000-0000-000000000006";
+
+#[test]
+fn local_v1_metadata_fixture_preserves_nested_workspaces_status_tokens_and_defaults() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/local-v1/resources.json")).unwrap();
+    let response = local_v1_fixture::<ServerMessage>(fixture.clone());
+    let ServerMessage::Resources { snapshot, .. } = response.message else {
+        unreachable!()
+    };
+    let session = &snapshot.sessions[0];
+    assert!(session.trusted_project_config.is_none());
+    let workspace = &session.workspaces[0];
+    assert!(workspace.parent_workspace_id.is_some());
+    assert!(workspace.tokens.is_empty());
+    assert!(workspace.tabs[0].tokens.is_empty());
+    let status = &workspace.tabs[0].panes[0].activity;
+    assert_eq!((status.attention_revision, status.read_revision), (0, 0));
+    assert_eq!(status.records[0].attention_revision, 0);
+
+    // Flat workspaces and empty status remain the omitted/default form.
+    let mut flat = fixture;
+    let workspace = &mut flat["message"]["snapshot"]["sessions"][0]["workspaces"][0];
+    workspace
+        .as_object_mut()
+        .unwrap()
+        .remove("parent_workspace_id");
+    workspace["tabs"][0]["panes"][0]["activity"] =
+        serde_json::json!({"records": [], "revision": 0});
+    let response = local_v1_fixture::<ServerMessage>(flat);
+    let ServerMessage::Resources { snapshot, .. } = response.message else {
+        unreachable!()
+    };
+    assert!(
+        snapshot.sessions[0].workspaces[0]
+            .parent_workspace_id
+            .is_none()
+    );
+    assert_eq!(
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity,
+        fut::domain::ProgramStatus::default()
+    );
+}
+
+#[test]
+fn local_v1_screen_delta_image_and_chunk_fixtures_preserve_compact_fields() {
+    let screen = serde_json::json!({
+        "r": 10, "s": {"c": 2, "r": 2}, "c": ["A", "B", "C", "D"],
+        "p": {"c": 0, "r": 1, "v": true}, "v": {"b": 0, "m": 4}
+    });
+    let response = local_v1_fixture::<ServerMessage>(serde_json::json!({"message": {
+        "type": "snapshot", "terminal_id": LOCAL_FIXTURE_TERMINAL, "screen": screen
+    }}));
+    let ServerMessage::Snapshot {
+        screen: mut base, ..
+    } = response.message
+    else {
+        unreachable!()
+    };
+    assert!(base.hyperlinks.is_empty());
+    assert!(!base.mouse_tracking);
+    assert!(base.graphics.images.is_empty());
+    assert_eq!(base.cursor.shape, fut::domain::CursorShape::Block);
+    assert!(!base.cursor.blinking);
+    let response = local_v1_fixture::<ServerMessage>(serde_json::json!({"message": {
+        "type": "snapshot_delta", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+        "delta": {"r": 11, "b": 10, "s": {"c": 2, "r": 2},
+            "x": {"t": 0, "e": 2, "n": 1}, "d": [{"i": 1, "c": ["E", "F"]}],
+            "p": {"c": 1, "r": 1, "v": true, "s": "bar", "b": true},
+            "v": {"b": 0, "m": 5}}
+    }}));
+    let ServerMessage::SnapshotDelta { delta, .. } = response.message else {
+        unreachable!()
+    };
+    assert!(delta.graphics.is_none());
+    base.apply_delta(delta).unwrap();
+    assert_eq!(snapshot_text(&base), "CD\nEF");
+
+    let image = local_v1_fixture::<ServerMessage>(serde_json::json!({"message": {
+        "type": "kitty_image", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+        "image": {"i": 7, "g": 2, "d": [137, 80, 78, 71, 13, 10, 26, 10]}
+    }}));
+    // PNG pixels use MessagePack bin, unlike attachment Vec<u8> arrays.
+    assert!(
+        encode_payload(&image)
+            .unwrap()
+            .windows(2)
+            .any(|bytes| bytes == [0xc4, 8])
+    );
+
+    let mut styled = screen.clone();
+    styled["c"] = serde_json::json!([["A", 0, true, 0], "B", "C", "D"]);
+    styled["h"] = serde_json::json!(["https://example.invalid/"]);
+    styled["m"] = serde_json::json!(true);
+    styled["g"] = serde_json::json!({"i": [{"i": 7, "g": 2, "d": []}], "p": [{
+        "i": 7, "p": 1, "c": 0, "r": 0, "w": 1, "h": 1,
+        "x": 0, "y": 0, "s": 1, "t": 1, "z": -1
+    }]});
+    local_v1_fixture::<ServerMessage>(serde_json::json!({"message": {
+        "type": "snapshot", "terminal_id": LOCAL_FIXTURE_TERMINAL, "screen": styled
+    }}));
+
+    let mut assembler = ScreenAssembler::default();
+    let mut header = screen.clone();
+    header["c"] = serde_json::json!([]);
+    for message in [
+        serde_json::json!({"type": "screen_begin", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+            "begin": {"n": 2, "f": {"snapshot": header}}}),
+        serde_json::json!({"type": "screen_rows", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+            "revision": 10, "rows": [{"i": 0, "c": ["A", "B"]}, {"i": 1, "c": ["C", "D"]}]}),
+    ] {
+        let response = local_v1_fixture::<ServerMessage>(serde_json::json!({"message": message}));
+        assert!(matches!(
+            assembler.accept(response.message),
+            Assembly::Pending
+        ));
+    }
+    let end = local_v1_fixture::<ServerMessage>(serde_json::json!({"message": {
+        "type": "screen_end", "terminal_id": LOCAL_FIXTURE_TERMINAL, "revision": 10
+    }}));
+    let Assembly::Ready(ServerMessage::Snapshot {
+        screen: assembled, ..
+    }) = assembler.accept(end.message)
+    else {
+        panic!("fixture chunks did not assemble")
+    };
+    assert_eq!(serde_json::to_value(assembled).unwrap(), screen);
+
+    // Historical screen defaults decode from actual MessagePack maps too.
+    let mut minimal = screen;
+    minimal.as_object_mut().unwrap().remove("v");
+    let defaulted: ScreenSnapshot = decode_payload(&encode_payload(&minimal).unwrap()).unwrap();
+    assert_eq!(defaulted.scroll, fut::domain::ScrollPosition::default());
+}
+
+#[test]
+fn local_v1_configured_command_fixtures_preserve_specs_operations_and_replies() {
+    let command = serde_json::json!({
+        "title": "Review", "program": "/fixture/review", "args": ["--all"],
+        "execution": {"Interactive": {"size": {"width": 80, "height": null}, "activate_opened": false}},
+        "extension": {"id": "review", "command": "open"}, "extension_args_override": true
+    });
+    for message in [
+        serde_json::json!({"type": "command_defaults", "command": command, "target": LOCAL_FIXTURE_TERMINAL}),
+        serde_json::json!({"type": "command_start", "command": command, "target": LOCAL_FIXTURE_TERMINAL,
+            "size": {"c": 80, "r": 24}, "form": {"query": "test"}}),
+        serde_json::json!({"type": "command_operation", "operation": {"Paste": "hello"}}),
+        serde_json::json!({"type": "command_operation", "operation": {"FinishClipboard": {
+            "request_id": LOCAL_FIXTURE_REQUEST, "copied": true}}}),
+    ] {
+        local_v1_fixture::<ClientMessage>(serde_json::json!({
+            "request_id": LOCAL_FIXTURE_REQUEST, "message": message
+        }));
+    }
+    for reply in [
+        serde_json::json!({"Defaults": {"values": {"query": "test"}}}),
+        serde_json::json!({"Ack": {"clipboard": {"request_id": LOCAL_FIXTURE_REQUEST, "text": "copied"}, "handled": true}}),
+        serde_json::json!({"Done": {"exit_code": 0, "activated_target": null, "failure_output": null}}),
+    ] {
+        local_v1_fixture::<ServerMessage>(serde_json::json!({
+            "request_id": LOCAL_FIXTURE_REQUEST, "message": {"type": "command_reply", "reply": reply}
+        }));
+    }
+}
+
+#[test]
+fn local_v1_attachment_automation_and_context_fixtures_preserve_local_only_contracts() {
+    let context = serde_json::json!({
+        "session_id": LOCAL_FIXTURE_SESSION, "workspace_id": LOCAL_FIXTURE_WORKSPACE,
+        "tab_id": LOCAL_FIXTURE_TAB, "pane_id": LOCAL_FIXTURE_PANE,
+        "terminal_id": LOCAL_FIXTURE_TERMINAL
+    });
+    let caps = fut::protocol::local::LocalHello::new(ClientMode::Control, "0.1.0")
+        .negotiate()
+        .unwrap();
+    for message in [
+        serde_json::json!({"type": "attachment_begin", "transfer_id": LOCAL_FIXTURE_REQUEST,
+            "terminal_id": LOCAL_FIXTURE_TERMINAL, "size": 8}),
+        serde_json::json!({"type": "attachment_chunk", "transfer_id": LOCAL_FIXTURE_REQUEST,
+            "bytes": [137, 80, 78, 71, 13, 10, 26, 10]}),
+        serde_json::json!({"type": "attachment_commit", "transfer_id": LOCAL_FIXTURE_REQUEST}),
+        serde_json::json!({"type": "attachment_cancel", "transfer_id": LOCAL_FIXTURE_REQUEST}),
+    ] {
+        let envelope = local_v1_fixture::<ClientMessage>(serde_json::json!({"message": message}));
+        assert!(caps.allows_client(&envelope.message));
+        assert!(envelope.request_id.is_none(), "uploads are fire-and-forget");
+    }
+    for message in [
+        serde_json::json!({"type": "terminal_input", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+            "operation": {"type": "run", "text": "cargo test"}}),
+        serde_json::json!({"type": "wait_terminal_output", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+            "source": "recent_unwrapped", "rows": 40, "matcher": {"kind": "regex", "value": "READY.*"}, "timeout_ms": 500}),
+        serde_json::json!({"type": "prompt_agent", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+            "text": "Review", "mode": {"kind": "wait", "timeout_ms": 500}}),
+        serde_json::json!({"type": "wait_agent", "terminal_id": LOCAL_FIXTURE_TERMINAL, "timeout_ms": 500}),
+        serde_json::json!({"type": "report_agent", "terminal_id": LOCAL_FIXTURE_TERMINAL,
+            "report": {"type": "report", "value": {"state": "working"}}, "source": {"type": "report"}}),
+        serde_json::json!({"type": "contextual", "context": context,
+            "command": {"type": "create_tab", "argv": []}}),
+        serde_json::json!({"type": "retire_workspace", "workspace_id": LOCAL_FIXTURE_WORKSPACE, "context": context}),
+    ] {
+        let envelope = local_v1_fixture::<ClientMessage>(serde_json::json!({
+            "request_id": LOCAL_FIXTURE_REQUEST, "message": message
+        }));
+        assert!(caps.allows_client(&envelope.message));
+    }
+    let defaulted: ClientMessage = decode_payload(
+        &encode_payload(&serde_json::json!({
+            "type": "contextual", "context": context, "command": {"type": "create_tab"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let ClientMessage::Contextual {
+        command:
+            fut::protocol::ContextualCommand::CreateTab {
+                name,
+                cwd,
+                program,
+                argv,
+            },
+        ..
+    } = defaulted
+    else {
+        unreachable!()
+    };
+    assert_eq!((name, cwd, program, argv), (None, None, None, Vec::new()));
+    local_v1_fixture::<ServerMessage>(serde_json::json!({
+        "request_id": LOCAL_FIXTURE_REQUEST, "message": {"type": "agent_settled",
+            "terminal_id": LOCAL_FIXTURE_TERMINAL, "barrier_revision": 10,
+            "activity": {"records": [], "revision": 11}}
+    }));
+}
+
+/// All ordinary harness clients exercise the negotiated local boundary. Only
+/// after validating the actual reply do we adapt it for older test assertions;
+/// this synthesized legacy welcome is never sent or accepted on the wire.
+async fn local_hello(
+    connection: &mut Connection,
+    mode: ClientMode,
+) -> Result<ServerMessage, &'static str> {
+    let offer = fut::protocol::local::LocalHello::new(mode, "fut-e2e");
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::LocalHello(offer.clone()),
+        },
+    )
+    .await;
+    let Some(frame) = time::timeout(DEADLINE, connection.next())
+        .await
+        .expect("local handshake timed out")
+    else {
+        return Err("connection closed");
+    };
+    let response: Envelope<ServerMessage> =
+        fut::protocol::remote::decode_handshake(&frame.expect("receive local handshake frame"))
+            .expect("strictly decode local handshake");
+    assert_eq!(
+        response.request_id,
+        Some(request_id),
+        "handshake correlation"
+    );
+    match response.message {
+        ServerMessage::LocalWelcome(welcome) => {
+            offer.accept(&welcome).expect("validate local negotiation");
+            Ok(ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                server_version: welcome.server_version,
+                selected: welcome.selected,
+                extension_catalog: welcome.extension_catalog,
+            })
+        }
+        // Selection and lease errors are operational, not negotiation failures.
+        error @ ServerMessage::Error { .. } => Ok(error),
+        other => panic!("expected negotiated local welcome or selection error, got {other:?}"),
+    }
+}
+
+/// Explicit transition-contract tests only; ordinary clients must not fall back.
+async fn legacy_hello(
     connection: &mut Connection,
     mode: ClientMode,
     version: u16,
 ) -> Result<ServerMessage, &'static str> {
+    let request_id = Uuid::new_v4();
     send_envelope(
         connection,
         Envelope {
-            request_id: Some(Uuid::new_v4()),
+            request_id: Some(request_id),
             message: ClientMessage::Hello {
                 version,
                 client_version: "fut-e2e".into(),
@@ -16586,7 +17005,15 @@ async fn hello(
         },
     )
     .await;
-    receive(connection).await.ok_or("connection closed")
+    let response = receive_envelope(connection)
+        .await
+        .ok_or("connection closed")?;
+    assert_eq!(
+        response.request_id,
+        Some(request_id),
+        "legacy handshake correlation"
+    );
+    Ok(response.message)
 }
 
 fn interactive_mode(selector: Option<TargetSelector>) -> ClientMode {
@@ -16851,13 +17278,9 @@ async fn attach_once(harness: &Harness, selector: TargetSelector) -> (Connection
     let ServerMessage::Welcome {
         selected: Some(selected),
         ..
-    } = hello(
-        &mut connection,
-        interactive_mode(Some(selector)),
-        PROTOCOL_VERSION,
-    )
-    .await
-    .expect("one-shot contender disconnected")
+    } = local_hello(&mut connection, interactive_mode(Some(selector)))
+        .await
+        .expect("one-shot contender disconnected")
     else {
         panic!("one-shot contender did not acquire lease")
     };
@@ -16866,13 +17289,11 @@ async fn attach_once(harness: &Harness, selector: TargetSelector) -> (Connection
 
 async fn attach_error_once(harness: &Harness, selector: TargetSelector) -> String {
     let mut connection = harness.connect().await.expect("connect one-shot contender");
-    let ServerMessage::Error { code, .. } = hello(
-        &mut connection,
-        interactive_mode(Some(selector)),
-        PROTOCOL_VERSION,
-    )
-    .await
-    .expect("one-shot contender disconnected") else {
+    let ServerMessage::Error { code, .. } =
+        local_hello(&mut connection, interactive_mode(Some(selector)))
+            .await
+            .expect("one-shot contender disconnected")
+    else {
         panic!("one-shot contender unexpectedly acquired lease")
     };
     code

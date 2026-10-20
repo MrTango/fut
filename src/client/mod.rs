@@ -140,6 +140,9 @@ use temporary_command::{
 use toast::{Toast, ToastState};
 use ui_catalog::{UiCatalog, UiCatalogAction};
 
+#[cfg(test)]
+use crate::protocol::PROTOCOL_VERSION;
+
 use crate::{
     domain::{
         CellColor, CellStyle, CursorShape, KittyGraphics, KittyImage, MouseButton, MouseButtons,
@@ -147,8 +150,8 @@ use crate::{
         ScreenSnapshot, ScrollPosition, SessionId, SplitId, TerminalId, TerminalSize,
     },
     protocol::{
-        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
-        SelectionExpectation, ServerMessage,
+        ClientMessage, ClientMode, Envelope, SelectedTarget, SelectedView, SelectionExpectation,
+        ServerMessage,
         chunked::{Assembly, ScreenAssembler},
         codec, decode_payload, encode_payload,
     },
@@ -710,7 +713,7 @@ pub(crate) async fn attach_with_ui(
         selector,
         TerminalSize { columns, rows },
         alert_client_id,
-        PROTOCOL_VERSION,
+        None,
     )
     .await?;
     let ui = staged.materialize(&catalog)?;
@@ -794,12 +797,14 @@ fn retained_alert_client_id(path: &Path) -> anyhow::Result<crate::domain::Client
     }
 }
 
+/// `None` negotiates stable local capabilities. A version is carried only from
+/// the navigator's explicitly requested legacy mismatch escape hatch.
 async fn connect_interactive(
     socket_path: &Path,
     selector: Option<TargetSelector>,
     size: TerminalSize,
     alert_client_id: crate::domain::ClientId,
-    protocol_version: u16,
+    protocol_version: Option<u16>,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     SelectedView,
@@ -825,7 +830,7 @@ async fn handshake_interactive(
     selector: Option<TargetSelector>,
     size: TerminalSize,
     alert_client_id: crate::domain::ClientId,
-    protocol_version: u16,
+    protocol_version: Option<u16>,
     handshake_timeout: Duration,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
@@ -834,25 +839,46 @@ async fn handshake_interactive(
     crate::alerts::ClientAlertSnapshot,
 )> {
     let mut framed = Framed::new(stream, codec());
+    let hello = crate::protocol::local::LocalHello::new(
+        ClientMode::Interactive {
+            size,
+            selector: selector.clone(),
+        },
+        env!("CARGO_PKG_VERSION"),
+    );
     send(
         &mut framed,
-        ClientMessage::Hello {
-            version: protocol_version,
-            client_version: env!("CARGO_PKG_VERSION").into(),
-            mode: ClientMode::Interactive { size, selector },
+        if let Some(version) = protocol_version {
+            ClientMessage::Hello {
+                version,
+                client_version: env!("CARGO_PKG_VERSION").into(),
+                mode: ClientMode::Interactive { size, selector },
+            }
+        } else {
+            ClientMessage::LocalHello(hello.clone())
         },
     )
     .await?;
-    let selected = match time::timeout(handshake_timeout, receive(&mut framed))
-        .await
-        .context("daemon handshake timed out")??
+    let selected = match time::timeout(
+        handshake_timeout,
+        receive_welcome(&mut framed, protocol_version),
+    )
+    .await
+    .context("daemon handshake timed out")??
     {
+        ServerMessage::LocalWelcome(welcome) if protocol_version.is_none() => {
+            hello.accept(&welcome)?;
+            let selected = welcome
+                .selected
+                .context("daemon did not select a terminal")?;
+            (selected, welcome.extension_catalog)
+        }
         ServerMessage::Welcome {
             version,
             selected: Some(selected),
             extension_catalog,
             ..
-        } if version == protocol_version => (selected, extension_catalog),
+        } if Some(version) == protocol_version => (selected, extension_catalog),
         ServerMessage::Welcome { selected: None, .. } => bail!("daemon did not select a terminal"),
         ServerMessage::Welcome { version, .. } => {
             bail!("daemon welcomed client with unsupported protocol version {version}")
@@ -860,6 +886,7 @@ async fn handshake_interactive(
         ServerMessage::IncompatibleProtocol { client, server } => {
             bail!(ProtocolMismatch { client, server })
         }
+        ServerMessage::EndpointError { error } => return Err(error.into()),
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected welcome from daemon, received {message:?}"),
     };
@@ -920,14 +947,9 @@ async fn prepare_machine_attachment(
     match spec {
         federation::EndpointSpec::Local => {
             let alert_client_id = alert_client_id(local_socket)?;
-            let (framed, selected, catalog, alerts) = connect_interactive(
-                local_socket,
-                Some(selector),
-                size,
-                alert_client_id,
-                PROTOCOL_VERSION,
-            )
-            .await?;
+            let (framed, selected, catalog, alerts) =
+                connect_interactive(local_socket, Some(selector), size, alert_client_id, None)
+                    .await?;
             let ui = staged.materialize(&catalog)?;
             Ok(PreparedMachineAttachment {
                 framed,
@@ -1070,18 +1092,37 @@ async fn connect_control_navigator(
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     crate::protocol::ExtensionCatalog,
-    u16,
+    Option<u16>,
 )> {
-    match connect_control_navigator_with_version(socket_path, PROTOCOL_VERSION).await {
-        Err(error) if ignore_protocol_mismatch => {
-            if let Some(mismatch) = error.downcast_ref::<ProtocolMismatch>() {
-                connect_control_navigator_with_version(socket_path, mismatch.server).await
-            } else {
-                Err(error)
-            }
-        }
-        result => result,
+    let error = match connect_control_navigator_with_version(socket_path, None).await {
+        Err(error) if ignore_protocol_mismatch => error,
+        result => return result,
+    };
+    if let Some(mismatch) = error.downcast_ref::<ProtocolMismatch>() {
+        return connect_control_navigator_with_version(socket_path, Some(mismatch.server)).await;
     }
+    if error
+        .downcast_ref::<crate::protocol::local::UnsupportedHandshake>()
+        .is_none()
+    {
+        return Err(error);
+    }
+
+    // Only the explicit unsafe flag permits probing the legacy protocol. A
+    // generation/capability failure or malformed welcome never reaches here.
+    let error = match connect_control_navigator_with_version(
+        socket_path,
+        Some(crate::protocol::PROTOCOL_VERSION),
+    )
+    .await
+    {
+        Err(error) => error,
+        result => return result,
+    };
+    let Some(mismatch) = error.downcast_ref::<ProtocolMismatch>() else {
+        return Err(error);
+    };
+    connect_control_navigator_with_version(socket_path, Some(mismatch.server)).await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1095,11 +1136,11 @@ struct ProtocolMismatch {
 
 async fn connect_control_navigator_with_version(
     socket_path: &Path,
-    protocol_version: u16,
+    protocol_version: Option<u16>,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     crate::protocol::ExtensionCatalog,
-    u16,
+    Option<u16>,
 )> {
     let stream = UnixStream::connect(socket_path)
         .await
@@ -1109,15 +1150,61 @@ async fn connect_control_navigator_with_version(
 
 async fn handshake_navigator(
     stream: UnixStream,
-    protocol_version: u16,
+    protocol_version: Option<u16>,
     handshake_timeout: Duration,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     crate::protocol::ExtensionCatalog,
-    u16,
+    Option<u16>,
 )> {
-    let (mut framed, extension_catalog, _) =
-        hello_control(stream, protocol_version, handshake_timeout).await?;
+    let mut framed = Framed::new(stream, codec());
+    let hello =
+        crate::protocol::local::LocalHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
+    send(
+        &mut framed,
+        if let Some(version) = protocol_version {
+            ClientMessage::Hello {
+                version,
+                client_version: env!("CARGO_PKG_VERSION").into(),
+                mode: ClientMode::Control,
+            }
+        } else {
+            ClientMessage::LocalHello(hello.clone())
+        },
+    )
+    .await?;
+    let extension_catalog = match time::timeout(
+        handshake_timeout,
+        receive_welcome(&mut framed, protocol_version),
+    )
+    .await
+    .context("daemon handshake timed out")??
+    {
+        ServerMessage::LocalWelcome(welcome) if protocol_version.is_none() => {
+            hello.accept(&welcome)?;
+            welcome.extension_catalog
+        }
+        ServerMessage::Welcome {
+            version,
+            server_version,
+            selected: None,
+            extension_catalog,
+        } if Some(version) == protocol_version => {
+            if server_version.is_empty()
+                || server_version.len() > 128
+                || server_version.chars().any(char::is_control)
+            {
+                bail!("remote daemon reported an invalid version string");
+            }
+            extension_catalog
+        }
+        ServerMessage::IncompatibleProtocol { client, server } => {
+            bail!(ProtocolMismatch { client, server });
+        }
+        ServerMessage::EndpointError { error } => return Err(error.into()),
+        ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+        message => bail!("expected control welcome from daemon, received {message:?}"),
+    };
     send_request(
         &mut framed,
         Some(Uuid::new_v4()),
@@ -1125,54 +1212,6 @@ async fn handshake_navigator(
     )
     .await?;
     Ok((framed, extension_catalog, protocol_version))
-}
-
-/// Control-mode hello, also yielding the daemon's reported Fut version.
-async fn hello_control(
-    stream: UnixStream,
-    protocol_version: u16,
-    handshake_timeout: Duration,
-) -> anyhow::Result<(
-    Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
-    crate::protocol::ExtensionCatalog,
-    String,
-)> {
-    let mut framed = Framed::new(stream, codec());
-    send(
-        &mut framed,
-        ClientMessage::Hello {
-            version: protocol_version,
-            client_version: env!("CARGO_PKG_VERSION").into(),
-            mode: ClientMode::Control,
-        },
-    )
-    .await?;
-    let (extension_catalog, server_version) =
-        match time::timeout(handshake_timeout, receive(&mut framed))
-            .await
-            .context("daemon handshake timed out")??
-        {
-            ServerMessage::Welcome {
-                version,
-                server_version,
-                selected: None,
-                extension_catalog,
-            } if version == protocol_version => {
-                if server_version.is_empty()
-                    || server_version.len() > 128
-                    || server_version.chars().any(char::is_control)
-                {
-                    bail!("remote daemon reported an invalid version string");
-                }
-                (extension_catalog, server_version)
-            }
-            ServerMessage::IncompatibleProtocol { client, server } => {
-                bail!(ProtocolMismatch { client, server });
-            }
-            ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
-            message => bail!("expected control welcome from daemon, received {message:?}"),
-        };
-    Ok((framed, extension_catalog, server_version))
 }
 
 async fn initial_navigator(
@@ -2394,7 +2433,7 @@ async fn run_loop(
                     ServerMessage::IncompatibleProtocol { client, server } => {
                         bail!("protocol became incompatible: client {client}, server {server}")
                     }
-                    ServerMessage::Welcome { .. } | ServerMessage::RemoteWelcome(_) => bail!("unexpected second welcome from daemon"),
+                    ServerMessage::Welcome { .. } | ServerMessage::LocalWelcome(_) | ServerMessage::RemoteWelcome(_) => bail!("unexpected second welcome from daemon"),
                     ServerMessage::EndpointError { error } => return Err(error.into()),
                     ServerMessage::TerminalOutput { .. }
                     | ServerMessage::TerminalOutputMatched { .. }
@@ -6616,6 +6655,31 @@ async fn send_request(
     Ok(())
 }
 
+/// Negotiated local handshakes use the strict named-map decoder. The legacy
+/// escape hatch alone retains the original decoder and version checks.
+async fn receive_welcome(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    legacy_version: Option<u16>,
+) -> anyhow::Result<ServerMessage> {
+    if legacy_version.is_some() {
+        return receive(framed).await;
+    }
+    let frame = framed
+        .next()
+        .await
+        .context("daemon disconnected during handshake")??;
+    let envelope: Envelope<ServerMessage> = crate::protocol::remote::decode_handshake(&frame)?;
+    if envelope.request_id.is_some() {
+        return Err(crate::protocol::remote::EndpointError::InvalidHandshake.into());
+    }
+    if let ServerMessage::EndpointError { error } = &envelope.message
+        && crate::protocol::local::is_legacy_rejection(envelope.request_id, error)
+    {
+        return Err(crate::protocol::local::UnsupportedHandshake::error());
+    }
+    Ok(envelope.message)
+}
+
 async fn receive(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
 ) -> anyhow::Result<ServerMessage> {
@@ -8260,24 +8324,39 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server_version = PROTOCOL_VERSION - 1;
         let server = tokio::spawn(async move {
-            for expected_version in [PROTOCOL_VERSION, server_version] {
+            for attempt in 0..3 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut framed = Framed::new(stream, codec());
                 let request = framed.next().await.unwrap().unwrap();
                 let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
-                assert!(matches!(
-                    hello.message,
-                    ClientMessage::Hello { version, .. } if version == expected_version
-                ));
-                let message = if expected_version == PROTOCOL_VERSION {
-                    ServerMessage::IncompatibleProtocol {
-                        client: PROTOCOL_VERSION,
-                        server: server_version,
+                let message = match attempt {
+                    0 => {
+                        assert!(matches!(hello.message, ClientMessage::LocalHello(_)));
+                        ServerMessage::EndpointError {
+                            error: crate::protocol::remote::EndpointError::InvalidHandshake,
+                        }
                     }
-                } else {
-                    ServerMessage::Error {
-                        code: "done".into(),
-                        message: "negotiated".into(),
+                    1 => {
+                        assert!(matches!(
+                            hello.message,
+                            ClientMessage::Hello {
+                                version: PROTOCOL_VERSION,
+                                ..
+                            }
+                        ));
+                        ServerMessage::IncompatibleProtocol {
+                            client: PROTOCOL_VERSION,
+                            server: server_version,
+                        }
+                    }
+                    _ => {
+                        assert!(
+                            matches!(hello.message, ClientMessage::Hello { version, .. } if version == server_version)
+                        );
+                        ServerMessage::Error {
+                            code: "done".into(),
+                            message: "negotiated".into(),
+                        }
                     }
                 };
                 framed

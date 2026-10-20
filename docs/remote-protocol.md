@@ -1,8 +1,9 @@
 # Remote endpoint contract, generation 2
 
 Remote compatibility is independent of `CARGO_PKG_VERSION` and the local
-`PROTOCOL_VERSION` (package minor). Local `hello` / `welcome`, exact protocol
-checks and the explicit local mismatch escape hatch keep their existing behavior.
+legacy `PROTOCOL_VERSION` (package minor). Local clients now negotiate their own
+[stable local contract](local-protocol.md); legacy `hello` / `welcome` retains
+its exact-match policy. Local negotiation never expands remote permissions.
 Standalone `fut --machine` asks the remote bridge to start a missing daemon by
 default, using the remote host's local autostart policy. Local
 `[remote] autostart = false` or `--attach-only` makes the bridge attach-only.
@@ -40,7 +41,7 @@ a fresh ID for the handshake and verifies its echo. The first message is:
 ```
 
 `mode` uses the frozen `ClientMode` payload: `control`, or
-`{"interactive":{"size":{"columns":80,"rows":24},"selector":...}}`.
+`{"interactive":{"size":{"c":80,"r":24},"selector":...}}`.
 Interactive offers must require both `metadata.v2` and `interactive.v1` and
 provide a valid terminal size. Control offers must require `metadata.v2`.
 Selectors, UUIDs and terminal dimensions retain their existing encoding.

@@ -1,0 +1,59 @@
+{
+  "request_id": "00000000-0000-0000-0000-000000000006",
+  "message": {
+    "type": "resources",
+    "snapshot": {
+      "revision": 12,
+      "sessions": [{
+        "id": "00000000-0000-0000-0000-000000000001",
+        "name": "demo",
+        "closing": false,
+        "project": {"identity": {"CanonicalDirectory": "/fixture/project"}},
+        "tokens": {"demo.label": "review"},
+        "workspaces": [{
+          "id": "00000000-0000-0000-0000-000000000002",
+          "name": "child",
+          "parent_workspace_id": "00000000-0000-0000-0000-000000000007",
+          "root": "/fixture/project/child",
+          "closing": false,
+          "tabs": [{
+            "id": "00000000-0000-0000-0000-000000000003",
+            "name": "shell",
+            "closing": false,
+            "layout": {"type": "leaf", "pane_id": "00000000-0000-0000-0000-000000000004"},
+            "panes": [{
+              "id": "00000000-0000-0000-0000-000000000004",
+              "terminal_id": "00000000-0000-0000-0000-000000000005",
+              "closing": false,
+              "cwd": "/fixture/project/child/src",
+              "worktree": "/fixture/project/child",
+              "tokens": {"demo.open": {
+                "text": "Open",
+                "action": {"type": "pane", "pane_id": "00000000-0000-0000-0000-000000000004"}
+              }},
+              "activity": {
+                "records": [{
+                  "id": "build",
+                  "state": "working",
+                  "progress": 40,
+                  "app": "cargo",
+                  "title": "Tests",
+                  "message": "running",
+                  "revision": 9,
+                  "updated_at_ms": 1234
+                }],
+                "source": {"type": "report", "source": "fixture"},
+                "revision": 9,
+                "working_revision": 9
+              }
+            }]
+          }]
+        }]
+      }]
+    },
+    "presence": {
+      "revision": 3,
+      "sessions": [{"session_id": "00000000-0000-0000-0000-000000000001", "clients": 1}]
+    }
+  }
+}

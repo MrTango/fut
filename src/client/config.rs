@@ -205,6 +205,10 @@ pub(super) struct ExtensionCommandIdentity {
     pub id: String,
     pub root: PathBuf,
     pub command: String,
+    /// Materialized refusal: the extension's Fut requirement excludes this
+    /// binary, so the command stays listed and bindable for the daemon's
+    /// catalog but `ExtensionCommandContext::resolve` refuses to run it here.
+    pub unavailable: Option<String>,
 }
 
 impl ExtensionCommandIdentity {
@@ -1561,6 +1565,13 @@ impl UiConfig {
         self.remote.upload_image_paths
     }
 
+    /// Extensions of the materialized daemon generation. Locally, hooks this
+    /// binary may not run have already been deactivated.
+    #[cfg(test)]
+    pub(crate) fn extensions(&self) -> &[Extension] {
+        &self.extensions
+    }
+
     pub(crate) fn icon_preset_name(&self) -> &'static str {
         match self.icons.preset {
             IconPreset::Ascii => "ascii",
@@ -1791,14 +1802,7 @@ impl StagedUiConfig {
         catalog: Option<&crate::protocol::ExtensionCatalog>,
     ) -> Result<UiConfig> {
         if let Some(catalog) = catalog {
-            let registry = extensions::ExtensionRegistry::from_remote_catalog(catalog.clone())?;
-            return materialize_config_for_locality(
-                self.config.clone(),
-                registry.extensions().to_vec(),
-                registry.config().clone(),
-                self.source.as_deref(),
-                Locality::Remote,
-            );
+            return self.materialize_daemon_catalog(catalog, Locality::Remote);
         }
         let mut config = self.config.clone();
         config.extension_commands.clear();
@@ -1821,12 +1825,21 @@ impl StagedUiConfig {
         &self,
         catalog: &crate::protocol::ExtensionCatalog,
     ) -> Result<UiConfig> {
+        self.materialize_daemon_catalog(catalog, Locality::Local)
+    }
+
+    fn materialize_daemon_catalog(
+        &self,
+        catalog: &crate::protocol::ExtensionCatalog,
+        locality: Locality,
+    ) -> Result<UiConfig> {
         let registry = extensions::ExtensionRegistry::from_catalog(catalog.clone())?;
-        materialize_config(
+        materialize_config_for_locality(
             self.config.clone(),
             registry.extensions().to_vec(),
             registry.config().clone(),
             self.source.as_deref(),
+            locality,
         )
     }
 }
@@ -2183,7 +2196,7 @@ fn materialize_config(
 
 fn materialize_config_for_locality(
     mut config: Config,
-    extensions: Vec<Extension>,
+    mut extensions: Vec<Extension>,
     extension_config: ExtensionConfigCatalog,
     source: Option<&Path>,
     locality: Locality,
@@ -2208,13 +2221,19 @@ fn materialize_config_for_locality(
         }
     }
     config.ui.bindings.commands = config.trusted_commands.into_values().collect();
-    for extension in &extensions {
+    for extension in &mut extensions {
+        let unavailable = if locality == Locality::Local {
+            deactivate_incompatible_extension(extension)
+        } else {
+            None
+        };
         for launcher in extension.commands() {
             let argv = launcher.argv();
             let identity = ExtensionCommandIdentity {
                 id: extension.id().to_owned(),
                 root: extension.root().to_owned(),
                 command: launcher.name().to_owned(),
+                unavailable: unavailable.clone(),
             };
             let slug = identity.slug();
             let binding = config.ui.bindings.values.remove(&slug);
@@ -2256,6 +2275,25 @@ fn materialize_config_for_locality(
     config.ui.extensions = extensions;
     config.ui.extension_config = extension_config;
     Ok(config.ui)
+}
+
+/// A daemon catalog may carry extensions whose manifests exclude this client's
+/// package version. Their presentation, bindings and overrides stay valid so a
+/// mixed-version UI keeps working, but this binary must not execute their
+/// processes: client hooks are dropped here and commands keep a refusal that
+/// `ExtensionCommandContext::resolve` reports when they are run.
+fn deactivate_incompatible_extension(extension: &mut Extension) -> Option<String> {
+    let Err(error) = extension.check_fut_requirement() else {
+        return None;
+    };
+    let reason = format!("{error:#}");
+    tracing::warn!(
+        extension = extension.id(),
+        %reason,
+        "extension commands and client hooks are deactivated in this client; the daemon catalog still renders"
+    );
+    extension.deactivate_hooks();
+    Some(reason)
 }
 
 fn validate_projects(
@@ -4312,6 +4350,139 @@ components = [{ component = 'workspaces', row = { body = [{ token = 'workspace.p
                 temporary.path().join("dev/fut/extensions/wt"),
                 temporary.path().join("config/extensions/run"),
             ]
+        );
+    }
+
+    #[test]
+    fn disk_extension_loads_reject_a_narrow_requirement_for_another_fut_version() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("extension");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join(extensions::MANIFEST_FILE_NAME),
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.37.0, <0.38.0'\nid = 'hosted'\ncapabilities = []\n",
+        )
+        .unwrap();
+        fs::write(
+            temporary.path().join("config.toml"),
+            format!("extensions = [{:?}]\n", root.to_str().unwrap()),
+        )
+        .unwrap();
+        let location = resolve_location(Some(temporary.path())).unwrap();
+        assert!(stage_location(&location).is_ok());
+        // Both the complete runtime config and daemon reload candidate read
+        // packages from disk and must still enforce this binary's requirement.
+        for error in [
+            load_location(&location).unwrap_err(),
+            load_extensions_location(&location).unwrap_err(),
+        ] {
+            assert!(format!("{error:#}").contains("is incompatible"));
+        }
+    }
+
+    #[test]
+    fn staged_ui_renders_a_catalog_for_another_fut_but_refuses_to_run_it_locally() {
+        use super::super::temporary_command::ExtensionCommandContext;
+        use crate::domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        fs::write(
+            extension_root.join(extensions::MANIFEST_FILE_NAME),
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands', 'hooks', 'presentation_tokens']\nid = 'hosted'\n[hooks]\n'client.attached' = ['./hook']\n[commands.launch]\ntitle = 'Launch hosted'\nargv = ['./bin/launch', '--manifest']\n[[presentation_tokens]]\nname = 'badge'\nscope = 'tab'\n",
+        )
+        .unwrap();
+        fs::write(
+            temporary.path().join("config.toml"),
+            format!(
+                "extensions = [{:?}]\n[ui.bindings]\n\"hosted:launch\" = \"N\"\n[ui.hotkeys]\n\"ctrl-x\" = \"hosted:launch\"\n[extension_commands.\"hosted:launch\"]\nargs = [\"configured\"]\n[ui.tab_bar.item]\nsegments = [{{ token = 'tab.extension.hosted.badge' }}]\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let location = resolve_location(Some(temporary.path())).unwrap();
+        let staged = stage_location(&location).unwrap();
+        let catalog = |requirement: &str| {
+            let loaded = load_extensions_location(&location).unwrap();
+            let mut extensions = loaded.extensions;
+            extensions[0].set_fut_requirement(semver::VersionReq::parse(requirement).unwrap());
+            extensions::ExtensionRegistry::new(3, extensions, loaded.config)
+                .unwrap()
+                .catalog()
+                .unwrap()
+        };
+        let focused = crate::protocol::SelectedTarget {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+            child_pid: 1,
+        };
+        let hotkey = parse_key("ctrl-x").unwrap().0;
+
+        // The daemon's catalog admitted a package this binary is outside of.
+        let foreign = catalog(">=0.37.0, <0.38.0");
+        let ui = staged.materialize(&foreign).unwrap();
+        assert_eq!(ui.extensions.len(), 1);
+        assert_eq!(
+            ui.extensions[0].presentation_tokens()[0].qualified_name(),
+            "tab.extension.hosted.badge"
+        );
+        assert_eq!(ui.tab_bar.item.segments.len(), 1);
+        assert_eq!(ui.extensions[0].hook_names().count(), 0);
+        let command = ui.bindings.command(0).unwrap();
+        assert_eq!(command.title, "Launch hosted");
+        assert_eq!(command.args, ["configured"]);
+        assert_eq!(
+            ui.bindings.action_for_suffix(b"N"),
+            Some(ClientAction::RunCommand(0))
+        );
+        assert_eq!(
+            ui.bindings.action_for_hotkey(&hotkey),
+            Some(ClientAction::RunCommand(0))
+        );
+        assert!(ui.bindings.extension_command("hosted", "launch").is_some());
+        let reason = command.extension.as_ref().unwrap().unavailable.as_deref();
+        assert!(
+            reason.is_some_and(|reason| reason.contains("requires Fut >=0.37.0, <0.38.0")
+                && reason.contains("is incompatible")),
+            "{reason:?}"
+        );
+        let refused =
+            ExtensionCommandContext::resolve(&ui, command, &focused, temporary.path(), None)
+                .unwrap_err();
+        assert_eq!(format!("{refused:#}"), reason.unwrap());
+
+        // Remote declarations execute on the host, so its requirement governs.
+        let remote = staged.materialize_remote(Some(&foreign)).unwrap();
+        let command = remote.bindings.command(0).unwrap();
+        assert_eq!(command.extension.as_ref().unwrap().unavailable, None);
+        assert_eq!(
+            remote.extensions[0].hook_names().collect::<Vec<_>>(),
+            ["client.attached"]
+        );
+        assert!(
+            ExtensionCommandContext::resolve(&remote, command, &focused, temporary.path(), None)
+                .is_ok()
+        );
+
+        // A catalog this binary satisfies keeps everything active locally.
+        let ui = staged.materialize(&catalog(">=0.7.0, <1.0.0")).unwrap();
+        assert_eq!(
+            ui.bindings
+                .command(0)
+                .unwrap()
+                .extension
+                .as_ref()
+                .unwrap()
+                .unavailable,
+            None
+        );
+        assert_eq!(
+            ui.extensions[0].hook_names().collect::<Vec<_>>(),
+            ["client.attached"]
         );
     }
 

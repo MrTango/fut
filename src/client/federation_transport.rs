@@ -21,8 +21,9 @@ use crate::{
     alerts::ClientAlertSnapshot,
     domain::ClientId,
     protocol::{
-        ClientMessage, ClientMode, ClientPresenceSnapshot, Envelope, ExtensionCatalog,
-        PROTOCOL_VERSION, codec, decode_payload, encode_payload,
+        ClientMessage, ClientMode, ClientPresenceSnapshot, Envelope, ExtensionCatalog, codec,
+        decode_payload, encode_payload,
+        local::{LocalHello, LocalWelcome},
         remote::{
             Capabilities, Capability, EndpointError, RemoteHello, RemoteWelcome, decode_handshake,
         },
@@ -103,13 +104,7 @@ impl Connector for SystemConnector {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MetadataMessage {
-    Welcome {
-        version: u16,
-        server_version: String,
-        #[serde(deserialize_with = "Deserialize::deserialize")]
-        selected: Option<serde::de::IgnoredAny>,
-        extension_catalog: ExtensionCatalog,
-    },
+    LocalWelcome(Box<LocalWelcome>),
     RemoteWelcome(Box<RemoteWelcome>),
     EndpointError {
         error: EndpointError,
@@ -172,7 +167,7 @@ struct SystemConnection {
     // Owns the child, diagnostics task and attachment shutdown handle. Dropping
     // this connection or a cancelled connect future also drops the SSH owner.
     owner: Option<SshBridge>,
-    strict_remote_handshake: bool,
+    strict_handshake: bool,
     capabilities: Option<Capabilities>,
     pending: VecDeque<Update>,
     probe: Option<Probe>,
@@ -181,11 +176,10 @@ struct SystemConnection {
 
 impl SystemConnection {
     fn new(stream: UnixStream, owner: Option<SshBridge>) -> Self {
-        let strict_remote_handshake = owner.is_some();
         Self {
             framed: Framed::new(stream, codec()),
             owner,
-            strict_remote_handshake,
+            strict_handshake: true,
             capabilities: None,
             pending: VecDeque::new(),
             probe: None,
@@ -214,7 +208,7 @@ impl SystemConnection {
             return Ok(None);
         };
         let frame = frame.map_err(transport_failure)?;
-        if self.strict_remote_handshake {
+        if self.strict_handshake {
             decode_handshake(&frame).map(Some).map_err(compatibility)
         } else {
             decode_payload(&frame).map(Some).map_err(compatibility)
@@ -224,19 +218,15 @@ impl SystemConnection {
     async fn initialize(&mut self, client_id: ClientId) -> Result<InitialMetadata, Failure> {
         let remote = self.owner.is_some();
         let hello = RemoteHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
-        // The private control hello is uncorrelated, exactly as hello_control
-        // in client/mod.rs. It never retries with the daemon's private version.
+        let local_hello = LocalHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
+        // Local negotiation never retries with the daemon's package version.
         let request_id = remote.then(Uuid::new_v4);
         self.send(
             request_id,
             if remote {
                 ClientMessage::RemoteHello(hello.clone())
             } else {
-                ClientMessage::Hello {
-                    version: PROTOCOL_VERSION,
-                    client_version: env!("CARGO_PKG_VERSION").into(),
-                    mode: ClientMode::Control,
-                }
+                ClientMessage::LocalHello(local_hello.clone())
             },
         )
         .await?;
@@ -244,7 +234,15 @@ impl SystemConnection {
             .receive()
             .await?
             .ok_or_else(|| transient("endpoint disconnected during handshake"))?;
-        self.strict_remote_handshake = false;
+        self.strict_handshake = false;
+        if !remote
+            && let MetadataMessage::EndpointError { error } = &response.message
+            && crate::protocol::local::is_legacy_rejection(response.request_id, error)
+        {
+            return Err(compatibility(
+                crate::protocol::local::UnsupportedHandshake::error(),
+            ));
+        }
         if response.request_id != request_id {
             return Err(compatibility(EndpointError::InvalidHandshake));
         }
@@ -262,22 +260,15 @@ impl SystemConnection {
                     welcome.extension_catalog,
                 )
             }
-            MetadataMessage::Welcome {
-                version,
-                server_version,
-                selected: None,
-                extension_catalog,
-            } if !remote
-                && version == PROTOCOL_VERSION
-                && !server_version.is_empty()
-                && server_version.len() <= 128
-                && !server_version.chars().any(char::is_control) =>
-            {
+            MetadataMessage::LocalWelcome(welcome) if !remote => {
+                local_hello.accept(&welcome).map_err(compatibility)?;
+                // Local capabilities validate local.v1, not remote allowlists.
+                // Keep `self.capabilities` unset so all local behavior survives.
                 (
                     Negotiation::Local {
-                        protocol_version: version,
+                        protocol_generation: welcome.generation,
                     },
-                    Some(extension_catalog),
+                    Some(welcome.extension_catalog),
                 )
             }
             message => return Err(message_failure(message)),
@@ -809,21 +800,22 @@ mod tests {
                 assert!(hello.request_id.is_none());
                 assert!(matches!(
                     hello.message,
-                    ClientMessage::Hello {
-                        version: PROTOCOL_VERSION,
+                    ClientMessage::LocalHello(LocalHello {
                         mode: ClientMode::Control,
                         ..
-                    }
+                    })
                 ));
                 reply(
                     &mut peer,
                     None,
-                    ServerMessage::Welcome {
-                        version: PROTOCOL_VERSION,
-                        server_version: "0.22.0".into(),
+                    ServerMessage::LocalWelcome(LocalWelcome {
+                        generation: crate::protocol::local::GENERATION,
+                        codec: "msgpack-map-v1".into(),
+                        server_version: "99.22.0".into(),
+                        capabilities: vec!["local.v1".into()],
                         selected: None,
                         extension_catalog: catalog(7),
-                    },
+                    }),
                 )
                 .await;
                 let watch = request(&mut peer).await;
@@ -856,6 +848,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_metadata_negotiation_rejects_invalid_welcome_before_subscribing() {
+        for fault in 0..4 {
+            let (mut connection, mut peer) = pair();
+            let server = tokio::spawn(async move {
+                let hello = request(&mut peer).await;
+                assert!(matches!(hello.message, ClientMessage::LocalHello(_)));
+                let mut welcome = LocalWelcome {
+                    generation: crate::protocol::local::GENERATION,
+                    codec: crate::protocol::local::CODEC.into(),
+                    server_version: "99.0.0".into(),
+                    capabilities: vec!["local.v1".into()],
+                    selected: None,
+                    extension_catalog: catalog(1),
+                };
+                match fault {
+                    0 => welcome.generation += 1,
+                    1 => welcome.capabilities.clear(),
+                    2 => welcome.capabilities.push("metadata.v2".into()),
+                    _ => welcome.codec = "unsupported".into(),
+                }
+                reply(&mut peer, None, ServerMessage::LocalWelcome(welcome)).await;
+                assert!(peer.next().await.is_none());
+            });
+            let error = connection.initialize(ClientId::new()).await.err().unwrap();
+            assert_eq!(error.kind, FailureKind::Compatibility);
+            assert!(connection.capabilities.is_none());
+            drop(connection);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn initial_responses_are_bounded_even_when_peer_keeps_sending() {
         let (mut connection, mut peer) = pair();
         let server = tokio::spawn(async move {
@@ -863,12 +887,14 @@ mod tests {
             reply(
                 &mut peer,
                 None,
-                ServerMessage::Welcome {
-                    version: PROTOCOL_VERSION,
+                ServerMessage::LocalWelcome(LocalWelcome {
+                    generation: crate::protocol::local::GENERATION,
+                    codec: "msgpack-map-v1".into(),
                     server_version: "0.22.0".into(),
+                    capabilities: vec!["local.v1".into()],
                     selected: None,
                     extension_catalog: catalog(1),
-                },
+                }),
             )
             .await;
             request(&mut peer).await;

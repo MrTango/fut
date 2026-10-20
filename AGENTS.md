@@ -2,6 +2,12 @@
 
 This project uses a CLI ticket system for task management. Run `tk help` when you need to use it.
 
+## Protocol compatibility
+
+- Local and remote negotiated contracts are independent of package versions.
+- Read `docs/local-protocol.md` and `docs/remote-protocol.md` before changing wire messages or their transitive domain types. Preserve frozen payloads and semantics; new behavior needs a negotiated capability, a tested adapter, or a new generation.
+- Never grant local-only operations through the remote capability allowlist.
+
 ## Changelog
 
 - `CHANGELOG.md` covers user-visible changes to the Fut app itself. Omit project website, installer, distribution, CI, release-process, and other repository-maintenance changes unless they alter the installed app's behavior.

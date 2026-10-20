@@ -59,6 +59,7 @@ use crate::{
         PresentationTokenPublishAction, RenameSelector, SelectedTarget, SelectedView,
         SelectionExpectation, ServerMessage, TerminalContext, TerminalInputOperation, codec,
         decode_payload, encode_payload,
+        local::{self, LocalWelcome},
         remote::{self, Capabilities, Capability, EndpointError, RemoteWelcome},
     },
     resources::{
@@ -2684,6 +2685,7 @@ impl Drop for OwnedSocket {
 struct ClientConnection {
     peer_pid: Option<u32>,
     remote: Option<Capabilities>,
+    local: Option<local::Capabilities>,
     reader: SplitStream<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>>,
     outbound: Arc<OutboundQueue>,
 }
@@ -2723,6 +2725,9 @@ struct OutboundState {
 struct OutboundQueue {
     state: std::sync::Mutex<OutboundState>,
     ready: Notify,
+    /// Also check writer-generated image/delta/chunk messages at the boundary,
+    /// not only messages that pass through `send`.
+    local: std::sync::OnceLock<local::Capabilities>,
     /// Set for remote peers without `large-screens.v1`: their frozen screen
     /// format embeds Kitty image pixels instead of referencing separate
     /// `kitty_image` frames.
@@ -2743,6 +2748,7 @@ impl Default for OutboundQueue {
         Self {
             state: Default::default(),
             ready: Default::default(),
+            local: Default::default(),
             embed_images: Default::default(),
             unshifted_deltas: Default::default(),
             max_screen_cells: crate::domain::MAX_GRID_CELLS.into(),
@@ -2767,6 +2773,7 @@ impl ClientConnection {
             outbound,
             peer_pid,
             remote: None,
+            local: None,
         }
     }
 
@@ -3080,6 +3087,15 @@ async fn write_outbound(
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             for image in sent_images.prepare(&mut message) {
+                if queue
+                    .local
+                    .get()
+                    .is_some_and(|caps| !caps.allows_server(&image))
+                {
+                    tracing::error!(message_type = ?std::mem::discriminant(&image), "outbound image is not allowed by the negotiated local contract");
+                    queue.fail();
+                    return;
+                }
                 let payload = encode_payload(&Envelope {
                     request_id: None,
                     message: image,
@@ -3099,6 +3115,15 @@ async fn write_outbound(
         };
         let last = frames.len() - 1;
         for (index, message) in frames.into_iter().enumerate() {
+            if queue
+                .local
+                .get()
+                .is_some_and(|caps| !caps.allows_server(&message))
+            {
+                tracing::error!(message_type = ?std::mem::discriminant(&message), "outbound frame is not allowed by the negotiated local contract");
+                queue.fail();
+                return;
+            }
             let payload = encode_payload(&Envelope {
                 request_id: request_id.filter(|_| index == last),
                 message,
@@ -3188,6 +3213,30 @@ async fn handle_connection(
                 return Ok(());
             }
             mode
+        }
+        ClientMessage::LocalHello(hello) => {
+            let negotiated = remote::decode_handshake::<Envelope<ClientMessage>>(&frame)
+                .and_then(|_| hello.negotiate());
+            match negotiated {
+                Ok(capabilities) => {
+                    connection.local = Some(capabilities);
+                    connection
+                        .outbound
+                        .local
+                        .set(capabilities)
+                        .expect("local handshake is only accepted once");
+                }
+                Err(error) => {
+                    send(
+                        &mut connection,
+                        first.request_id,
+                        ServerMessage::EndpointError { error },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            hello.mode
         }
         ClientMessage::RemoteHello(hello) => {
             let negotiated = remote::decode_handshake::<Envelope<ClientMessage>>(&frame)
@@ -3296,6 +3345,17 @@ async fn handle_connection(
                 .contains(Capability::ExtensionCatalog)
                 .then_some(extension_catalog),
         }),
+        None if connection.local.is_some() => ServerMessage::LocalWelcome(LocalWelcome {
+            generation: local::GENERATION,
+            codec: local::CODEC.into(),
+            server_version: env!("CARGO_PKG_VERSION").into(),
+            capabilities: connection
+                .local
+                .expect("negotiated local capabilities")
+                .names(),
+            selected,
+            extension_catalog,
+        }),
         None => ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").into(),
@@ -3321,7 +3381,7 @@ async fn handle_connection(
             frame = connection.next() => {
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
-                if reject_remote_method(&mut connection, &envelope).await? {
+                if reject_unnegotiated_method(&mut connection, &envelope).await? {
                     continue;
                 }
                 if let Some(operation) = fire_and_forget_operation(&envelope.message)
@@ -4149,7 +4209,7 @@ async fn handle_connection(
                     }
                     ClientMessage::OpenProject { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportAutomaticAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::CommandDefaults { .. } | ClientMessage::CommandStart { .. } | ClientMessage::CommandOperation { .. } => send_error(&mut connection, envelope.request_id, "control_only", "commands require a dedicated control connection").await?,
-                    ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
+                    ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) | ClientMessage::LocalHello(_) => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
             changed = attachment.resource_changes.changed() => {
@@ -4329,15 +4389,19 @@ async fn handle_connection(
     }
 }
 
-/// Reject before dispatch: even a negotiated peer cannot reach private methods
-/// (notably Shutdown) through either connection mode.
-async fn reject_remote_method(
+/// Reject before dispatch, preserving the remote private-method restrictions
+/// and the local baseline allowlist in interactive, control and command loops.
+/// Legacy exact-version local peers bypass capability negotiation.
+async fn reject_unnegotiated_method(
     connection: &mut ClientConnection,
     envelope: &Envelope<ClientMessage>,
 ) -> Result<bool> {
     if connection
         .remote
         .is_some_and(|caps| !caps.allows_client(&envelope.message))
+        || connection
+            .local
+            .is_some_and(|caps| !caps.allows_client(&envelope.message))
     {
         send(
             connection,
@@ -4401,7 +4465,7 @@ async fn control_loop(
         };
         let Some(frame) = frame else { break };
         let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
-        if reject_remote_method(connection, &envelope).await? {
+        if reject_unnegotiated_method(connection, &envelope).await? {
             continue;
         }
         if let Some(operation) = fire_and_forget_operation(&envelope.message)
@@ -5132,7 +5196,7 @@ async fn control_loop(
                 )
                 .await?
             }
-            ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) => {
+            ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) | ClientMessage::LocalHello(_) => {
                 send_error(
                     connection,
                     envelope.request_id,
@@ -7721,6 +7785,9 @@ async fn send(
         .remote
         .is_some_and(|caps| !caps.allows_server(&message))
         && !matches!(message, ServerMessage::RemoteWelcome(_))
+        || connection
+            .local
+            .is_some_and(|caps| !caps.allows_server(&message))
     {
         if request_id.is_none() {
             return Ok(());

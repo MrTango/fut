@@ -94,6 +94,12 @@ interpret this file and processes. `version` identifies your release. `fut`
 declares which Fut releases you tested and support. A hook JSON object's
 `version` is a fourth, independent version for that payload shape.
 
+With mixed-version clients, the daemon checks `fut` before loading a package.
+A client can render that daemon's validated catalog even if its own version is
+outside the requirement, but incompatible local commands and client hooks are
+disabled rather than blocking attachment. Remote commands still execute against
+the hosting daemon's version.
+
 Choose the narrowest truthful `fut` range, test its lower and upper edges, and
 do not use the package version to imply API compatibility. Fut rejects an
 unsupported API or unmatched `fut` requirement before activating any part of
@@ -447,7 +453,8 @@ Rust `ClientMessage`/`ServerMessage` types, and daemon-to-client extension
 catalog are Fut implementation details. They are not the extension API even
 when visible in the source tree. Do not open `FUT_SOCKET` yourself or copy
 `src/protocol.rs`; invoke `FUT_BIN --socket FUT_SOCKET ...`. Raw daemon protocol
-versions may change independently of manifest API v1.
+generations and capabilities evolve independently of manifest API v1. The stable
+local compatibility contract is for Fut's own clients, not a new extension API.
 
 ## Limits and failure model
 

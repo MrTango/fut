@@ -127,6 +127,33 @@ impl Extension {
             .find(|token| token.name == name)
     }
 
+    #[cfg(test)]
+    pub(crate) fn hook_names(&self) -> impl Iterator<Item = &str> {
+        self.hooks.keys().map(String::as_str)
+    }
+
+    /// Whether this Fut binary may execute the extension's processes. The
+    /// daemon enforces it while loading packages from disk; a client rendering
+    /// a daemon catalog enforces it before running commands or client hooks
+    /// with its own executable, because a negotiated catalog may come from a
+    /// daemon of another package version.
+    pub(crate) fn check_fut_requirement(&self) -> Result<()> {
+        check_fut_requirement(&self.id, &self.fut_requirement)
+    }
+
+    /// Keep the declaration for presentation and `FUT_EXTENSIONS` while this
+    /// client stops running its hooks.
+    pub(crate) fn deactivate_hooks(&mut self) {
+        self.hooks.clear();
+    }
+
+    /// Simulate a catalog from a daemon whose package accepted this manifest;
+    /// `load` never admits a requirement excluding the test binary.
+    #[cfg(test)]
+    pub(crate) fn set_fut_requirement(&mut self, requirement: VersionReq) {
+        self.fut_requirement = requirement;
+    }
+
     /// Stable extension identity entries added to every hook environment.
     fn command_environment(&self) -> [(OsString, OsString); 2] {
         [
@@ -345,17 +372,15 @@ impl ExtensionRegistry {
     /// Rebuild the runtime representation solely from a daemon catalog. This
     /// repeats all structural bounds and pins the fingerprint so a client never
     /// accepts partial or malformed extension state from the wire.
+    ///
+    /// The hosting daemon validates package compatibility when loading from
+    /// disk. A negotiated client validates the catalog, not the host's package
+    /// requirement against its own version, so a mixed-version UI still
+    /// renders the host's declarations. Before this client runs an extension
+    /// process itself, materialization consults `Extension::check_fut_requirement`
+    /// and deactivates that extension's local commands and client hooks.
+    /// Disk candidates must use `load`.
     pub(crate) fn from_catalog(catalog: ExtensionCatalog) -> Result<Self> {
-        Self::from_catalog_inner(catalog, true)
-    }
-
-    /// Remote declarations are rendered, never executed locally. Their Fut
-    /// requirement applies to the daemon hosting them, not this UI's package.
-    pub(crate) fn from_remote_catalog(catalog: ExtensionCatalog) -> Result<Self> {
-        Self::from_catalog_inner(catalog, false)
-    }
-
-    fn from_catalog_inner(catalog: ExtensionCatalog, check_package_version: bool) -> Result<Self> {
         if catalog.generation == 0 {
             bail!("extension catalog generation must be at least 1");
         }
@@ -389,7 +414,7 @@ impl ExtensionRegistry {
         let mut extensions = Vec::with_capacity(catalog.extensions.len());
         let mut ids = HashSet::new();
         for declaration in catalog.extensions {
-            let extension = extension_from_declaration(declaration, check_package_version)?;
+            let extension = extension_from_declaration(declaration)?;
             if !ids.insert(extension.id.clone()) {
                 bail!(
                     "extension catalog contains duplicate extension id {:?}",
@@ -577,10 +602,7 @@ fn validate_command_fields(
         .collect()
 }
 
-fn extension_from_declaration(
-    declaration: ExtensionDeclaration,
-    check_package_version: bool,
-) -> Result<Extension> {
+fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Extension> {
     if declaration.api_version != MANIFEST_API_VERSION {
         bail!(
             "extension {:?} catalog declares unsupported api_version {}",
@@ -603,15 +625,6 @@ fn extension_from_declaration(
             declaration.id
         )
     })?;
-    let running_fut_version = Version::parse(env!("CARGO_PKG_VERSION"))
-        .expect("Cargo package version must be valid SemVer");
-    if check_package_version && !fut_requirement.matches(&running_fut_version) {
-        bail!(
-            "extension {:?} catalog is incompatible with Fut {}",
-            declaration.id,
-            running_fut_version
-        );
-    }
     if !declaration.root.is_absolute() {
         bail!(
             "extension {:?} catalog root must be absolute",
@@ -1945,6 +1958,20 @@ fn validate_root(configured_root: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+pub(crate) fn running_fut_version() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo package version must be valid SemVer")
+}
+
+fn check_fut_requirement(id: &str, requirement: &VersionReq) -> Result<()> {
+    let running_fut_version = running_fut_version();
+    if !requirement.matches(&running_fut_version) {
+        bail!(
+            "extension {id:?} requires Fut {requirement}, but running Fut version {running_fut_version} is incompatible"
+        );
+    }
+    Ok(())
+}
+
 fn load_one(root: &Path) -> Result<Extension> {
     let manifest_path = root.join(MANIFEST_FILE_NAME);
     let source = read_manifest(&manifest_path)?;
@@ -1969,16 +1996,7 @@ fn load_one(root: &Path) -> Result<Extension> {
             manifest.id, manifest.fut
         )
     })?;
-    let running_fut_version = Version::parse(env!("CARGO_PKG_VERSION"))
-        .expect("Cargo package version must be valid SemVer");
-    if !fut_requirement.matches(&running_fut_version) {
-        bail!(
-            "extension {:?} requires Fut {}, but running Fut version {} is incompatible",
-            manifest.id,
-            fut_requirement,
-            running_fut_version
-        );
-    }
+    check_fut_requirement(&manifest.id, &fut_requirement)?;
     validate_identifier("extension id", &manifest.id)?;
     let capabilities = validate_capabilities(
         &manifest.id,
@@ -2397,17 +2415,53 @@ fut = ">=0.7.0, <1.0.0"
     }
 
     #[test]
-    fn remote_catalog_package_requirements_apply_to_the_daemon_not_the_renderer() {
-        let root = extension_root("id = 'remote'\ncapabilities = []\n");
+    fn daemon_catalog_package_requirements_apply_to_the_host_not_the_renderer() {
+        let root = extension_root("id = 'hosted'\ncapabilities = []\n");
         let mut extensions = load(&[root.path().to_owned()]).unwrap();
-        extensions[0].fut_requirement = VersionReq::parse(">=99.0.0").unwrap();
+        let requirement = VersionReq::parse(">=0.37.0, <0.38.0").unwrap();
+        assert!(!requirement.matches(&Version::parse(env!("CARGO_PKG_VERSION")).unwrap()));
+        extensions[0].fut_requirement = requirement;
         let catalog = registry(extensions).catalog().unwrap();
-        assert!(ExtensionRegistry::from_catalog(catalog.clone()).is_err());
-        let remote = ExtensionRegistry::from_remote_catalog(catalog.clone()).unwrap();
-        assert_eq!(remote.catalog().unwrap(), catalog);
-        let mut tampered = catalog;
+        let rebuild = ExtensionRegistry::from_catalog;
+        assert_eq!(
+            rebuild(catalog.clone()).unwrap().catalog().unwrap(),
+            catalog
+        );
+        let mut tampered = catalog.clone();
         tampered.fingerprint = "0".repeat(64);
-        assert!(ExtensionRegistry::from_remote_catalog(tampered).is_err());
+        assert!(rebuild(tampered).is_err());
+        let mut malformed = catalog.clone();
+        malformed.extensions[0].fut = "not a requirement".into();
+        assert!(
+            format!("{:#}", rebuild(malformed).unwrap_err()).contains("requirement is invalid")
+        );
+        let mut unsupported = catalog.clone();
+        unsupported.extensions[0].api_version = MANIFEST_API_VERSION + 1;
+        assert!(
+            rebuild(unsupported)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported api_version")
+        );
+
+        // The local UI trusts the daemon's package check even if the same
+        // incompatible manifest is now on disk. This also covers reload UI
+        // preparation, which materializes a daemon-prepared catalog.
+        fs::write(
+            root.path().join(MANIFEST_FILE_NAME),
+            "api_version = 1\nversion = '1.2.3'\nfut = '>=0.37.0, <0.38.0'\nid = 'hosted'\ncapabilities = []\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("config.toml"),
+            format!("extensions = [{:?}]\n", root.path().to_str().unwrap()),
+        )
+        .unwrap();
+        let location = crate::client::config::resolve_location(Some(root.path())).unwrap();
+        let staged = crate::client::config::stage_location(&location).unwrap();
+        assert!(staged.materialize(&catalog).is_ok());
+        assert!(staged.materialize_remote(Some(&catalog)).is_ok());
+        assert!(load(&[root.path().to_owned()]).is_err());
     }
 
     fn registry(extensions: Vec<Extension>) -> ExtensionRegistry {
@@ -3351,6 +3405,67 @@ scope = "tab"
         assert_eq!(
             fs::read_to_string(output.path()).unwrap(),
             "client.attached first\nclient.session_changed second\nclient.detached second\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_catalog_deactivates_client_hooks_of_an_extension_for_another_fut() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let output_path = output.path().display().to_string();
+        let root = executable_hook(
+            &format!(
+                "id = 'hosted'\ncapabilities = ['hooks']\n[hooks]\n'client.attached' = ['./hook', {output_path:?}]\n'client.detached' = ['./hook', {output_path:?}]\n"
+            ),
+            "#!/bin/sh\nprintf '%s\\n' \"$FUT_EVENT\" >> \"$1\"\n",
+        );
+        fs::write(
+            root.path().join("config.toml"),
+            format!("extensions = [{:?}]\n", root.path().to_str().unwrap()),
+        )
+        .unwrap();
+        let location = crate::client::config::resolve_location(Some(root.path())).unwrap();
+        let staged = crate::client::config::stage_location(&location).unwrap();
+        let materialized = |requirement: &str| {
+            let mut extensions = load(&[root.path().to_owned()]).unwrap();
+            extensions[0].fut_requirement = VersionReq::parse(requirement).unwrap();
+            let catalog = registry(extensions).catalog().unwrap();
+            staged.materialize(&catalog).unwrap().extensions().to_vec()
+        };
+        let session = ClientSession {
+            id: SessionId::new(),
+            name: "first".into(),
+        };
+
+        // The host accepted this manifest; this binary is outside its range.
+        let foreign = materialized(">=0.37.0, <0.38.0");
+        assert_eq!(foreign.len(), 1);
+        assert!(foreign[0].check_fut_requirement().is_err());
+        assert_eq!(foreign[0].hook_names().count(), 0);
+        assert_eq!(active_extensions_json(&foreign), r#"{"hosted":"1.2.3"}"#);
+        let mut runtime = ClientHookRuntime::new(
+            foreign,
+            PathBuf::from("/opt/fut/bin/fut"),
+            root.path().join("fut.sock"),
+        );
+        runtime.observe_session(session.clone());
+        runtime.shutdown().await;
+        assert_eq!(fs::read_to_string(output.path()).unwrap(), "");
+
+        let compatible = materialized(&format!("={}", running_fut_version()));
+        assert_eq!(
+            compatible[0].hook_names().collect::<Vec<_>>(),
+            ["client.attached", "client.detached"]
+        );
+        let mut runtime = ClientHookRuntime::new(
+            compatible,
+            PathBuf::from("/opt/fut/bin/fut"),
+            root.path().join("fut.sock"),
+        );
+        runtime.observe_session(session);
+        runtime.shutdown().await;
+        assert_eq!(
+            fs::read_to_string(output.path()).unwrap(),
+            "client.attached\nclient.detached\n"
         );
     }
 

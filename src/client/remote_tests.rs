@@ -286,7 +286,7 @@ fn remote_link_policy_applies_at_rendering_and_preserves_local_links() {
 }
 
 #[tokio::test]
-async fn local_handshakes_retain_exact_version_guidance() {
+async fn legacy_local_handshakes_retain_exact_version_guidance() {
     for interactive in [false, true] {
         let (stream, peer) = UnixStream::pair().unwrap();
         let server = tokio::spawn(async move {
@@ -323,19 +323,179 @@ async fn local_handshakes_retain_exact_version_guidance() {
                     rows: 24,
                 },
                 crate::domain::ClientId::new(),
-                PROTOCOL_VERSION,
+                Some(PROTOCOL_VERSION),
                 Duration::from_secs(1),
             )
             .await
             .unwrap_err()
         } else {
-            handshake_navigator(stream, PROTOCOL_VERSION, Duration::from_secs(1))
+            handshake_navigator(stream, Some(PROTOCOL_VERSION), Duration::from_secs(1))
                 .await
                 .unwrap_err()
         };
         assert!(error.downcast_ref::<ProtocolMismatch>().is_some());
         assert!(error.to_string().contains("fut daemon shutdown --force"));
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn local_handshakes_accept_different_package_versions() {
+    use crate::protocol::local::{self as wire, LocalWelcome};
+    for interactive in [false, true] {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let target = targets(1).remove(0);
+        let selected = selected_view(1, target.clone(), vec![target]);
+        let server = tokio::spawn(async move {
+            let mut peer = Framed::new(peer, codec());
+            let request: Envelope<ClientMessage> =
+                decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
+            let ClientMessage::LocalHello(hello) = request.message else {
+                panic!("expected stable local hello")
+            };
+            assert_eq!(hello.required, vec!["local.v1"]);
+            peer.send(Bytes::from(
+                encode_payload(&Envelope {
+                    request_id: request.request_id,
+                    message: ServerMessage::LocalWelcome(LocalWelcome {
+                        generation: wire::GENERATION,
+                        codec: wire::CODEC.into(),
+                        server_version: "99.999.1".into(),
+                        capabilities: vec!["local.v1".into()],
+                        selected: interactive.then_some(selected),
+                        extension_catalog: crate::protocol::ExtensionCatalog {
+                            generation: 7,
+                            fingerprint: String::new(),
+                            extensions: Vec::new(),
+                            config: Default::default(),
+                        },
+                    }),
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+            let request: Envelope<ClientMessage> =
+                decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
+            assert!(if interactive {
+                matches!(request.message, ClientMessage::WatchAlerts { .. })
+            } else {
+                matches!(request.message, ClientMessage::WatchResources)
+            });
+            assert!(peer.next().await.is_none());
+        });
+        if interactive {
+            let (connection, _, catalog, _) = handshake_interactive(
+                stream,
+                None,
+                TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+                crate::domain::ClientId::new(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(catalog.generation, 7);
+            drop(connection);
+        } else {
+            let (connection, catalog, version) =
+                handshake_navigator(stream, None, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            assert_eq!(catalog.generation, 7);
+            assert_eq!(version, None);
+            drop(connection);
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn local_negotiation_rejections_do_not_subscribe_or_retry_even_with_ignore() {
+    use crate::protocol::{
+        local::{self as wire, LocalWelcome},
+        remote::EndpointError,
+    };
+    for interactive in [false, true] {
+        for fault in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut peer = Framed::new(stream, codec());
+                let request: Envelope<ClientMessage> =
+                    decode_payload(&peer.next().await.unwrap().unwrap()).unwrap();
+                assert!(matches!(request.message, ClientMessage::LocalHello(_)));
+                let target = targets(1).remove(0);
+                let selected = selected_view(1, target.clone(), vec![target]);
+                let mut welcome = LocalWelcome {
+                    generation: wire::GENERATION,
+                    codec: wire::CODEC.into(),
+                    server_version: "99.999.1".into(),
+                    capabilities: vec!["local.v1".into()],
+                    selected: interactive.then_some(selected.clone()),
+                    extension_catalog: crate::protocol::ExtensionCatalog {
+                        generation: 0,
+                        fingerprint: String::new(),
+                        extensions: Vec::new(),
+                        config: Default::default(),
+                    },
+                };
+                match fault {
+                    0 => welcome.generation += 1,
+                    1 => welcome.capabilities.clear(),
+                    2 => welcome.selected = (!interactive).then_some(selected),
+                    3 => welcome.codec = "unsupported".into(),
+                    _ => {}
+                }
+                let message = if fault == 4 {
+                    ServerMessage::EndpointError {
+                        error: EndpointError::MissingRequiredCapability,
+                    }
+                } else {
+                    ServerMessage::LocalWelcome(welcome)
+                };
+                peer.send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: request.request_id,
+                        message,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+                assert!(peer.next().await.is_none());
+                assert!(
+                    time::timeout(Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            // These preparation helpers run before TerminalGuard::enter and
+            // must return the typed negotiation error without session traffic.
+            let error = if interactive {
+                connect_interactive(
+                    &socket,
+                    None,
+                    TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                    },
+                    crate::domain::ClientId::new(),
+                    None,
+                )
+                .await
+                .unwrap_err()
+            } else {
+                connect_control_navigator(&socket, true).await.unwrap_err()
+            };
+            assert!(error.downcast_ref::<EndpointError>().is_some(), "{error:#}");
+            server.await.unwrap();
+        }
     }
 }
 

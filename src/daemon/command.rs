@@ -152,7 +152,7 @@ async fn run(
                 frame = connection.next() => {
                     let Some(frame) = frame else { return Ok(()) };
                     let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
-                    if reject_remote_method(connection, &envelope).await? { continue; }
+                    if reject_unnegotiated_method(connection, &envelope).await? { continue; }
                     if matches!(envelope.message, ClientMessage::Detach) { return Ok(()); }
                     reply(connection, envelope.request_id, RemoteCommandReply::Error {
                         message: "background command does not accept operations".into(),
@@ -172,7 +172,7 @@ async fn run(
             frame = connection.next() => {
                 let Some(frame) = frame else { return Ok(()) };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
-                if reject_remote_method(connection, &envelope).await? { continue; }
+                if reject_unnegotiated_method(connection, &envelope).await? { continue; }
                 if matches!(envelope.message, ClientMessage::Detach) { return Ok(()); }
                 let mut screen_changed = false;
                 let response = if envelope.request_id.is_none() {

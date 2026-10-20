@@ -741,7 +741,10 @@ async fn remote_cli_protocol_mismatch_never_retries_or_changes_terminal() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("incompatible remote generation"), "{error}");
+    assert!(
+        error.contains("incompatible endpoint generation"),
+        "{error}"
+    );
     assert!(!error.contains("shutdown"));
     assert!(!error.contains('\x1b'));
     assert_ssh_reaped(root.path()).await;
@@ -1184,7 +1187,10 @@ async fn machine_add_saves_nothing_after_failed_or_cancelled_verification() {
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("incompatible remote generation"), "{error}");
+    assert!(
+        error.contains("incompatible endpoint generation"),
+        "{error}"
+    );
     assert!(!machine_catalog(root.path()).exists());
     assert_ssh_reaped(root.path()).await;
     server.await.unwrap();

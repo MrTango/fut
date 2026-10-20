@@ -137,7 +137,7 @@ impl Failure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Negotiation {
     Local {
-        protocol_version: u16,
+        protocol_generation: u16,
     },
     Ssh {
         protocol_generation: u16,
@@ -1072,7 +1072,7 @@ mod tests {
     fn initial(revision: u64) -> InitialMetadata {
         InitialMetadata {
             negotiation: Negotiation::Local {
-                protocol_version: 22,
+                protocol_generation: crate::protocol::local::GENERATION,
             },
             resources: resources(revision),
             presence: ClientPresenceSnapshot {

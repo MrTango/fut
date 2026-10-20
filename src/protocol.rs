@@ -2,6 +2,7 @@
 //! versioned remote contract reuses an explicit subset; see [`remote`].
 
 pub mod chunked;
+pub mod local;
 pub mod remote;
 
 pub use crate::command::PopupSize as RemoteCommandSize;
@@ -25,8 +26,8 @@ use crate::{
     splits::{SplitDirection, SplitRatio, SplitTree},
 };
 
-/// Local clients and daemons require an exact protocol match. The protocol is
-/// the package version's minor component: Fut 0.12.x uses protocol 12.
+/// Legacy local clients require an exact protocol match. New local clients use
+/// [`local`] negotiation independently of the package version.
 pub const PROTOCOL_VERSION: u16 = parse_protocol_version(env!("CARGO_PKG_VERSION_MINOR"));
 /// Enough for a worst-case screen of [`crate::domain::MAX_VISIBLE_CELLS`]
 /// cells, or one Kitty image, while remaining a firm pre-allocation bound for
@@ -471,6 +472,7 @@ pub enum ClientMessage {
         operation: RemoteCommandOperation,
     },
     RemoteHello(remote::RemoteHello),
+    LocalHello(local::LocalHello),
     Hello {
         version: u16,
         client_version: String,
@@ -721,6 +723,7 @@ pub enum ServerMessage {
         reply: RemoteCommandReply,
     },
     RemoteWelcome(remote::RemoteWelcome),
+    LocalWelcome(local::LocalWelcome),
     EndpointError {
         error: remote::EndpointError,
     },
