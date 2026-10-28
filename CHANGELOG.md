@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.41
+
 - Open nested projects under `projects_dir` by name, such as `fut project work/api`.
 
 ## 0.40
