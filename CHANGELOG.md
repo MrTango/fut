@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Open nested projects under `projects_dir` by name, such as `fut project work/api`.
+
 ## 0.40
 
 - Name panes with `rename-pane` in the command palette or `fut pane rename`; titles show above panes and in navigator search. Workspace, tab, and pane names are limited to 512 bytes without control characters.

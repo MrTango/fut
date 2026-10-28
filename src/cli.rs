@@ -6815,14 +6815,16 @@ mod tests {
         .unwrap();
         let config_location = client::config::resolve_location(Some(&config)).unwrap();
 
-        let (cwd, name, recipe_project) =
-            resolve_project_open(None, Some("10er"), temporary.path(), &config_location)
-                .await
-                .unwrap();
+        for project_name in ["10er", "work/api", "work/team/api"] {
+            let (cwd, name, recipe_project) =
+                resolve_project_open(None, Some(project_name), temporary.path(), &config_location)
+                    .await
+                    .unwrap();
 
-        assert_eq!(cwd, projects.join("10er"));
-        assert_eq!(name.as_deref(), Some("10er"));
-        assert_eq!(recipe_project.path(), projects.join("10er"));
+            assert_eq!(cwd, projects.join(project_name));
+            assert_eq!(name.as_deref(), Some(project_name));
+            assert_eq!(recipe_project.path(), projects.join(project_name));
+        }
     }
 
     #[tokio::test]

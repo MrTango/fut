@@ -1677,7 +1677,9 @@ impl ProjectCatalog {
             return Some(project.clone());
         }
         let directory = self.directory.as_ref()?;
-        valid_project_name(name).then(|| ProjectConfig::repository(directory.join(name)))
+        name.split('/')
+            .all(valid_project_name)
+            .then(|| ProjectConfig::repository(directory.join(name)))
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &ProjectConfig)> {
@@ -3344,7 +3346,23 @@ unknown_future_option = true
             catalog.resolve("10er").unwrap().path(),
             temporary.path().join("dev/10er")
         );
-        assert!(catalog.resolve("../outside").is_none());
+        for name in ["work/api", "work/team/api"] {
+            assert_eq!(
+                catalog.resolve(name).unwrap().path(),
+                temporary.path().join("dev").join(name)
+            );
+        }
+        for name in [
+            "",
+            "../outside",
+            "work/../outside",
+            "/work/api",
+            "work//api",
+            "work/",
+            "./work",
+        ] {
+            assert!(catalog.resolve(name).is_none(), "accepted {name:?}");
+        }
     }
 
     #[test]
